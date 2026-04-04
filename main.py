@@ -19,10 +19,6 @@ app.add_middleware(
 
 
 def streamdata_to_response(stream_obj) -> dict:
-    """
-    把 streamget 的 StreamData 转成前端期待的格式：
-    { streams: [{cdn, url, type}], title, avatar }
-    """
     raw = json.loads(stream_obj.to_json())
 
     streams = []
@@ -35,7 +31,7 @@ def streamdata_to_response(stream_obj) -> dict:
         streams.append({"cdn": "HLS", "url": m3u8, "type": "m3u8"})
 
     if not streams:
-        raise ValueError("streamget 未返回有效流地址（直播可能未开播）")
+        raise ValueError(f"未获取到流地址，原始数据: {raw}")
 
     return {
         "streams": streams,
@@ -56,18 +52,37 @@ async def parse_url(url: str) -> dict:
     else:
         raise HTTPException(status_code=400, detail="不支持的平台，仅支持虎牙/斗鱼/B站/抖音")
 
-    # process_data=True 是 fetch_stream_url 的前提
     data = await live.fetch_web_stream_data(url, process_data=True)
 
-    if not data.get("is_live"):
-        raise HTTPException(status_code=200, detail=f"{data.get('anchor_name','主播')} 未开播")
-
+    # 不强判 is_live，直接尝试取流
+    # Render 美国IP可能导致中国平台误判为未开播
     stream_obj = await live.fetch_stream_url(data, "OD")
     return streamdata_to_response(stream_obj)
 
 
+# ============ 调试端点：查看 streamget 原始返回数据 ============
+@app.get("/api/debug")
+async def api_debug(url: str = Query(...)):
+    try:
+        if "huya.com" in url:
+            live = HuyaLiveStream()
+        elif "douyu.com" in url:
+            live = DouyuLiveStream()
+        elif "bilibili.com" in url:
+            live = BilibiliLiveStream()
+        elif "douyin.com" in url:
+            live = DouyinLiveStream()
+        else:
+            return {"error": "不支持的平台"}
+
+        data = await live.fetch_web_stream_data(url, process_data=True)
+        return {"raw_data": data}
+    except Exception as e:
+        return {"error": str(e), "type": type(e).__name__}
+
+
 @app.get("/api/parse")
-async def api_parse(url: str = Query(..., description="直播间地址")):
+async def api_parse(url: str = Query(...)):
     try:
         result = await parse_url(url)
         return result
