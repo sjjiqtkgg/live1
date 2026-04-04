@@ -12,7 +12,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 
 
-# ==================== /api/proxy  (前端借此绕过 CORS) ====================
+# ==================== /api/proxy  (前端借此绕过 CORS，并强制修正斗鱼流地址) ====================
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request,
                     url: str = Query(...),
@@ -36,6 +36,38 @@ async def api_proxy(request: Request,
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.request(request.method, url, headers=headers, content=body)
 
+    # 如果是斗鱼的 getH5Play 接口，需要修正流地址为华为 CDN
+    content_type = resp.headers.get("content-type", "")
+    if "douyu.com/lapi/live/getH5Play" in url and request.method == "POST" and "application/json" in content_type:
+        try:
+            data = resp.json()
+            # 修正 rtmp_url 和 rtmp_live
+            if "data" in data and data.get("error") == 0:
+                d = data["data"]
+                if d.get("rtmp_url") and d.get("rtmp_live"):
+                    # 强制替换域名为华为边缘节点
+                    d["rtmp_url"] = re.sub(r'[^/]+\.douyucdn2\.cn', 'hwa.douyucdn2.cn', d["rtmp_url"])
+                    # 修正 rtmp_live 中的 fcdn 参数
+                    d["rtmp_live"] = re.sub(r'fcdn=[^&]+', 'fcdn=hw', d["rtmp_live"])
+                    # 同时修正 hls_url 如果存在
+                    if d.get("hls_url"):
+                        d["hls_url"] = re.sub(r'[^/]+\.douyucdn2\.cn', 'hwa.douyucdn2.cn', d["hls_url"])
+                        d["hls_url"] = re.sub(r'fcdn=[^&]+', 'fcdn=hw', d["hls_url"])
+                # 过滤 cdnsWithName，只保留华为 CDN
+                if "cdnsWithName" in d:
+                    d["cdnsWithName"] = [cdn for cdn in d["cdnsWithName"] if cdn.get("cdn") and "hw" in cdn["cdn"].lower()]
+                    if not d["cdnsWithName"]:
+                        # 如果没有华为 CDN，手动添加一个占位，避免前端无流
+                        d["cdnsWithName"] = [{"cdn": "hw-h5", "name": "华为"}]
+            # 返回修改后的 JSON
+            modified_content = json.dumps(data).encode("utf-8")
+            out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": "application/json"}
+            return StreamingResponse(iter([modified_content]), status_code=200, headers=out_headers)
+        except Exception as e:
+            # 解析失败则原样返回
+            print(f"修正斗鱼流地址失败: {e}")
+
+    # 非斗鱼或修正失败，原样返回
     out_headers = {"Access-Control-Allow-Origin": "*"}
     ct = resp.headers.get("content-type", "application/json")
     out_headers["Content-Type"] = ct
@@ -80,7 +112,7 @@ async def parse_huya(url):
             "avatar": raw.get("avatar", ""), "danmaku": danmaku}
 
 
-# ==================== 斗鱼 (返回 crptext 给前端签名，前端多 CDN) ====================
+# ==================== 斗鱼 (返回 crptext 给前端签名，但后端 proxy 会修正流地址) ====================
 async def parse_douyu(url):
     room_id = url.rstrip("/").split("/")[-1].split("?")[0]
     hdrs = {"User-Agent": UA, "Referer": f"https://www.douyu.com/{room_id}"}
@@ -97,7 +129,7 @@ async def parse_douyu(url):
         if not crptext:
             raise ValueError("斗鱼：未获取到签名代码")
 
-    # 返回 client:true，让前端用 douyuSignAndPlay 签名并拿多 CDN
+    # 仍然返回 client:true，让前端签名，但后端 proxy 会确保返回的流地址是华为 CDN
     return {
         "client": True,
         "crptext": crptext,
