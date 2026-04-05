@@ -180,6 +180,8 @@ async def api_parse(url: str = Query(...)):
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        print(f"[ERROR] {url}\n{traceback.format_exc()}", flush=True)
         raise HTTPException(500, str(e))
 
 @app.get("/")
