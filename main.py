@@ -97,13 +97,20 @@ async def parse_douyu(url):
         if not crptext:
             raise ValueError("斗鱼：未获取到签名代码")
 
+    # avatar 字段可能是字符串或 {"big":..,"middle":..,"small":..} 对象，统一转成字符串
+    raw_avatar = room.get("room_icon") or room.get("avatar") or ""
+    if isinstance(raw_avatar, dict):
+        avatar_str = raw_avatar.get("big") or raw_avatar.get("middle") or raw_avatar.get("small") or ""
+    else:
+        avatar_str = raw_avatar
+
     # 返回 client:true，让前端用 douyuSignAndPlay 签名并拿多 CDN
     return {
         "client": True,
         "crptext": crptext,
         "roomId": real_id,
         "anchorName": room.get("nickname") or room.get("owner_name") or "斗鱼主播",
-        "avatar": room.get("room_icon") or room.get("avatar") or "",
+        "avatar": avatar_str,
         "isLive": True
     }
 
@@ -180,8 +187,6 @@ async def api_parse(url: str = Query(...)):
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        print(f"[ERROR] {url}\n{traceback.format_exc()}", flush=True)
         raise HTTPException(500, str(e))
 
 @app.get("/")
