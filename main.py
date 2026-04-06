@@ -207,13 +207,18 @@ async def parse_douyu(url):
         if not crptext:
             raise ValueError("斗鱼：未获取到签名代码")
 
+    # avatar 可能是 {"big":..} 对象，统一转成字符串
+    raw_av = room.get("room_icon") or room.get("avatar") or ""
+    if isinstance(raw_av, dict):
+        raw_av = raw_av.get("big") or raw_av.get("middle") or raw_av.get("small") or ""
+
     # 返回 client:true，让前端用 douyuSignAndPlay 签名并拿多 CDN
     return {
         "client": True,
         "crptext": crptext,
         "roomId": real_id,
         "anchorName": room.get("nickname") or room.get("owner_name") or "斗鱼主播",
-        "avatar": room.get("room_icon") or room.get("avatar") or "",
+        "avatar": raw_av,
         "isLive": True
     }
 
