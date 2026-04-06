@@ -66,18 +66,87 @@ async def fetch_huya_danmaku_params(room_id):
     except Exception:
         return {}
 
+def huya_build_anticode(raw_anti: str, stream_name: str) -> str:
+    """Python 版 buildAntiCode，与原 JS 逻辑完全一致"""
+    import base64, hashlib, time, random
+    anti = raw_anti.replace("&amp;", "&")
+    params = dict(p.split("=", 1) for p in anti.split("&") if "=" in p)
+    fm = params.get("fm", "")
+    ws_time = params.get("wsTime", "")
+    if not fm or not ws_time:
+        return anti
+    try:
+        fm_dec = base64.b64decode(fm.replace("%2B", "+").replace("%2F", "/").replace("%3D", "=") + "==").decode()
+    except Exception:
+        try:
+            from urllib.parse import unquote
+            fm_dec = base64.b64decode(unquote(fm) + "==").decode()
+        except Exception:
+            return anti
+    p = fm_dec.split("_")[0]
+    seqid = str(int(time.time() * 10000 + random.random() * 10000))
+    ws_secret_raw = "_".join([p, "0", stream_name, seqid, ws_time])
+    ws_secret = hashlib.md5(ws_secret_raw.encode()).hexdigest()
+    params["wsSecret"] = ws_secret
+    params["seqid"] = seqid
+    params["u"] = "0"
+    return "&".join(f"{k}={v}" for k, v in params.items())
+
+
 async def parse_huya(url):
     room_id = url.rstrip("/").split("/")[-1].split("?")[0]
-    live = HuyaLiveStream()
-    data = await live.fetch_web_stream_data(url, process_data=True)
-    stream_obj = await live.fetch_stream_url(data, "OD")
-    raw = json.loads(stream_obj.to_json())
-    streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
+    CDN_NAMES = {"AL": "阿里云", "TX": "腾讯云", "HW": "华为云", "WS": "网宿", "BD": "百度云"}
+    CDN_ORDER = {"TX": 0, "AL": 1, "HW": 2, "WS": 3, "BD": 4}
+
+    async with httpx.AsyncClient(timeout=15) as c:
+        api_r = await c.get(
+            f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}",
+            headers={"User-Agent": UA, "Referer": "https://www.huya.com/"}
+        )
+        data = api_r.json()
+
+    if data.get("status") != 200:
+        raise ValueError(f"虎牙 API 错误: {data.get('message', data.get('status'))}")
+
+    live = data["data"]
+    if live.get("realLiveStatus") != "ON":
+        raise ValueError("虎牙：未开播")
+
+    cdn_list = live.get("stream", {}).get("baseSteamInfoList", [])
+    if not cdn_list:
+        raise ValueError("虎牙：未找到流信息")
+
+    # 按 CDN 优先级排序
+    cdn_list.sort(key=lambda s: CDN_ORDER.get(s.get("sCdnType", "ZZ"), 9))
+
+    streams = []
+    seen_cdns = set()
+    for s in cdn_list:
+        cdn_type = s.get("sCdnType", "")
+        if cdn_type in seen_cdns:
+            continue
+        flv_url = s.get("sFlvUrl", "")
+        stream_name = s.get("sStreamName", "")
+        anti_code = s.get("sFlvAntiCode", "")
+        suffix = s.get("sFlvUrlSuffix", "flv")
+        if not (flv_url and stream_name and anti_code):
+            continue
+        built = huya_build_anticode(anti_code, stream_name)
+        full_url = f"{flv_url}/{stream_name}.{suffix}?{built}"
+        label = CDN_NAMES.get(cdn_type, cdn_type or "CDN")
+        streams.append({"cdn": label, "url": full_url.replace("http://", "https://"), "type": "flv"})
+        seen_cdns.add(cdn_type)
+
     if not streams:
-        raise ValueError(f"虎牙未获取到流: {raw}")
+        raise ValueError("虎牙：流地址构建失败")
+
+    # 主播信息
+    profile = live.get("profileRoom", {})
+    anchor_name = profile.get("nick") or live.get("roomInfo", {}).get("nick") or "虎牙主播"
+    avatar = profile.get("avatar") or live.get("roomInfo", {}).get("avatar") or ""
+
     danmaku = await fetch_huya_danmaku_params(room_id)
-    return {"streams": streams, "title": raw.get("anchor_name", "虎牙主播"),
-            "avatar": raw.get("avatar", ""), "danmaku": danmaku}
+    return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku}
 
 
 # ==================== 斗鱼 (返回 crptext 给前端签名，前端多 CDN) ====================
@@ -97,20 +166,13 @@ async def parse_douyu(url):
         if not crptext:
             raise ValueError("斗鱼：未获取到签名代码")
 
-    # avatar 字段可能是字符串或 {"big":..,"middle":..,"small":..} 对象，统一转成字符串
-    raw_avatar = room.get("room_icon") or room.get("avatar") or ""
-    if isinstance(raw_avatar, dict):
-        avatar_str = raw_avatar.get("big") or raw_avatar.get("middle") or raw_avatar.get("small") or ""
-    else:
-        avatar_str = raw_avatar
-
     # 返回 client:true，让前端用 douyuSignAndPlay 签名并拿多 CDN
     return {
         "client": True,
         "crptext": crptext,
         "roomId": real_id,
         "anchorName": room.get("nickname") or room.get("owner_name") or "斗鱼主播",
-        "avatar": avatar_str,
+        "avatar": room.get("room_icon") or room.get("avatar") or "",
         "isLive": True
     }
 
