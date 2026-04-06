@@ -140,10 +140,51 @@ async def parse_huya(url):
     if not streams:
         raise ValueError("虎牙：流地址构建失败")
 
-    # 主播信息
+    # ========== 增强主播信息获取 ==========
     profile = live.get("profileRoom", {})
-    anchor_name = profile.get("nick") or live.get("roomInfo", {}).get("nick") or "虎牙主播"
-    avatar = profile.get("avatar") or live.get("roomInfo", {}).get("avatar") or ""
+    room_info = live.get("roomInfo", {})
+    live_data = live.get("liveData", {})
+    anchor = live.get("anchor", {})
+
+    anchor_name = (
+        profile.get("nick") or
+        room_info.get("nick") or
+        live_data.get("nick") or
+        anchor.get("nick") or
+        None
+    )
+
+    # 如果 API 未返回昵称，降级从移动端 HTML 解析
+    if not anchor_name:
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                mob_html = await c.get(
+                    f"https://m.huya.com/{room_id}",
+                    headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"}
+                )
+                # 匹配 <title> 或 json 中的 nick
+                title_match = re.search(r'<title>(.*?)</title>', mob_html.text)
+                if title_match:
+                    raw_title = title_match.group(1)
+                    # 标题格式通常为 "主播名_虎牙直播"
+                    anchor_name = raw_title.split("_")[0].strip()
+                else:
+                    nick_match = re.search(r'"nick":"([^"]+)"', mob_html.text)
+                    if nick_match:
+                        anchor_name = nick_match.group(1)
+        except Exception:
+            pass
+
+    if not anchor_name:
+        anchor_name = "虎牙主播"
+
+    avatar = (
+        profile.get("avatar") or
+        room_info.get("avatar") or
+        live_data.get("avatar") or
+        anchor.get("avatar") or
+        ""
+    )
 
     danmaku = await fetch_huya_danmaku_params(room_id)
     return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku}
