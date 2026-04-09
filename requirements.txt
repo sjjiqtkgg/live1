@@ -2,3 +2,6 @@ fastapi
 uvicorn
 streamget
 httpx
+websockets
+protobuf>=3.19.0
+requests
