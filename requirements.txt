@@ -5,3 +5,5 @@ httpx
 websockets
 protobuf>=3.19.0
 requests
+betterproto>=2.0.0b6     
+websocket-client>=1.6.0    
