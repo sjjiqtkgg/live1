@@ -313,18 +313,8 @@ async def parse_douyin(url):
             except Exception:
                 pass
 
-        # 提取 ttwid
-        ttwid = ""
-        try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                resp = await c.get(url, headers={"User-Agent": UA})
-                for cookie in resp.cookies:
-                    if cookie.name == "ttwid":
-                        ttwid = cookie.value
-                        break
-        except Exception:
-            pass
-
+        # 尝试获取 ttwid
+        ttwid = await fetch_ttwid(url)
         return {
             "streams": streams,
             "title": raw.get("anchor_name", "抖音主播"),
@@ -339,7 +329,40 @@ async def parse_douyin(url):
         raise HTTPException(500, f"抖音解析失败: {str(e)}")
 
 
-# ==================== 抖音弹幕签名（使用 ac_signature） ====================
+# ==================== 获取 ttwid ====================
+async def fetch_ttwid(url: str = None) -> str:
+    """尝试从抖音页面获取 ttwid，失败则生成一个临时可用的"""
+    try:
+        headers = {
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        }
+        async with httpx.AsyncClient(timeout=8) as c:
+            if url:
+                resp = await c.get(url, headers=headers)
+            else:
+                resp = await c.get("https://live.douyin.com/", headers=headers)
+            for cookie in resp.cookies:
+                if cookie.name == "ttwid":
+                    print(f"[ttwid] 获取成功: {cookie.value[:30]}...")
+                    return cookie.value
+    except Exception as e:
+        print(f"[ttwid] 获取失败: {e}")
+    # 返回一个常见的格式，虽然不是真实有效，但有时能绕过简单检查
+    fallback = f"1%7C{random.randint(1000000000, 9999999999)}"
+    print(f"[ttwid] 使用临时值: {fallback}")
+    return fallback
+
+
+# ==================== 抖音弹幕签名 ====================
 def get_douyin_signature(room_id: str, ttwid: str = "") -> str:
     try:
         site = "live.douyin.com"
@@ -371,15 +394,13 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
         f"&identity=audience&room_id={room_id}&heartbeatDuration=0&signature={signature}"
     )
-    print(f"[抖音弹幕] 连接 URL (部分): {ws_url[:200]}...")
 
-    # 构造 Cookie 头
-    headers = {}
-    if ttwid:
-        headers["Cookie"] = f"ttwid={ttwid}"
-        print(f"[抖音弹幕] 携带 Cookie: ttwid={ttwid[:20]}...")
-    else:
-        print("[抖音弹幕] 警告: 未获取到 ttwid，连接可能失败")
+    headers = {
+        "User-Agent": UA,
+        "Origin": "https://live.douyin.com",
+        "Cookie": f"ttwid={ttwid}"
+    }
+    print(f"[抖音弹幕] 携带 Cookie: ttwid={ttwid[:30]}...")
 
     def on_open(ws):
         print(f"[抖音弹幕] 已连接房间 {room_id}")
@@ -474,16 +495,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
 
-    ttwid = ""
-    try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            resp = await c.get(f"https://live.douyin.com/{room_id}", headers={"User-Agent": UA})
-            for cookie in resp.cookies:
-                if cookie.name == "ttwid":
-                    ttwid = cookie.value
-                    break
-    except Exception:
-        pass
+    ttwid = await fetch_ttwid(f"https://live.douyin.com/{room_id}")
 
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
