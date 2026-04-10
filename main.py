@@ -348,42 +348,65 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         threading.Thread(target=heartbeat, daemon=True).start()
 
     def on_message(ws, message):
-        if stop_event.is_set():
-            return
-        try:
-            push_frame = douyin.PushFrame().parse(message)
-            response = douyin.Response().parse(push_frame.payload)
-            for msg in response.messages_list:
-                method = msg.method
-                payload = msg.payload
-                if method == "WebcastChatMessage":
+    if stop_event.is_set():
+        return
+    # 1. 确认是否收到任何数据
+    print(f"[抖音弹幕] 收到原始数据，长度: {len(message)}")
+    try:
+        # 2. 尝试解析 PushFrame
+        push_frame = douyin.PushFrame().parse(message)
+        print(f"[抖音弹幕] PushFrame 解析成功，payload 长度: {len(push_frame.payload)}")
+        
+        # 3. 尝试解析 Response
+        response = douyin.Response().parse(push_frame.payload)
+        print(f"[抖音弹幕] Response 解析成功，包含 {len(response.messages_list)} 条消息")
+
+        # 4. 遍历内部消息
+        for msg in response.messages_list:
+            method = msg.method
+            print(f"[抖音弹幕] 收到消息类型: {method}")
+            payload = msg.payload
+
+            if method == "WebcastChatMessage":
+                try:
                     chat = douyin.ChatMessage().parse(payload)
-                    callback({
-                        "type": "chat",
-                        "nick": chat.user.nick_name,
-                        "content": chat.content,
-                        "time": int(time.time() * 1000)
-                    })
-                elif method == "WebcastGiftMessage":
+                    # 安全检查，防止某些字段为 None 导致后续报错
+                    if chat and chat.user and chat.content:
+                        nick = chat.user.nick_name or "匿名用户"
+                        content = chat.content or ""
+                        print(f"[抖音弹幕] 弹幕解析成功: {nick}: {content}")
+                        callback({
+                            "type": "chat",
+                            "nick": nick,
+                            "content": content,
+                            "time": int(time.time() * 1000)
+                        })
+                except Exception as e:
+                    print(f"[抖音弹幕] 解析 WebcastChatMessage 时出错: {e}")
+
+            elif method == "WebcastGiftMessage":
+                try:
                     gift = douyin.GiftMessage().parse(payload)
-                    callback({
-                        "type": "gift",
-                        "nick": gift.user.nick_name,
-                        "gift": gift.gift.name if gift.gift else "礼物",
-                        "count": gift.repeat_count,
-                        "time": int(time.time() * 1000)
-                    })
-                elif method == "WebcastLikeMessage":
-                    like = douyin.LikeMessage().parse(payload)
-                    callback({
-                        "type": "like",
-                        "nick": like.user.nick_name,
-                        "count": like.count,
-                        "time": int(time.time() * 1000)
-                    })
-                # 可根据需要添加更多消息类型
-        except Exception as e:
-            print(f"[抖音弹幕] 解析错误: {e}")
+                    if gift and gift.user:
+                        nick = gift.user.nick_name or "匿名用户"
+                        gift_name = gift.gift.name if gift.gift else "礼物"
+                        print(f"[抖音弹幕] 礼物解析成功: {nick}: {gift_name}")
+                        callback({
+                            "type": "gift",
+                            "nick": nick,
+                            "gift": gift_name,
+                            "count": gift.repeat_count,
+                            "time": int(time.time() * 1000)
+                        })
+                except Exception as e:
+                    print(f"[抖音弹幕] 解析 WebcastGiftMessage 时出错: {e}")
+
+            # 其他消息类型（如LikeMessage）的处理逻辑同理，可依样补充...
+
+    except Exception as e:
+        print(f"[抖音弹幕] 解析错误: {e}")
+        # 可选：打印部分原始数据以便深入排查
+        # print(f"[抖音弹幕] 原始数据(前100字节): {message[:100]}")
 
     def on_error(ws, error):
         print(f"[抖音弹幕] WebSocket 错误: {error}")
