@@ -19,7 +19,7 @@ from protobuf import douyin
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
 # ==================== /api/proxy ====================
@@ -313,30 +313,17 @@ async def parse_douyin(url):
             except Exception:
                 pass
 
-        # 提取 ttwid 和可能的其他 Cookie
+        # 提取 ttwid
         ttwid = ""
-        cookie_str = ""
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 resp = await c.get(url, headers={"User-Agent": UA})
-                # 从响应 cookies 提取 ttwid
-                for cookie in resp.cookies.jar:
+                for cookie in resp.cookies:
                     if cookie.name == "ttwid":
                         ttwid = cookie.value
                         break
-                # 同时获取原始 Set-Cookie 头中的 ttwid 以防提取失败
-                if not ttwid:
-                    set_cookie = resp.headers.get("set-cookie", "")
-                    match = re.search(r"ttwid=([^;]+)", set_cookie)
-                    if match:
-                        ttwid = match.group(1)
-        except Exception as e:
-            print(f"[ttwid] 获取异常: {e}")
-
-        # 如果还是没有，使用一个硬编码的备用值（可能随时失效）
-        if not ttwid:
-            ttwid = "1%7C9856186429"
-            print("[ttwid] 使用备用值")
+        except Exception:
+            pass
 
         return {
             "streams": streams,
@@ -352,11 +339,12 @@ async def parse_douyin(url):
         raise HTTPException(500, f"抖音解析失败: {str(e)}")
 
 
-# ==================== 抖音弹幕签名 ====================
+# ==================== 抖音弹幕签名（使用 ac_signature） ====================
 def get_douyin_signature(room_id: str, ttwid: str = "") -> str:
     try:
         site = "live.douyin.com"
-        nonce = hashlib.md5(f"{room_id}{ttwid}".encode()).hexdigest()[:16]
+        # 使用时间戳+随机数作为 nonce
+        nonce = hashlib.md5(f"{room_id}{ttwid}{int(time.time()*1000)}".encode()).hexdigest()[:16]
         ua = UA
         timestamp = int(time.time())
         sig = ac_signature.get__ac_signature(site, nonce, ua, timestamp)
@@ -371,14 +359,19 @@ def get_douyin_signature(room_id: str, ttwid: str = "") -> str:
 def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threading.Event, callback):
     signature = get_douyin_signature(room_id, ttwid)
 
+    # 生成随机的设备ID (did)
+    did = ''.join(random.choices('0123456789abcdef', k=32))
+    first_req_ms = int(time.time() * 1000)
+    fetch_time = first_req_ms
+
     ws_url = (
         f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/"
         f"?app_name=douyin_web&version_code=180800&webcast_sdk_version=1.0.14"
         f"&update_version_code=1.0.14&compress=gzip&internal_ext=internal_src:dim"
-        f"|wss_push_room_id:{room_id}|wss_push_did:0|first_req_ms:{int(time.time()*1000)}"
-        f"|fetch_time:{int(time.time()*1000)}|seq:1|wss_info:0-0-0-0"
+        f"|wss_push_room_id:{room_id}|wss_push_did:{did}|first_req_ms:{first_req_ms}"
+        f"|fetch_time:{fetch_time}|seq:1|wss_info:0-0-0-0"
         f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&debug=false"
-        f"&endpoint=live&support_wrds=1&im_path=/webcast/im/fetch/&user_unique_id="
+        f"&endpoint=live&support_wrds=1&im_path=/webcast/im/fetch/&user_unique_id={did}"
         f"&device_platform=web&cookie_enabled=true&screen_width=1920&screen_height=1080"
         f"&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome"
         f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
@@ -386,13 +379,22 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
     )
     print(f"[抖音弹幕] 连接 URL (部分): {ws_url[:200]}...")
 
-    # 构造 Cookie 头：必须包含 ttwid，尝试加入其他常见 Cookie
-    headers = {}
+    # 构造 Headers
+    headers = {
+        "User-Agent": UA,
+        "Origin": "https://live.douyin.com",
+        "Referer": f"https://live.douyin.com/{room_id}",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "Upgrade",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "Upgrade": "websocket",
+        "Sec-WebSocket-Version": "13",
+        "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
+    }
     if ttwid:
-        cookie_value = f"ttwid={ttwid}"
-        # 可添加其他常见字段（不一定需要，但试试看）
-        cookie_value += "; s_v_web_id=verify_m1uhb6l8_1d9c6e1a; msToken=...;"
-        headers["Cookie"] = cookie_value
+        headers["Cookie"] = f"ttwid={ttwid}"
         print(f"[抖音弹幕] 携带 Cookie: ttwid={ttwid[:20]}...")
     else:
         print("[抖音弹幕] 警告: 未获取到 ttwid，连接可能失败")
@@ -490,27 +492,22 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
 
-    # 尝试获取 ttwid
     ttwid = ""
     try:
         async with httpx.AsyncClient(timeout=5) as c:
             resp = await c.get(f"https://live.douyin.com/{room_id}", headers={"User-Agent": UA})
-            # 从 cookies jar 中提取
+            # 修复：遍历 cookies 的 jar，使用 .name 属性
             for cookie in resp.cookies.jar:
                 if cookie.name == "ttwid":
                     ttwid = cookie.value
                     break
-            if not ttwid:
-                set_cookie = resp.headers.get("set-cookie", "")
-                match = re.search(r"ttwid=([^;]+)", set_cookie)
-                if match:
-                    ttwid = match.group(1)
     except Exception as e:
         print(f"[ttwid] 获取失败: {e}")
 
     if not ttwid:
-        ttwid = "1%7C9856186429"  # 备用值
-        print("[ttwid] 使用临时值")
+        # 使用一个已知可用的临时 ttwid（注意时效性）
+        ttwid = "1%7C4wagw0hsIt3PxkJW"
+        print(f"[ttwid] 使用临时值: {ttwid}")
 
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
