@@ -331,14 +331,13 @@ async def parse_douyin(url):
 
 
 # ==================== 抖音弹幕采集器 ====================
-def get_douyin_signature(md5_str: str) -> str:
-    """调用 sign.js 中的 get_sign 函数，传入 md5 字符串，返回 X-Bogus"""
+def get_douyin_signature(room_id: str, user_agent: str = UA) -> str:
+    """使用 ac_signature 模块生成签名"""
     try:
-        with open("sign.js", "r", encoding="utf-8") as f:
-            js_code = f.read()
-        ctx = execjs.compile(js_code)
-        bogus = ctx.call("get_sign", md5_str)
-        return bogus
+        # ac_signature 可能需要传递更多参数，具体查看该模块的接口
+        # 常见调用方式：ac_signature.get_sign(room_id, user_agent)
+        signature = ac_signature.get_sign(room_id, user_agent)
+        return signature
     except Exception as e:
         print(f"[签名] 生成失败: {e}")
         return ""
