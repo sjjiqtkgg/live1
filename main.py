@@ -9,197 +9,119 @@ import base64
 import random
 import execjs
 import websocket
-import ac_signature
+import string
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse, parse_qs
 from protobuf import douyin
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+
+# --- 工具函数 (generateMsToken) ---
+def generate_ms_token(length=107):
+    """生成抖音需要的 msToken Cookie"""
+    base_str = string.ascii_letters + string.digits + "=_"
+    _len = len(base_str) - 1
+    return ''.join(base_str[random.randint(0, _len)] for _ in range(length))
 
 
-# ==================== /api/proxy ====================
+# --- /api/proxy (保持不变) ---
 @app.api_route("/api/proxy", methods=["GET", "POST"])
-async def api_proxy(request: Request,
-                    url: str = Query(...),
-                    referer: str = Query(""),
-                    ua: str = Query(""),
-                    cookie: str = Query("")):
-    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com",
-               "douyucdn.cn", "douyin.com", "live.bilibili.com"]
-    if not any(d in url for d in ALLOWED):
-        raise HTTPException(403, "domain not allowed")
-
+async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
+    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com"]
+    if not any(d in url for d in ALLOWED): raise HTTPException(403, "domain not allowed")
     body = await request.body() if request.method == "POST" else None
-    headers = {
-        "User-Agent": ua or UA,
-        "Referer": referer or "",
-        "Cookie": cookie,
-    }
-    if request.method == "POST":
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-
+    headers = {"User-Agent": ua or UA, "Referer": referer or "", "Cookie": cookie}
+    if request.method == "POST": headers["Content-Type"] = "application/x-www-form-urlencoded"
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.request(request.method, url, headers=headers, content=body)
-
-    out_headers = {"Access-Control-Allow-Origin": "*"}
-    ct = resp.headers.get("content-type", "application/json")
-    out_headers["Content-Type"] = ct
+    out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": resp.headers.get("content-type", "application/json")}
     return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
 
 
-# ==================== 工具函数 ====================
+# --- 虎牙、斗鱼、B站解析函数 (保持不变) ---
 def build_streams(flv, m3u8):
     s = []
-    if flv and flv.startswith("http"):
-        s.append({"cdn": "FLV", "url": flv, "type": "flv"})
-    if m3u8 and m3u8.startswith("http"):
-        s.append({"cdn": "HLS", "url": m3u8, "type": "m3u8"})
+    if flv and flv.startswith("http"): s.append({"cdn": "FLV", "url": flv, "type": "flv"})
+    if m3u8 and m3u8.startswith("http"): s.append({"cdn": "HLS", "url": m3u8, "type": "m3u8"})
     return s
 
-
-# ==================== 虎牙 ====================
 async def fetch_huya_danmaku_params(room_id):
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(f"https://m.huya.com/{room_id}",
-                            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile", "Referer": "https://www.huya.com/"})
+            r = await c.get(f"https://m.huya.com/{room_id}", headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile", "Referer": "https://www.huya.com/"})
             html = r.text
-            ayyuid  = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
+            ayyuid = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
             top_sid = int((re.search(r'"lChannelId":(\d+)', html) or [None, 0])[1])
             sub_sid = int((re.search(r'"lSubChannelId":(\d+)', html) or [None, 0])[1])
             return {"platform": "huya", "ayyuid": ayyuid, "topSid": top_sid, "subSid": sub_sid}
-    except Exception:
-        return {}
-
+    except Exception: return {}
 
 def huya_build_anticode(raw_anti: str, stream_name: str) -> str:
     anti = raw_anti.replace("&amp;", "&")
     params = dict(p.split("=", 1) for p in anti.split("&") if "=" in p)
-    fm = params.get("fm", "")
-    ws_time = params.get("wsTime", "")
-    if not fm or not ws_time:
-        return anti
-    try:
-        fm_dec = base64.b64decode(fm.replace("%2B", "+").replace("%2F", "/").replace("%3D", "=") + "==").decode()
+    fm, ws_time = params.get("fm", ""), params.get("wsTime", "")
+    if not fm or not ws_time: return anti
+    try: fm_dec = base64.b64decode(fm.replace("%2B", "+").replace("%2F", "/").replace("%3D", "=") + "==").decode()
     except Exception:
-        try:
-            fm_dec = base64.b64decode(unquote(fm) + "==").decode()
-        except Exception:
-            return anti
+        try: fm_dec = base64.b64decode(unquote(fm) + "==").decode()
+        except Exception: return anti
     p = fm_dec.split("_")[0]
     seqid = str(int(time.time() * 10000 + random.random() * 10000))
     ws_secret_raw = "_".join([p, "0", stream_name, seqid, ws_time])
-    ws_secret = hashlib.md5(ws_secret_raw.encode()).hexdigest()
-    params["wsSecret"] = ws_secret
-    params["seqid"] = seqid
-    params["u"] = "0"
+    params["wsSecret"] = hashlib.md5(ws_secret_raw.encode()).hexdigest()
+    params["seqid"], params["u"] = seqid, "0"
     return "&".join(f"{k}={v}" for k, v in params.items())
-
 
 async def parse_huya(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         CDN_NAMES = {"AL": "阿里云", "TX": "腾讯云", "HW": "华为云", "WS": "网宿", "BD": "百度云"}
         CDN_ORDER = {"TX": 0, "AL": 1, "HW": 2, "WS": 3, "BD": 4}
-
         async with httpx.AsyncClient(timeout=15) as c:
-            api_r = await c.get(
-                f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}",
-                headers={"User-Agent": UA, "Referer": "https://www.huya.com/"}
-            )
+            api_r = await c.get(f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}", headers={"User-Agent": UA, "Referer": "https://www.huya.com/"})
             data = api_r.json()
-
-        if data.get("status") != 200:
-            raise HTTPException(400, f"虎牙 API 错误: {data.get('message', data.get('status'))}")
-
+        if data.get("status") != 200: raise HTTPException(400, f"虎牙 API 错误: {data.get('message', data.get('status'))}")
         live = data["data"]
-        if live.get("realLiveStatus") != "ON":
-            raise HTTPException(400, "虎牙：该直播间未开播")
-
+        if live.get("realLiveStatus") != "ON": raise HTTPException(400, "虎牙：该直播间未开播")
         cdn_list = live.get("stream", {}).get("baseSteamInfoList", [])
-        if not cdn_list:
-            raise HTTPException(400, "虎牙：未找到流信息")
-
+        if not cdn_list: raise HTTPException(400, "虎牙：未找到流信息")
         cdn_list.sort(key=lambda s: CDN_ORDER.get(s.get("sCdnType", "ZZ"), 9))
-
-        streams = []
-        seen_cdns = set()
+        streams, seen_cdns = [], set()
         for s in cdn_list:
             cdn_type = s.get("sCdnType", "")
-            if cdn_type in seen_cdns:
-                continue
-            flv_url = s.get("sFlvUrl", "")
-            stream_name = s.get("sStreamName", "")
-            anti_code = s.get("sFlvAntiCode", "")
-            suffix = s.get("sFlvUrlSuffix", "flv")
-            if not (flv_url and stream_name and anti_code):
-                continue
+            if cdn_type in seen_cdns: continue
+            flv_url, stream_name, anti_code, suffix = s.get("sFlvUrl", ""), s.get("sStreamName", ""), s.get("sFlvAntiCode", ""), s.get("sFlvUrlSuffix", "flv")
+            if not (flv_url and stream_name and anti_code): continue
             built = huya_build_anticode(anti_code, stream_name)
             full_url = f"{flv_url}/{stream_name}.{suffix}?{built}"
             label = CDN_NAMES.get(cdn_type, cdn_type or "CDN")
             streams.append({"cdn": label, "url": full_url.replace("http://", "https://"), "type": "flv"})
             seen_cdns.add(cdn_type)
-
-        if not streams:
-            raise HTTPException(400, "虎牙：流地址构建失败")
-
-        profile = live.get("profileRoom", {})
-        room_info = live.get("roomInfo", {})
-        live_data = live.get("liveData", {})
-        anchor = live.get("anchor", {})
-
-        anchor_name = (
-            profile.get("nick") or
-            room_info.get("nick") or
-            live_data.get("nick") or
-            anchor.get("nick") or
-            None
-        )
-
+        if not streams: raise HTTPException(400, "虎牙：流地址构建失败")
+        profile, room_info, live_data, anchor = live.get("profileRoom", {}), live.get("roomInfo", {}), live.get("liveData", {}), live.get("anchor", {})
+        anchor_name = profile.get("nick") or room_info.get("nick") or live_data.get("nick") or anchor.get("nick") or None
         if not anchor_name:
             try:
                 async with httpx.AsyncClient(timeout=10) as c:
-                    mob_html = await c.get(
-                        f"https://m.huya.com/{room_id}",
-                        headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"}
-                    )
+                    mob_html = await c.get(f"https://m.huya.com/{room_id}", headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"})
                     title_match = re.search(r'<title>(.*?)</title>', mob_html.text)
-                    if title_match:
-                        raw_title = title_match.group(1)
-                        anchor_name = raw_title.split("_")[0].strip()
+                    if title_match: raw_title = title_match.group(1); anchor_name = raw_title.split("_")[0].strip()
                     else:
                         nick_match = re.search(r'"nick":"([^"]+)"', mob_html.text)
-                        if nick_match:
-                            anchor_name = nick_match.group(1)
-            except Exception:
-                pass
-
-        if not anchor_name:
-            anchor_name = "虎牙主播"
-
-        avatar = (
-            profile.get("avatar") or
-            room_info.get("avatar") or
-            live_data.get("avatar") or
-            anchor.get("avatar") or
-            ""
-        )
-
+                        if nick_match: anchor_name = nick_match.group(1)
+            except Exception: pass
+        if not anchor_name: anchor_name = "虎牙主播"
+        avatar = profile.get("avatar") or room_info.get("avatar") or live_data.get("avatar") or anchor.get("avatar") or ""
         danmaku = await fetch_huya_danmaku_params(room_id)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[虎牙] 解析异常: {e}")
-        raise HTTPException(500, f"虎牙解析失败: {str(e)}")
+    except HTTPException: raise
+    except Exception as e: print(f"[虎牙] 解析异常: {e}"); raise HTTPException(500, f"虎牙解析失败: {str(e)}")
 
-
-# ==================== 斗鱼 ====================
 async def parse_douyu(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -207,55 +129,29 @@ async def parse_douyu(url):
         async with httpx.AsyncClient(timeout=15, headers=hdrs) as c:
             info = (await c.get(f"https://www.douyu.com/betard/{room_id}")).json()
             room = info.get("room")
-            if not room:
-                raise HTTPException(400, "斗鱼：房间不存在")
-            if room.get("show_status") != 1 or room.get("videoLoop") == 1:
-                raise HTTPException(400, "斗鱼：未开播")
+            if not room: raise HTTPException(400, "斗鱼：房间不存在")
+            if room.get("show_status") != 1 or room.get("videoLoop") == 1: raise HTTPException(400, "斗鱼：未开播")
             real_id = str(room["room_id"])
             enc = (await c.get(f"https://www.douyu.com/swf_api/homeH5Enc?rids={real_id}")).json()
             crptext = enc.get("data", {}).get(f"room{real_id}")
-            if not crptext:
-                raise HTTPException(400, "斗鱼：未获取到签名代码")
-
+            if not crptext: raise HTTPException(400, "斗鱼：未获取到签名代码")
         raw_av = room.get("room_icon") or room.get("avatar") or ""
-        if isinstance(raw_av, dict):
-            raw_av = raw_av.get("big") or raw_av.get("middle") or raw_av.get("small") or ""
+        if isinstance(raw_av, dict): raw_av = raw_av.get("big") or raw_av.get("middle") or raw_av.get("small") or ""
+        return {"client": True, "crptext": crptext, "roomId": real_id, "anchorName": room.get("nickname") or room.get("owner_name") or "斗鱼主播", "avatar": raw_av, "isLive": True}
+    except HTTPException: raise
+    except Exception as e: print(f"[斗鱼] 解析异常: {e}"); raise HTTPException(500, f"斗鱼解析失败: {str(e)}")
 
-        return {
-            "client": True,
-            "crptext": crptext,
-            "roomId": real_id,
-            "anchorName": room.get("nickname") or room.get("owner_name") or "斗鱼主播",
-            "avatar": raw_av,
-            "isLive": True
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[斗鱼] 解析异常: {e}")
-        raise HTTPException(500, f"斗鱼解析失败: {str(e)}")
-
-
-# ==================== B站 ====================
 async def parse_bilibili(url):
     try:
         rid = url.rstrip("/").split("/")[-1].split("?")[0]
         hdrs = {"User-Agent": UA, "Referer": "https://live.bilibili.com/"}
         async with httpx.AsyncClient(timeout=15, headers=hdrs) as c:
             room_resp = (await c.get(f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={rid}")).json()
-            if room_resp.get("code") != 0:
-                raise HTTPException(400, f"B站房间信息失败: {room_resp.get('message')}")
+            if room_resp.get("code") != 0: raise HTTPException(400, f"B站房间信息失败: {room_resp.get('message')}")
             real_rid = room_resp["data"]["room_id"]
-            if room_resp["data"].get("live_status") != 1:
-                raise HTTPException(400, "B站：未开播")
-
-            play = (await c.get(
-                f"https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
-                f"?room_id={real_rid}&protocol=0,1&format=0,1,2&codec=0,1&qn=10000&platform=web&ptype=8"
-            )).json()
-            if play.get("code") != 0:
-                raise HTTPException(400, f"B站拉流失败: {play.get('message')}")
-
+            if room_resp["data"].get("live_status") != 1: raise HTTPException(400, "B站：未开播")
+            play = (await c.get(f"https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id={real_rid}&protocol=0,1&format=0,1,2&codec=0,1&qn=10000&platform=web&ptype=8")).json()
+            if play.get("code") != 0: raise HTTPException(400, f"B站拉流失败: {play.get('message')}")
             playurl = play["data"].get("playurl_info", {}).get("playurl", {})
             streams, seen = [], set()
             for stream in playurl.get("stream", []):
@@ -266,30 +162,20 @@ async def parse_bilibili(url):
                             if u not in seen:
                                 seen.add(u)
                                 m = re.search(r"([a-z0-9]+)\.bilivideo", info["host"])
-                                streams.append({"cdn": f"{fmt['format_name'].upper()}-{m.group(1) if m else 'cdn'}",
-                                               "url": u, "type": "flv" if fmt["format_name"] == "flv" else "m3u8"})
+                                streams.append({"cdn": f"{fmt['format_name'].upper()}-{m.group(1) if m else 'cdn'}", "url": u, "type": "flv" if fmt["format_name"] == "flv" else "m3u8"})
             streams.sort(key=lambda x: 0 if x["type"] == "flv" else 1)
-            if not streams:
-                raise HTTPException(400, "B站：流地址提取失败")
-
+            if not streams: raise HTTPException(400, "B站：流地址提取失败")
             name, avatar = "B站主播", ""
             try:
                 ir = (await c.get(f"https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id={real_rid}")).json()
                 ri = ir.get("data", {}).get("room_info", {})
                 name = ri.get("uname") or ri.get("owner_name") or name
                 avatar = ri.get("face") or avatar
-            except Exception:
-                pass
-
+            except Exception: pass
             return {"streams": streams[:4], "title": name, "avatar": avatar}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[B站] 解析异常: {e}")
-        raise HTTPException(500, f"B站解析失败: {str(e)}")
+    except HTTPException: raise
+    except Exception as e: print(f"[B站] 解析异常: {e}"); raise HTTPException(500, f"B站解析失败: {str(e)}")
 
-
-# ==================== 抖音流解析 ====================
 async def parse_douyin(url):
     try:
         from streamget import DouyinLiveStream
@@ -298,9 +184,7 @@ async def parse_douyin(url):
         stream_obj = await live.fetch_stream_url(data, "OD")
         raw = json.loads(stream_obj.to_json())
         streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
-        if not streams:
-            raise HTTPException(400, f"抖音未获取到流，可能未开播或链接无效")
-
+        if not streams: raise HTTPException(400, f"抖音未获取到流，可能未开播或链接无效")
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         if not room_id.isdigit():
             try:
@@ -308,91 +192,66 @@ async def parse_douyin(url):
                     resp = await c.get(url, headers={"User-Agent": UA})
                     html = resp.text
                     match = re.search(r'"room_id":"(\d+)"', html)
-                    if match:
-                        room_id = match.group(1)
-            except Exception:
-                pass
-
-        # 提取 ttwid
+                    if match: room_id = match.group(1)
+            except Exception: pass
         ttwid = ""
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 resp = await c.get(url, headers={"User-Agent": UA})
                 for cookie in resp.cookies:
-                    if cookie.name == "ttwid":
-                        ttwid = cookie.value
-                        break
-        except Exception:
-            pass
+                    if cookie.name == "ttwid": ttwid = cookie.value; break
+        except Exception: pass
+        return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"), "avatar": raw.get("avatar", ""), "roomId": room_id, "ttwid": ttwid}
+    except HTTPException: raise
+    except Exception as e: print(f"[抖音] 解析异常: {e}"); raise HTTPException(500, f"抖音解析失败: {str(e)}")
 
-        return {
-            "streams": streams,
-            "title": raw.get("anchor_name", "抖音主播"),
-            "avatar": raw.get("avatar", ""),
-            "roomId": room_id,
-            "ttwid": ttwid
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[抖音] 解析异常: {e}")
-        raise HTTPException(500, f"抖音解析失败: {str(e)}")
-
-
-# ==================== 抖音弹幕签名（使用 ac_signature） ====================
-def get_douyin_signature(room_id: str, ttwid: str = "") -> str:
+# --- 核心修正：抖音弹幕签名生成 ---
+def get_signature(md5_str: str) -> str:
+    """调用 sign.js 中的 get_sign 函数，传入 MD5 字符串，返回签名"""
     try:
-        site = "live.douyin.com"
-        # 使用时间戳+随机数作为 nonce
-        nonce = hashlib.md5(f"{room_id}{ttwid}{int(time.time()*1000)}".encode()).hexdigest()[:16]
-        ua = UA
-        timestamp = int(time.time())
-        sig = ac_signature.get__ac_signature(site, nonce, ua, timestamp)
-        print(f"[签名] ac_signature 生成成功: {sig}")
-        return sig
-    except Exception as e:
-        print(f"[签名] ac_signature 生成失败: {e}")
-        return ""
+        with open("sign.js", "r", encoding="utf-8") as f: js_code = f.read()
+        ctx = execjs.compile(js_code)
+        return ctx.call("get_sign", md5_str)
+    except Exception as e: print(f"[签名] 生成失败: {e}"); return ""
 
-
-# ==================== 抖音弹幕采集器 ====================
+# --- 核心修正：抖音弹幕采集器 (完整版) ---
 def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threading.Event, callback):
-    signature = get_douyin_signature(room_id, ttwid)
-
-    # 生成随机的设备ID (did)
-    did = ''.join(random.choices('0123456789abcdef', k=32))
-    first_req_ms = int(time.time() * 1000)
-    fetch_time = first_req_ms
-
-    ws_url = (
+    # 1. 构造 WebSocket 基础 URL
+    user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
+    base_ws_url = (
         f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/"
         f"?app_name=douyin_web&version_code=180800&webcast_sdk_version=1.0.14"
         f"&update_version_code=1.0.14&compress=gzip&internal_ext=internal_src:dim"
-        f"|wss_push_room_id:{room_id}|wss_push_did:{did}|first_req_ms:{first_req_ms}"
-        f"|fetch_time:{fetch_time}|seq:1|wss_info:0-0-0-0"
+        f"|wss_push_room_id:{room_id}|wss_push_did:0|first_req_ms:{int(time.time()*1000)}"
+        f"|fetch_time:{int(time.time()*1000)}|seq:1|wss_info:0-0-0-0"
         f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&debug=false"
-        f"&endpoint=live&support_wrds=1&im_path=/webcast/im/fetch/&user_unique_id={did}"
+        f"&endpoint=live&support_wrds=1&im_path=/webcast/im/fetch/&user_unique_id={user_unique_id}"
         f"&device_platform=web&cookie_enabled=true&screen_width=1920&screen_height=1080"
         f"&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome"
         f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
-        f"&identity=audience&room_id={room_id}&heartbeatDuration=0&signature={signature}"
+        f"&identity=audience&room_id={room_id}&heartbeatDuration=0"
     )
-    print(f"[抖音弹幕] 连接 URL (部分): {ws_url[:200]}...")
 
-    # 构造 Headers
-    headers = {
-        "User-Agent": UA,
-        "Origin": "https://live.douyin.com",
-        "Referer": f"https://live.douyin.com/{room_id}",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "Upgrade",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
-        "Upgrade": "websocket",
-        "Sec-WebSocket-Version": "13",
-        "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
-    }
+    # 2. 提取参数并生成 MD5
+    params_order = ("live_id,aid,version_code,webcast_sdk_version,room_id,sub_room_id,sub_channel_id,did_rule,user_unique_id,device_platform,device_type,ac,identity").split(',')
+    parsed = urlparse(base_ws_url)
+    qs_dict = parse_qs(parsed.query)
+    wss_maps = {k: v[0] if isinstance(v, list) else v for k, v in qs_dict.items()}
+    param_parts = [f"{p}={wss_maps.get(p, '')}" for p in params_order]
+    param_str = ','.join(param_parts)
+    md5_str = hashlib.md5(param_str.encode()).hexdigest()
+    print(f"[签名] 拼接参数: {param_str[:100]}...")
+    print(f"[签名] MD5: {md5_str}")
+
+    # 3. 生成签名
+    signature = get_signature(md5_str)
+    print(f"[签名] 生成成功: {signature}")
+
+    # 4. 拼接最终 WebSocket URL
+    ws_url = f"{base_ws_url}&signature={signature}"
+
+    # 5. 建立连接
+    headers = {}
     if ttwid:
         headers["Cookie"] = f"ttwid={ttwid}"
         print(f"[抖音弹幕] 携带 Cookie: ttwid={ttwid[:20]}...")
@@ -405,170 +264,97 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
             while not stop_event.is_set():
                 time.sleep(10)
                 try:
-                    if ws.sock and ws.sock.connected:
-                        ws.send(b"", opcode=websocket.ABNF.OPCODE_PING)
-                except Exception:
-                    break
+                    if ws.sock and ws.sock.connected: ws.send(b"", opcode=websocket.ABNF.OPCODE_PING)
+                except Exception: break
         threading.Thread(target=heartbeat, daemon=True).start()
 
     def on_message(ws, message):
-        if stop_event.is_set():
-            return
+        if stop_event.is_set(): return
         print(f"[抖音弹幕] 收到原始数据，长度: {len(message)}")
         try:
             push_frame = douyin.PushFrame().parse(message)
             response = douyin.Response().parse(push_frame.payload)
             for msg in response.messages_list:
-                method = msg.method
-                payload = msg.payload
+                method, payload = msg.method, msg.payload
                 if method == "WebcastChatMessage":
                     try:
                         chat = douyin.ChatMessage().parse(payload)
                         if chat and chat.user and chat.content:
                             nick = chat.user.nick_name or "匿名用户"
                             content = chat.content or ""
-                            callback({
-                                "type": "chat",
-                                "nick": nick,
-                                "content": content,
-                                "time": int(time.time() * 1000)
-                            })
-                    except Exception as e:
-                        print(f"[抖音弹幕] 解析聊天出错: {e}")
+                            callback({"type": "chat", "nick": nick, "content": content, "time": int(time.time() * 1000)})
+                    except Exception as e: print(f"[抖音弹幕] 解析聊天出错: {e}")
                 elif method == "WebcastGiftMessage":
                     try:
                         gift = douyin.GiftMessage().parse(payload)
                         if gift and gift.user:
                             nick = gift.user.nick_name or "匿名用户"
                             gift_name = gift.gift.name if gift.gift else "礼物"
-                            callback({
-                                "type": "gift",
-                                "nick": nick,
-                                "gift": gift_name,
-                                "count": gift.repeat_count,
-                                "time": int(time.time() * 1000)
-                            })
-                    except Exception as e:
-                        print(f"[抖音弹幕] 解析礼物出错: {e}")
+                            callback({"type": "gift", "nick": nick, "gift": gift_name, "count": gift.repeat_count, "time": int(time.time() * 1000)})
+                    except Exception as e: print(f"[抖音弹幕] 解析礼物出错: {e}")
                 elif method == "WebcastLikeMessage":
                     try:
                         like = douyin.LikeMessage().parse(payload)
                         if like and like.user:
                             nick = like.user.nick_name or "匿名用户"
-                            callback({
-                                "type": "like",
-                                "nick": nick,
-                                "count": like.count,
-                                "time": int(time.time() * 1000)
-                            })
-                    except Exception as e:
-                        print(f"[抖音弹幕] 解析点赞出错: {e}")
-        except Exception as e:
-            print(f"[抖音弹幕] 解析顶层错误: {e}")
+                            callback({"type": "like", "nick": nick, "count": like.count, "time": int(time.time() * 1000)})
+                    except Exception as e: print(f"[抖音弹幕] 解析点赞出错: {e}")
+        except Exception as e: print(f"[抖音弹幕] 解析顶层错误: {e}")
 
-    def on_error(ws, error):
-        print(f"[抖音弹幕] WebSocket 错误: {error}")
-
+    def on_error(ws, error): print(f"[抖音弹幕] WebSocket 错误: {error}")
     def on_close(ws, close_status_code, close_msg):
         print(f"[抖音弹幕] 连接关闭: {close_status_code} {close_msg}")
-        if not stop_event.is_set():
-            time.sleep(3)
-            douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
+        if not stop_event.is_set(): time.sleep(3); douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
 
-    ws = websocket.WebSocketApp(
-        ws_url,
-        header=headers,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-    )
+    ws = websocket.WebSocketApp(ws_url, header=headers, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
 
-
-# ==================== WebSocket 路由 ====================
+# --- WebSocket 路由 (保持不变) ---
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
-
     ttwid = ""
     try:
         async with httpx.AsyncClient(timeout=5) as c:
             resp = await c.get(f"https://live.douyin.com/{room_id}", headers={"User-Agent": UA})
-            # 修复：遍历 cookies 的 jar，使用 .name 属性
-            for cookie in resp.cookies.jar:
-                if cookie.name == "ttwid":
-                    ttwid = cookie.value
-                    break
-    except Exception as e:
-        print(f"[ttwid] 获取失败: {e}")
-
-    if not ttwid:
-        # 使用一个已知可用的临时 ttwid（注意时效性）
-        ttwid = "1%7C4wagw0hsIt3PxkJW"
-        print(f"[ttwid] 使用临时值: {ttwid}")
-
+            for cookie in resp.cookies:
+                if cookie.name == "ttwid": ttwid = cookie.value; break
+    except Exception: pass
+    if not ttwid: print("[ttwid] 获取失败，将尝试不带 ttwid 连接")
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
-
-    def callback(msg):
-        asyncio.run_coroutine_threadsafe(message_queue.put(msg), loop)
-
+    def callback(msg): asyncio.run_coroutine_threadsafe(message_queue.put(msg), loop)
     loop = asyncio.get_event_loop()
-    task = loop.run_in_executor(
-        None,
-        lambda: douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
-    )
-
+    task = loop.run_in_executor(None, lambda: douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback))
     async def send_worker():
         while not stop_event.is_set():
-            try:
-                msg = await asyncio.wait_for(message_queue.get(), timeout=1.0)
-                await websocket.send_json(msg)
-            except asyncio.TimeoutError:
-                continue
-            except Exception:
-                break
-
+            try: msg = await asyncio.wait_for(message_queue.get(), timeout=1.0); await websocket.send_json(msg)
+            except asyncio.TimeoutError: continue
+            except Exception: break
     send_task = asyncio.create_task(send_worker())
-
     try:
         while True:
             data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_text("pong")
-    except WebSocketDisconnect:
-        print(f"[WS] 前端断开抖音弹幕: {room_id}")
+            if data == "ping": await websocket.send_text("pong")
+    except WebSocketDisconnect: print(f"[WS] 前端断开抖音弹幕: {room_id}")
     finally:
-        stop_event.set()
-        send_task.cancel()
-        try:
-            await send_task
-        except:
-            pass
+        stop_event.set(); send_task.cancel()
+        try: await send_task
+        except: pass
         task.cancel()
 
-
-# ==================== /api/parse 路由 ====================
+# --- /api/parse 路由 (保持不变) ---
 @app.get("/api/parse")
 async def api_parse(url: str = Query(...)):
     try:
-        if "huya.com" in url:
-            return await parse_huya(url)
-        if "douyu.com" in url:
-            return await parse_douyu(url)
-        if "bilibili.com" in url:
-            return await parse_bilibili(url)
-        if "douyin.com" in url:
-            return await parse_douyin(url)
+        if "huya.com" in url: return await parse_huya(url)
+        if "douyu.com" in url: return await parse_douyu(url)
+        if "bilibili.com" in url: return await parse_bilibili(url)
+        if "douyin.com" in url: return await parse_douyin(url)
         raise HTTPException(400, "不支持的平台")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(500, str(e))
 
 @app.get("/")
-def root():
-    return {"status": "ok", "message": "多平台直播解析 API"}
+def root(): return {"status": "ok", "message": "多平台直播解析 API"}
