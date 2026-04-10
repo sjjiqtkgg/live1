@@ -9,7 +9,7 @@ import base64
 import random
 import execjs
 import websocket
-import ac_signature  # 导入 ac_signature 模块
+import ac_signature
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -341,14 +341,11 @@ async def parse_douyin(url):
 
 # ==================== 抖音弹幕签名（使用 ac_signature） ====================
 def get_douyin_signature(room_id: str, ttwid: str = "") -> str:
-    """使用 ac_signature 模块生成签名"""
     try:
-        # 构造参数
         site = "live.douyin.com"
-        nonce = f"{room_id}{ttwid}"[:32]  # 随机字符串，用 room_id+ttwid 前32位
+        nonce = hashlib.md5(f"{room_id}{ttwid}".encode()).hexdigest()[:16]
         ua = UA
         timestamp = int(time.time())
-        # 调用 ac_signature 中的函数
         sig = ac_signature.get__ac_signature(site, nonce, ua, timestamp)
         print(f"[签名] ac_signature 生成成功: {sig}")
         return sig
@@ -374,7 +371,15 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
         f"&identity=audience&room_id={room_id}&heartbeatDuration=0&signature={signature}"
     )
-    print(f"[抖音弹幕] 连接 URL: {ws_url[:200]}...")
+    print(f"[抖音弹幕] 连接 URL (部分): {ws_url[:200]}...")
+
+    # 构造 Cookie 头
+    headers = {}
+    if ttwid:
+        headers["Cookie"] = f"ttwid={ttwid}"
+        print(f"[抖音弹幕] 携带 Cookie: ttwid={ttwid[:20]}...")
+    else:
+        print("[抖音弹幕] 警告: 未获取到 ttwid，连接可能失败")
 
     def on_open(ws):
         print(f"[抖音弹幕] 已连接房间 {room_id}")
@@ -454,6 +459,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
 
     ws = websocket.WebSocketApp(
         ws_url,
+        header=headers,
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
