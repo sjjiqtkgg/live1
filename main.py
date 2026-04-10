@@ -301,22 +301,25 @@ async def parse_douyin(url):
 
 
 # ==================== 抖音弹幕采集器 ====================
-def get_douyin_signature(room_id: str, ttwid: str = "") -> str:
-    """调用项目中的 sign.js 生成签名"""
+# 修改后的签名函数
+def get_douyin_signature(md5_str: str) -> str:
     try:
         with open("sign.js", "r", encoding="utf-8") as f:
             js_code = f.read()
         ctx = execjs.compile(js_code)
-        signature = ctx.call("get_signature", room_id, ttwid)
-        return signature
+        bogus = ctx.call("get_sign", md5_str)
+        return bogus
     except Exception as e:
         print(f"[签名] 生成失败: {e}")
         return ""
 
-
+# 修改后的采集器（片段）
 def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threading.Event, callback):
-    """在独立线程中运行，连接抖音弹幕服务器，并通过 callback 推送消息"""
-    signature = get_douyin_signature(room_id, ttwid)
+    import hashlib
+    # 生成 MD5（规则可能需要调整）
+    md5_input = f"{room_id}{ttwid}"
+    md5_str = hashlib.md5(md5_input.encode()).hexdigest()
+    signature = get_douyin_signature(md5_str)
     ws_url = (
         f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/"
         f"?app_name=douyin_web&version_code=180800&webcast_sdk_version=1.0.14"
@@ -330,6 +333,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
         f"&identity=audience&room_id={room_id}&heartbeatDuration=0&signature={signature}"
     )
+    # 后续不变...
 
     def on_open(ws):
         print(f"[抖音弹幕] 已连接房间 {room_id}")
