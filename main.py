@@ -338,43 +338,45 @@ async def parse_douyin(url):
         raise HTTPException(500, f"抖音解析失败: {str(e)}")
 
 
-# ==================== 抖音弹幕签名 ====================
-def get_douyin_signature(md5_str: str) -> str:
-    """调用 sign.js 中的 get_sign 函数"""
-    try:
-        with open("sign.js", "r", encoding="utf-8") as f:
-            js_code = f.read()
-        ctx = execjs.compile(js_code)
-        # 尝试多种可能的函数名
-        for func_name in ["get_sign", "sign", "getSignature"]:
-            if hasattr(ctx, func_name):
-                bogus = ctx.call(func_name, md5_str)
-                print(f"[签名] 使用函数 {func_name} 成功，md5={md5_str} -> bogus={bogus}")
-                return bogus
-        raise Exception("未找到签名函数")
-    except Exception as e:
-        print(f"[签名] 生成失败: {e}")
+# ==================== 抖音弹幕签名 (使用 ac_signature) ====================
+try:
+    import ac_signature
+except ImportError:
+    ac_signature = None
+    print("[签名] 警告: ac_signature.py 未找到，将无法生成签名")
+
+
+def get_douyin_signature(room_id: str, ttwid: str = "") -> str:
+    """使用 ac_signature 模块生成签名"""
+    if ac_signature is None:
+        print("[签名] ac_signature 模块未导入")
         return ""
-
-
-def generate_md5_for_douyin(room_id: str, ttwid: str = "") -> str:
-    """尝试多种 MD5 组合，返回可能正确的签名用 MD5"""
-    # 尝试 1: room_id + ttwid
-    s1 = f"{room_id}{ttwid}"
-    # 尝试 2: room_id + ttwid + 固定后缀
-    s2 = f"{room_id}{ttwid}webcast"
-    # 尝试 3: 仅 room_id
-    s3 = room_id
-    # 返回第一个非空的 MD5（默认用 s1）
-    md5_val = hashlib.md5(s1.encode()).hexdigest()
-    print(f"[签名] 使用组合: {s1} -> {md5_val}")
-    return md5_val
+    try:
+        # 尝试调用可能存在的函数名
+        # 常见函数名: get_x_bogus, get_bogus, sign, get_signature
+        # 根据 ac_signature.py 的实际内容选择，这里先尝试 get_x_bogus
+        # 如果函数名不同，请自行修改下面这行
+        params = f"room_id={room_id}&ttwid={ttwid}"
+        if hasattr(ac_signature, "get_x_bogus"):
+            signature = ac_signature.get_x_bogus(params)
+        elif hasattr(ac_signature, "get_bogus"):
+            signature = ac_signature.get_bogus(params)
+        elif hasattr(ac_signature, "sign"):
+            signature = ac_signature.sign(params)
+        else:
+            # 打印所有可用属性，便于调试
+            print("[签名] ac_signature 中的可用属性:", [attr for attr in dir(ac_signature) if not attr.startswith("_")])
+            raise Exception("未找到可用的签名函数")
+        print(f"[签名] ac_signature 生成成功: {signature}")
+        return signature
+    except Exception as e:
+        print(f"[签名] ac_signature 生成失败: {e}")
+        return ""
 
 
 # ==================== 抖音弹幕采集器 ====================
 def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threading.Event, callback):
-    md5_str = generate_md5_for_douyin(room_id, ttwid)
-    signature = get_douyin_signature(md5_str)
+    signature = get_douyin_signature(room_id, ttwid)
 
     ws_url = (
         f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/"
@@ -389,7 +391,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
         f"&identity=audience&room_id={room_id}&heartbeatDuration=0&signature={signature}"
     )
-    print(f"[抖音弹幕] 连接 URL: {ws_url[:200]}...")
+    print(f"[抖音弹幕] 连接 URL (签名部分): signature={signature[:20]}...")
 
     def on_open(ws):
         print(f"[抖音弹幕] 已连接房间 {room_id}")
@@ -406,7 +408,6 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
     def on_message(ws, message):
         if stop_event.is_set():
             return
-        print(f"[抖音弹幕] 收到原始数据，长度: {len(message)}")
         try:
             push_frame = douyin.PushFrame().parse(message)
             response = douyin.Response().parse(push_frame.payload)
@@ -426,7 +427,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                                 "time": int(time.time() * 1000)
                             })
                     except Exception as e:
-                        print(f"[抖音弹幕] 解析聊天出错: {e}")
+                        pass
                 elif method == "WebcastGiftMessage":
                     try:
                         gift = douyin.GiftMessage().parse(payload)
@@ -441,7 +442,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                                 "time": int(time.time() * 1000)
                             })
                     except Exception as e:
-                        print(f"[抖音弹幕] 解析礼物出错: {e}")
+                        pass
                 elif method == "WebcastLikeMessage":
                     try:
                         like = douyin.LikeMessage().parse(payload)
@@ -454,9 +455,9 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                                 "time": int(time.time() * 1000)
                             })
                     except Exception as e:
-                        print(f"[抖音弹幕] 解析点赞出错: {e}")
+                        pass
         except Exception as e:
-            print(f"[抖音弹幕] 解析顶层错误: {e}")
+            pass
 
     def on_error(ws, error):
         print(f"[抖音弹幕] WebSocket 错误: {error}")
@@ -483,7 +484,6 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
 
-    # 获取 ttwid
     ttwid = ""
     try:
         async with httpx.AsyncClient(timeout=5) as c:
