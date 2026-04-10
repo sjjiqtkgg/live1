@@ -313,8 +313,31 @@ async def parse_douyin(url):
             except Exception:
                 pass
 
-        # 尝试获取 ttwid
-        ttwid = await fetch_ttwid(url)
+        # 提取 ttwid 和可能的其他 Cookie
+        ttwid = ""
+        cookie_str = ""
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                resp = await c.get(url, headers={"User-Agent": UA})
+                # 从响应 cookies 提取 ttwid
+                for cookie in resp.cookies.jar:
+                    if cookie.name == "ttwid":
+                        ttwid = cookie.value
+                        break
+                # 同时获取原始 Set-Cookie 头中的 ttwid 以防提取失败
+                if not ttwid:
+                    set_cookie = resp.headers.get("set-cookie", "")
+                    match = re.search(r"ttwid=([^;]+)", set_cookie)
+                    if match:
+                        ttwid = match.group(1)
+        except Exception as e:
+            print(f"[ttwid] 获取异常: {e}")
+
+        # 如果还是没有，使用一个硬编码的备用值（可能随时失效）
+        if not ttwid:
+            ttwid = "1%7C9856186429"
+            print("[ttwid] 使用备用值")
+
         return {
             "streams": streams,
             "title": raw.get("anchor_name", "抖音主播"),
@@ -327,39 +350,6 @@ async def parse_douyin(url):
     except Exception as e:
         print(f"[抖音] 解析异常: {e}")
         raise HTTPException(500, f"抖音解析失败: {str(e)}")
-
-
-# ==================== 获取 ttwid ====================
-async def fetch_ttwid(url: str = None) -> str:
-    """尝试从抖音页面获取 ttwid，失败则生成一个临时可用的"""
-    try:
-        headers = {
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-        }
-        async with httpx.AsyncClient(timeout=8) as c:
-            if url:
-                resp = await c.get(url, headers=headers)
-            else:
-                resp = await c.get("https://live.douyin.com/", headers=headers)
-            for cookie in resp.cookies:
-                if cookie.name == "ttwid":
-                    print(f"[ttwid] 获取成功: {cookie.value[:30]}...")
-                    return cookie.value
-    except Exception as e:
-        print(f"[ttwid] 获取失败: {e}")
-    # 返回一个常见的格式，虽然不是真实有效，但有时能绕过简单检查
-    fallback = f"1%7C{random.randint(1000000000, 9999999999)}"
-    print(f"[ttwid] 使用临时值: {fallback}")
-    return fallback
 
 
 # ==================== 抖音弹幕签名 ====================
@@ -394,13 +384,18 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
         f"&identity=audience&room_id={room_id}&heartbeatDuration=0&signature={signature}"
     )
+    print(f"[抖音弹幕] 连接 URL (部分): {ws_url[:200]}...")
 
-    headers = {
-        "User-Agent": UA,
-        "Origin": "https://live.douyin.com",
-        "Cookie": f"ttwid={ttwid}"
-    }
-    print(f"[抖音弹幕] 携带 Cookie: ttwid={ttwid[:30]}...")
+    # 构造 Cookie 头：必须包含 ttwid，尝试加入其他常见 Cookie
+    headers = {}
+    if ttwid:
+        cookie_value = f"ttwid={ttwid}"
+        # 可添加其他常见字段（不一定需要，但试试看）
+        cookie_value += "; s_v_web_id=verify_m1uhb6l8_1d9c6e1a; msToken=...;"
+        headers["Cookie"] = cookie_value
+        print(f"[抖音弹幕] 携带 Cookie: ttwid={ttwid[:20]}...")
+    else:
+        print("[抖音弹幕] 警告: 未获取到 ttwid，连接可能失败")
 
     def on_open(ws):
         print(f"[抖音弹幕] 已连接房间 {room_id}")
@@ -495,7 +490,27 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
 
-    ttwid = await fetch_ttwid(f"https://live.douyin.com/{room_id}")
+    # 尝试获取 ttwid
+    ttwid = ""
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            resp = await c.get(f"https://live.douyin.com/{room_id}", headers={"User-Agent": UA})
+            # 从 cookies jar 中提取
+            for cookie in resp.cookies.jar:
+                if cookie.name == "ttwid":
+                    ttwid = cookie.value
+                    break
+            if not ttwid:
+                set_cookie = resp.headers.get("set-cookie", "")
+                match = re.search(r"ttwid=([^;]+)", set_cookie)
+                if match:
+                    ttwid = match.group(1)
+    except Exception as e:
+        print(f"[ttwid] 获取失败: {e}")
+
+    if not ttwid:
+        ttwid = "1%7C9856186429"  # 备用值
+        print("[ttwid] 使用临时值")
 
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
