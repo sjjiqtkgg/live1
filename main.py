@@ -9,6 +9,7 @@ import base64
 import random
 import execjs
 import websocket
+import ac_signature  # 导入 ac_signature 模块
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -338,37 +339,19 @@ async def parse_douyin(url):
         raise HTTPException(500, f"抖音解析失败: {str(e)}")
 
 
-# ==================== 抖音弹幕签名 (使用 ac_signature) ====================
-try:
-    import ac_signature
-except ImportError:
-    ac_signature = None
-    print("[签名] 警告: ac_signature.py 未找到，将无法生成签名")
-
-
+# ==================== 抖音弹幕签名（使用 ac_signature） ====================
 def get_douyin_signature(room_id: str, ttwid: str = "") -> str:
     """使用 ac_signature 模块生成签名"""
-    if ac_signature is None:
-        print("[签名] ac_signature 模块未导入")
-        return ""
     try:
-        # 尝试调用可能存在的函数名
-        # 常见函数名: get_x_bogus, get_bogus, sign, get_signature
-        # 根据 ac_signature.py 的实际内容选择，这里先尝试 get_x_bogus
-        # 如果函数名不同，请自行修改下面这行
-        params = f"room_id={room_id}&ttwid={ttwid}"
-        if hasattr(ac_signature, "get_x_bogus"):
-            signature = ac_signature.get_x_bogus(params)
-        elif hasattr(ac_signature, "get_bogus"):
-            signature = ac_signature.get_bogus(params)
-        elif hasattr(ac_signature, "sign"):
-            signature = ac_signature.sign(params)
-        else:
-            # 打印所有可用属性，便于调试
-            print("[签名] ac_signature 中的可用属性:", [attr for attr in dir(ac_signature) if not attr.startswith("_")])
-            raise Exception("未找到可用的签名函数")
-        print(f"[签名] ac_signature 生成成功: {signature}")
-        return signature
+        # 构造参数
+        site = "live.douyin.com"
+        nonce = f"{room_id}{ttwid}"[:32]  # 随机字符串，用 room_id+ttwid 前32位
+        ua = UA
+        timestamp = int(time.time())
+        # 调用 ac_signature 中的函数
+        sig = ac_signature.get__ac_signature(site, nonce, ua, timestamp)
+        print(f"[签名] ac_signature 生成成功: {sig}")
+        return sig
     except Exception as e:
         print(f"[签名] ac_signature 生成失败: {e}")
         return ""
@@ -391,7 +374,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
         f"&identity=audience&room_id={room_id}&heartbeatDuration=0&signature={signature}"
     )
-    print(f"[抖音弹幕] 连接 URL (签名部分): signature={signature[:20]}...")
+    print(f"[抖音弹幕] 连接 URL: {ws_url[:200]}...")
 
     def on_open(ws):
         print(f"[抖音弹幕] 已连接房间 {room_id}")
@@ -408,6 +391,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
     def on_message(ws, message):
         if stop_event.is_set():
             return
+        print(f"[抖音弹幕] 收到原始数据，长度: {len(message)}")
         try:
             push_frame = douyin.PushFrame().parse(message)
             response = douyin.Response().parse(push_frame.payload)
@@ -427,7 +411,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                                 "time": int(time.time() * 1000)
                             })
                     except Exception as e:
-                        pass
+                        print(f"[抖音弹幕] 解析聊天出错: {e}")
                 elif method == "WebcastGiftMessage":
                     try:
                         gift = douyin.GiftMessage().parse(payload)
@@ -442,7 +426,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                                 "time": int(time.time() * 1000)
                             })
                     except Exception as e:
-                        pass
+                        print(f"[抖音弹幕] 解析礼物出错: {e}")
                 elif method == "WebcastLikeMessage":
                     try:
                         like = douyin.LikeMessage().parse(payload)
@@ -455,9 +439,9 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                                 "time": int(time.time() * 1000)
                             })
                     except Exception as e:
-                        pass
+                        print(f"[抖音弹幕] 解析点赞出错: {e}")
         except Exception as e:
-            pass
+            print(f"[抖音弹幕] 解析顶层错误: {e}")
 
     def on_error(ws, error):
         print(f"[抖音弹幕] WebSocket 错误: {error}")
