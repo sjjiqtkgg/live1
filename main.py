@@ -1,5 +1,6 @@
 import json
 import re
+import os
 import httpx
 import asyncio
 import threading
@@ -15,10 +16,23 @@ from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs
 from protobuf import douyin
 
+# 用于 SOCKS5 代理的 WebSocket 支持
+try:
+    from python_socks.sync import Proxy
+    from python_socks import ProxyType
+    SOCKS_SUPPORT = True
+except ImportError:
+    SOCKS_SUPPORT = False
+    print("[警告] python_socks 未安装，WebSocket 将不使用代理")
+
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+
+# 从环境变量读取代理地址，默认为你提供的 SOCKS5 代理
+PROXY_URL = os.getenv("PROXY_URL", "socks5://134.175.238.113:1080")
+print(f"[代理] 使用代理: {PROXY_URL}")
 
 
 # ==================== /api/proxy ====================
@@ -42,7 +56,7 @@ async def api_proxy(request: Request,
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, proxy=PROXY_URL) as client:
         resp = await client.request(request.method, url, headers=headers, content=body)
 
     out_headers = {"Access-Control-Allow-Origin": "*"}
@@ -64,7 +78,7 @@ def build_streams(flv, m3u8):
 # ==================== 虎牙 ====================
 async def fetch_huya_danmaku_params(room_id):
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10, proxy=PROXY_URL) as c:
             r = await c.get(f"https://m.huya.com/{room_id}",
                             headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile", "Referer": "https://www.huya.com/"})
             html = r.text
@@ -106,7 +120,7 @@ async def parse_huya(url):
         CDN_NAMES = {"AL": "阿里云", "TX": "腾讯云", "HW": "华为云", "WS": "网宿", "BD": "百度云"}
         CDN_ORDER = {"TX": 0, "AL": 1, "HW": 2, "WS": 3, "BD": 4}
 
-        async with httpx.AsyncClient(timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15, proxy=PROXY_URL) as c:
             api_r = await c.get(
                 f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}",
                 headers={"User-Agent": UA, "Referer": "https://www.huya.com/"}
@@ -162,7 +176,7 @@ async def parse_huya(url):
 
         if not anchor_name:
             try:
-                async with httpx.AsyncClient(timeout=10) as c:
+                async with httpx.AsyncClient(timeout=10, proxy=PROXY_URL) as c:
                     mob_html = await c.get(
                         f"https://m.huya.com/{room_id}",
                         headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"}
@@ -203,7 +217,7 @@ async def parse_douyu(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         hdrs = {"User-Agent": UA, "Referer": f"https://www.douyu.com/{room_id}"}
-        async with httpx.AsyncClient(timeout=15, headers=hdrs) as c:
+        async with httpx.AsyncClient(timeout=15, headers=hdrs, proxy=PROXY_URL) as c:
             info = (await c.get(f"https://www.douyu.com/betard/{room_id}")).json()
             room = info.get("room")
             if not room:
@@ -240,7 +254,7 @@ async def parse_bilibili(url):
     try:
         rid = url.rstrip("/").split("/")[-1].split("?")[0]
         hdrs = {"User-Agent": UA, "Referer": "https://live.bilibili.com/"}
-        async with httpx.AsyncClient(timeout=15, headers=hdrs) as c:
+        async with httpx.AsyncClient(timeout=15, headers=hdrs, proxy=PROXY_URL) as c:
             room_resp = (await c.get(f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={rid}")).json()
             if room_resp.get("code") != 0:
                 raise HTTPException(400, f"B站房间信息失败: {room_resp.get('message')}")
@@ -303,7 +317,7 @@ async def parse_douyin(url):
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         if not room_id.isdigit():
             try:
-                async with httpx.AsyncClient(timeout=10) as c:
+                async with httpx.AsyncClient(timeout=10, proxy=PROXY_URL) as c:
                     resp = await c.get(url, headers={"User-Agent": UA})
                     html = resp.text
                     match = re.search(r'"room_id":"(\d+)"', html)
@@ -314,7 +328,7 @@ async def parse_douyin(url):
 
         ttwid = ""
         try:
-            async with httpx.AsyncClient(timeout=10) as c:
+            async with httpx.AsyncClient(timeout=10, proxy=PROXY_URL) as c:
                 resp = await c.get(url, headers={"User-Agent": UA})
                 for cookie in resp.cookies:
                     if cookie.name == "ttwid":
@@ -337,17 +351,8 @@ async def parse_douyin(url):
         raise HTTPException(500, f"抖音解析失败: {str(e)}")
 
 
-# ==================== 抖音弹幕签名 (参考 DTV 实现) ====================
-def generate_ms_token(length=107):
-    """生成抖音需要的 msToken Cookie"""
-    import string
-    base_str = string.ascii_letters + string.digits + "=_"
-    _len = len(base_str) - 1
-    return ''.join(base_str[random.randint(0, _len)] for _ in range(length))
-
-
+# ==================== 抖音弹幕签名 ====================
 def get_douyin_signature(md5_str: str) -> str:
-    """调用 sign.js 中的 get_sign 函数"""
     try:
         with open("sign.js", "r", encoding="utf-8") as f:
             js_code = f.read()
@@ -360,10 +365,8 @@ def get_douyin_signature(md5_str: str) -> str:
 
 
 def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threading.Event, callback):
-    # 生成 user_unique_id
     user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
 
-    # 构建基础 URL
     base_ws_url = (
         f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/"
         f"?app_name=douyin_web&version_code=180800&webcast_sdk_version=1.0.14"
@@ -378,7 +381,6 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         f"&identity=audience&room_id={room_id}&heartbeatDuration=0"
     )
 
-    # 提取参数并生成 MD5 (关键修复)
     params_order = ("live_id", "aid", "version_code", "webcast_sdk_version",
                     "room_id", "sub_room_id", "sub_channel_id", "did_rule",
                     "user_unique_id", "device_platform", "device_type", "ac", "identity")
@@ -394,10 +396,8 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
     signature = get_douyin_signature(md5_str)
     print(f"[签名] 生成成功: {signature}")
 
-    # 最终 URL
     ws_url = f"{base_ws_url}&signature={signature}"
 
-    # 构建 Cookie 头
     headers = {
         "User-Agent": UA,
         "Origin": "https://live.douyin.com",
@@ -485,14 +485,46 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
             time.sleep(3)
             douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
 
-    ws = websocket.WebSocketApp(
-        ws_url,
-        header=headers,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-    )
+    # 创建 WebSocket 连接，如果支持 SOCKS5 且代理协议是 socks5，则使用代理
+    if SOCKS_SUPPORT and PROXY_URL.startswith("socks5://"):
+        proxy_parts = urlparse(PROXY_URL)
+        proxy = Proxy.from_url(PROXY_URL)
+        # 通过 python_socks 建立代理隧道
+        sock = proxy.connect(("webcast3-ws-web-lq.douyin.com", 443))
+        ws = websocket.WebSocketApp(
+            ws_url,
+            header=headers,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            sock=sock
+        )
+    elif PROXY_URL.startswith("http://") or PROXY_URL.startswith("https://"):
+        # HTTP 代理支持
+        proxy_parts = urlparse(PROXY_URL)
+        ws = websocket.WebSocketApp(
+            ws_url,
+            header=headers,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            http_proxy_host=proxy_parts.hostname,
+            http_proxy_port=proxy_parts.port,
+            http_proxy_auth=(proxy_parts.username, proxy_parts.password) if proxy_parts.username else None,
+            proxy_type="http"
+        )
+    else:
+        # 无代理或协议不支持
+        ws = websocket.WebSocketApp(
+            ws_url,
+            header=headers,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
     ws.run_forever()
 
 
@@ -502,10 +534,9 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
 
-    # 尝试获取 ttwid
     ttwid = ""
     try:
-        async with httpx.AsyncClient(timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5, proxy=PROXY_URL) as c:
             resp = await c.get(f"https://live.douyin.com/{room_id}", headers={"User-Agent": UA})
             for cookie in resp.cookies:
                 if cookie.name == "ttwid":
