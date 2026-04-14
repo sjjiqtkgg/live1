@@ -31,7 +31,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 
 # 从环境变量读取代理地址，默认为你提供的 SOCKS5 代理
-PROXY_URL = os.getenv("PROXY_URL", "socks5://134.175.238.113:1080")
+PROXY_URL = os.getenv("PROXY_URL", "socks5://221.176.85.236:1080")
 print(f"[代理] 使用代理: {PROXY_URL}")
 
 
