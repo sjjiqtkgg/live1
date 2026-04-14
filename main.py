@@ -31,8 +31,16 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 
 # 从环境变量读取代理地址，默认为你提供的 SOCKS5 代理
-PROXY_URL = os.getenv("PROXY_URL", "socks5://123:123@175.178.111.81:1080")
+PROXY_URL = os.getenv("PROXY_URL", "socks5://123:123@175.178.251.18:1080")
 print(f"[代理] 使用代理: {PROXY_URL}")
+
+# 预置一个有效的 ttwid（请从你自己的浏览器中复制一个）
+FALLBACK_TTWID = "1%7C4wagw0hsIt3PxkJW..."  # 替换为你自己抓包得到的 ttwid
+
+# 加载 sign.js 并编译一次，全局复用
+with open("sign.js", "r", encoding="utf-8") as f:
+    SIGN_JS_CODE = f.read()
+SIGN_CTX = execjs.compile(SIGN_JS_CODE)
 
 
 # ==================== /api/proxy ====================
@@ -326,16 +334,38 @@ async def parse_douyin(url):
             except Exception:
                 pass
 
+        # 尝试获取 ttwid
         ttwid = ""
-        try:
-            async with httpx.AsyncClient(timeout=10, proxy=PROXY_URL) as c:
-                resp = await c.get(url, headers={"User-Agent": UA})
-                for cookie in resp.cookies:
-                    if cookie.name == "ttwid":
-                        ttwid = cookie.value
-                        break
-        except Exception:
-            pass
+        # 1. 从 streamget 内部获取（如果库支持）
+        if hasattr(live, 'cookies'):
+            ttwid = live.cookies.get("ttwid", "")
+            if ttwid:
+                print(f"[ttwid] 从 streamget 获取成功: {ttwid[:20]}...")
+        # 2. 独立请求
+        if not ttwid:
+            try:
+                async with httpx.AsyncClient(timeout=10, proxy=PROXY_URL) as c:
+                    resp = await c.get(
+                        url,
+                        headers={
+                            "User-Agent": UA,
+                            "Referer": "https://live.douyin.com/",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                            "Accept-Language": "zh-CN,zh;q=0.9",
+                            "Connection": "keep-alive",
+                        }
+                    )
+                    for cookie in resp.cookies:
+                        if cookie.name == "ttwid":
+                            ttwid = cookie.value
+                            print(f"[ttwid] 独立请求获取成功: {ttwid[:20]}...")
+                            break
+            except Exception as e:
+                print(f"[ttwid] 独立请求异常: {e}")
+        # 3. 使用 fallback
+        if not ttwid and FALLBACK_TTWID:
+            ttwid = FALLBACK_TTWID
+            print("[ttwid] 使用预置 fallback 值")
 
         return {
             "streams": streams,
@@ -352,13 +382,12 @@ async def parse_douyin(url):
 
 
 # ==================== 抖音弹幕签名 ====================
-def get_douyin_signature(md5_str: str) -> str:
+def generate_signature(md5_str: str) -> str:
+    """调用 sign.js 中的 crawler 函数生成 X-Bogus"""
     try:
-        with open("sign.js", "r", encoding="utf-8") as f:
-            js_code = f.read()
-        ctx = execjs.compile(js_code)
-        sig = ctx.call("get_sign", md5_str)
-        return sig
+        data = {"X-MS-STUB": md5_str}
+        bogus = SIGN_CTX.call("crawler", data)["X-Bogus"]
+        return bogus
     except Exception as e:
         print(f"[签名] 生成失败: {e}")
         return ""
@@ -367,6 +396,7 @@ def get_douyin_signature(md5_str: str) -> str:
 def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threading.Event, callback):
     user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
 
+    # 基础 URL（不包含 signature）
     base_ws_url = (
         f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/"
         f"?app_name=douyin_web&version_code=180800&webcast_sdk_version=1.0.14"
@@ -381,20 +411,10 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         f"&identity=audience&room_id={room_id}&heartbeatDuration=0"
     )
 
-    params_order = ("live_id", "aid", "version_code", "webcast_sdk_version",
-                    "room_id", "sub_room_id", "sub_channel_id", "did_rule",
-                    "user_unique_id", "device_platform", "device_type", "ac", "identity")
-    parsed = urlparse(base_ws_url)
-    qs_dict = parse_qs(parsed.query)
-    wss_maps = {k: v[0] if isinstance(v, list) else v for k, v in qs_dict.items()}
-    param_parts = [f"{p}={wss_maps.get(p, '')}" for p in params_order]
-    param_str = ','.join(param_parts)
-    md5_str = hashlib.md5(param_str.encode()).hexdigest()
-    print(f"[签名] 拼接参数: {param_str[:100]}...")
-    print(f"[签名] MD5: {md5_str}")
-
-    signature = get_douyin_signature(md5_str)
-    print(f"[签名] 生成成功: {signature}")
+    # 生成签名所需的 MD5：直接使用 room_id 的 MD5 作为 X-MS-STUB
+    md5_val = hashlib.md5(room_id.encode()).hexdigest()
+    signature = generate_signature(md5_val)
+    print(f"[签名] MD5: {md5_val} -> Bogus: {signature}")
 
     ws_url = f"{base_ws_url}&signature={signature}"
 
@@ -485,23 +505,31 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
             time.sleep(3)
             douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
 
-    # 创建 WebSocket 连接，如果支持 SOCKS5 且代理协议是 socks5，则使用代理
+    # 建立 WebSocket 连接，处理代理
     if SOCKS_SUPPORT and PROXY_URL.startswith("socks5://"):
-        proxy_parts = urlparse(PROXY_URL)
-        proxy = Proxy.from_url(PROXY_URL)
-        # 通过 python_socks 建立代理隧道
-        sock = proxy.connect(("webcast3-ws-web-lq.douyin.com", 443))
-        ws = websocket.WebSocketApp(
-            ws_url,
-            header=headers,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-            sock=sock
-        )
+        try:
+            proxy = Proxy.from_url(PROXY_URL)
+            sock = proxy.connect(("webcast3-ws-web-lq.douyin.com", 443))
+            ws = websocket.WebSocketApp(
+                ws_url,
+                header=headers,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                sock=sock
+            )
+        except Exception as e:
+            print(f"[代理] SOCKS5 连接失败: {e}，回退到直连")
+            ws = websocket.WebSocketApp(
+                ws_url,
+                header=headers,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
     elif PROXY_URL.startswith("http://") or PROXY_URL.startswith("https://"):
-        # HTTP 代理支持
         proxy_parts = urlparse(PROXY_URL)
         ws = websocket.WebSocketApp(
             ws_url,
@@ -516,7 +544,6 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
             proxy_type="http"
         )
     else:
-        # 无代理或协议不支持
         ws = websocket.WebSocketApp(
             ws_url,
             header=headers,
@@ -545,8 +572,9 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     except Exception:
         pass
 
-    if not ttwid:
-        print("[ttwid] 获取失败，将尝试不带 ttwid 连接")
+    if not ttwid and FALLBACK_TTWID:
+        ttwid = FALLBACK_TTWID
+        print("[ttwid] 使用预置 fallback 值")
 
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
