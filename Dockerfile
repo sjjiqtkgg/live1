@@ -2,10 +2,6 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# === 代理配置（可通过环境变量覆盖）===
-ENV PROXY_URL="socks5://123456:123456@101.35.141.124:1080"
-# 如果有认证，格式为: socks5://user:pass@134.175.238.113:1080
-
 # 安装系统依赖（Node.js 用于执行 sign.js）
 RUN apt-get update && \
     apt-get install -y nodejs npm && \
