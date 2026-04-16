@@ -390,19 +390,19 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
             time.sleep(3)
             douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
 
-    # 遍历代理建立 WebSocket 连接
+    
+        # 遍历代理建立 WebSocket 连接
     for idx, proxy_url in enumerate(PROXY_URLS):
         try:
             print(f"[抖音弹幕] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy_url}")
             if SOCKS_SUPPORT and proxy_url.startswith("socks5://"):
                 proxy = Proxy.from_url(proxy_url)
-                # 修正点：connect 接受 (host, port) 两个参数，不是元组
                 sock = proxy.connect("webcast3-ws-web-lq.douyin.com", 443)
                 ws = websocket.WebSocketApp(
                     ws_url, header=headers,
                     on_open=on_open, on_message=on_message,
                     on_error=on_error, on_close=on_close,
-                    sock=sock
+                    socket=sock          # 修正点：sock -> socket
                 )
             elif proxy_url.startswith("http://") or proxy_url.startswith("https://"):
                 proxy_parts = urlparse(proxy_url)
@@ -422,7 +422,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                     on_error=on_error, on_close=on_close,
                 )
             ws.run_forever()
-            break  # 连接成功并 run_forever 后退出循环
+            break
         except Exception as e:
             print(f"[抖音弹幕] 代理 {proxy_url} 失败: {e}，尝试下一个...")
             if idx == len(PROXY_URLS) - 1:
