@@ -30,41 +30,23 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 
-# ==================== 多代理支持 ====================
-# 从环境变量读取代理列表，逗号分隔，如：
-# PROXY_LIST = "socks5://user:pass@ip1:port,socks5://user:pass@ip2:port,socks5://ip3:port"
-PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://43.139.29.27:1111")
-PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
-print(f"[代理] 共加载 {len(PROXY_URLS)} 个代理: {PROXY_URLS}")
+# 从环境变量读取代理列表，支持多个代理用逗号分隔
+_proxy_raw = os.getenv("PROXY_LIST", os.getenv("PROXY_URL", "socks5://43.139.29.27:1111"))
+PROXY_LIST = [p.strip() for p in _proxy_raw.split(",") if p.strip()]
+print(f"[代理] 已加载 {len(PROXY_LIST)} 个代理: {PROXY_LIST}")
 
-
-def get_proxy_cycle():
-    """返回一个生成器，每次调用按顺序取下一个代理，实现轮询（失败时继续取下一个）"""
-    while True:
-        for proxy in PROXY_URLS:
-            yield proxy
-
-
-# ==================== 带重试的 HTTP 请求辅助函数 ====================
-async def request_with_retry(method: str, url: str, **kwargs):
-    """
-    使用代理列表重试 HTTP 请求，直到成功或所有代理均失败。
-    参数同 httpx.AsyncClient.request。
-    """
-    last_error = None
-    timeout = kwargs.pop("timeout", 15)
-
-    for proxy in PROXY_URLS:
+async def get_working_proxy() -> str:
+    """依次尝试代理列表，返回第一个可用的代理"""
+    for proxy in PROXY_LIST:
         try:
-            async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
-                resp = await client.request(method, url, **kwargs)
-                return resp
-        except Exception as e:
-            last_error = e
-            print(f"[请求重试] 代理 {proxy} 失败: {e}，尝试下一个...")
-            continue
-
-    raise last_error or Exception("所有代理均失败")
+            async with httpx.AsyncClient(timeout=5, proxy=proxy) as c:
+                await c.get("https://www.baidu.com")
+            print(f"[代理] 使用: {proxy}")
+            return proxy
+        except Exception:
+            print(f"[代理] 不可用，跳过: {proxy}")
+    print("[代理] 所有代理均不可用，尝试直连")
+    return None
 
 
 # ==================== /api/proxy ====================
@@ -88,8 +70,9 @@ async def api_proxy(request: Request,
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    # 使用重试函数
-    resp = await request_with_retry(request.method, url, headers=headers, content=body)
+    proxy = await get_working_proxy()
+    async with httpx.AsyncClient(timeout=15, proxy=proxy) as client:
+        resp = await client.request(request.method, url, headers=headers, content=body)
 
     out_headers = {"Access-Control-Allow-Origin": "*"}
     ct = resp.headers.get("content-type", "application/json")
@@ -110,17 +93,14 @@ def build_streams(flv, m3u8):
 # ==================== 虎牙 ====================
 async def fetch_huya_danmaku_params(room_id):
     try:
-        resp = await request_with_retry(
-            "GET",
-            f"https://m.huya.com/{room_id}",
-            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile",
-                     "Referer": "https://www.huya.com/"}
-        )
-        html = resp.text
-        ayyuid  = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
-        top_sid = int((re.search(r'"lChannelId":(\d+)', html) or [None, 0])[1])
-        sub_sid = int((re.search(r'"lSubChannelId":(\d+)', html) or [None, 0])[1])
-        return {"platform": "huya", "ayyuid": ayyuid, "topSid": top_sid, "subSid": sub_sid}
+        async with httpx.AsyncClient(timeout=10, proxy=await get_working_proxy()) as c:
+            r = await c.get(f"https://m.huya.com/{room_id}",
+                            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile", "Referer": "https://www.huya.com/"})
+            html = r.text
+            ayyuid  = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
+            top_sid = int((re.search(r'"lChannelId":(\d+)', html) or [None, 0])[1])
+            sub_sid = int((re.search(r'"lSubChannelId":(\d+)', html) or [None, 0])[1])
+            return {"platform": "huya", "ayyuid": ayyuid, "topSid": top_sid, "subSid": sub_sid}
     except Exception:
         return {}
 
@@ -155,20 +135,20 @@ async def parse_huya(url):
         CDN_NAMES = {"AL": "阿里云", "TX": "腾讯云", "HW": "华为云", "WS": "网宿", "BD": "百度云"}
         CDN_ORDER = {"TX": 0, "AL": 1, "HW": 2, "WS": 3, "BD": 4}
 
-        # 虎牙 API 请求
-        resp = await request_with_retry(
-            "GET",
-            f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}",
-            headers={"User-Agent": UA, "Referer": "https://www.huya.com/"}
-        )
-        data = resp.json()
+        async with httpx.AsyncClient(timeout=15, proxy=await get_working_proxy()) as c:
+            api_r = await c.get(
+                f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}",
+                headers={"User-Agent": UA, "Referer": "https://www.huya.com/"}
+            )
+            data = api_r.json()
 
         if data.get("status") != 200:
             raise HTTPException(400, f"虎牙 API 错误: {data.get('message', data.get('status'))}")
 
         live = data["data"]
         if live.get("realLiveStatus") != "ON":
-            raise HTTPException(400, "虎牙：该直播间未开播")
+            # 未开播，返回空结果
+            return {"streams": [], "title": "", "avatar": "", "danmaku": {}, "isLive": False}
 
         cdn_list = live.get("stream", {}).get("baseSteamInfoList", [])
         if not cdn_list:
@@ -212,20 +192,19 @@ async def parse_huya(url):
 
         if not anchor_name:
             try:
-                mob_resp = await request_with_retry(
-                    "GET",
-                    f"https://m.huya.com/{room_id}",
-                    headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"}
-                )
-                mob_html = mob_resp.text
-                title_match = re.search(r'<title>(.*?)</title>', mob_html)
-                if title_match:
-                    raw_title = title_match.group(1)
-                    anchor_name = raw_title.split("_")[0].strip()
-                else:
-                    nick_match = re.search(r'"nick":"([^"]+)"', mob_html)
-                    if nick_match:
-                        anchor_name = nick_match.group(1)
+                async with httpx.AsyncClient(timeout=10, proxy=await get_working_proxy()) as c:
+                    mob_html = await c.get(
+                        f"https://m.huya.com/{room_id}",
+                        headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"}
+                    )
+                    title_match = re.search(r'<title>(.*?)</title>', mob_html.text)
+                    if title_match:
+                        raw_title = title_match.group(1)
+                        anchor_name = raw_title.split("_")[0].strip()
+                    else:
+                        nick_match = re.search(r'"nick":"([^"]+)"', mob_html.text)
+                        if nick_match:
+                            anchor_name = nick_match.group(1)
             except Exception:
                 pass
 
@@ -241,7 +220,7 @@ async def parse_huya(url):
         )
 
         danmaku = await fetch_huya_danmaku_params(room_id)
-        return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku}
+        return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
     except HTTPException:
         raise
     except Exception as e:
@@ -254,21 +233,20 @@ async def parse_douyu(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         hdrs = {"User-Agent": UA, "Referer": f"https://www.douyu.com/{room_id}"}
+        async with httpx.AsyncClient(timeout=15, headers=hdrs, proxy=await get_working_proxy()) as c:
+            info = (await c.get(f"https://www.douyu.com/betard/{room_id}")).json()
+            room = info.get("room")
+            if not room:
+                raise HTTPException(400, "斗鱼：房间不存在")
+            if room.get("show_status") != 1 or room.get("videoLoop") == 1:
+                # 未开播
+                return {"streams": [], "isLive": False}
 
-        info_resp = await request_with_retry("GET", f"https://www.douyu.com/betard/{room_id}", headers=hdrs)
-        info = info_resp.json()
-        room = info.get("room")
-        if not room:
-            raise HTTPException(400, "斗鱼：房间不存在")
-        if room.get("show_status") != 1 or room.get("videoLoop") == 1:
-            raise HTTPException(400, "斗鱼：未开播")
-        real_id = str(room["room_id"])
-
-        enc_resp = await request_with_retry("GET", f"https://www.douyu.com/swf_api/homeH5Enc?rids={real_id}", headers=hdrs)
-        enc = enc_resp.json()
-        crptext = enc.get("data", {}).get(f"room{real_id}")
-        if not crptext:
-            raise HTTPException(400, "斗鱼：未获取到签名代码")
+            real_id = str(room["room_id"])
+            enc = (await c.get(f"https://www.douyu.com/swf_api/homeH5Enc?rids={real_id}")).json()
+            crptext = enc.get("data", {}).get(f"room{real_id}")
+            if not crptext:
+                raise HTTPException(400, "斗鱼：未获取到签名代码")
 
         raw_av = room.get("room_icon") or room.get("avatar") or ""
         if isinstance(raw_av, dict):
@@ -294,52 +272,48 @@ async def parse_bilibili(url):
     try:
         rid = url.rstrip("/").split("/")[-1].split("?")[0]
         hdrs = {"User-Agent": UA, "Referer": "https://live.bilibili.com/"}
+        async with httpx.AsyncClient(timeout=15, headers=hdrs, proxy=await get_working_proxy()) as c:
+            room_resp = (await c.get(f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={rid}")).json()
+            if room_resp.get("code") != 0:
+                raise HTTPException(400, f"B站房间信息失败: {room_resp.get('message')}")
+            real_rid = room_resp["data"]["room_id"]
+            if room_resp["data"].get("live_status") != 1:
+                # 未开播
+                return {"streams": [], "isLive": False}
 
-        room_resp = await request_with_retry("GET", f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={rid}", headers=hdrs)
-        room_data = room_resp.json()
-        if room_data.get("code") != 0:
-            raise HTTPException(400, f"B站房间信息失败: {room_data.get('message')}")
-        real_rid = room_data["data"]["room_id"]
-        if room_data["data"].get("live_status") != 1:
-            raise HTTPException(400, "B站：未开播")
+            play = (await c.get(
+                f"https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
+                f"?room_id={real_rid}&protocol=0,1&format=0,1,2&codec=0,1&qn=10000&platform=web&ptype=8"
+            )).json()
+            if play.get("code") != 0:
+                raise HTTPException(400, f"B站拉流失败: {play.get('message')}")
 
-        play_resp = await request_with_retry(
-            "GET",
-            f"https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
-            f"?room_id={real_rid}&protocol=0,1&format=0,1,2&codec=0,1&qn=10000&platform=web&ptype=8",
-            headers=hdrs
-        )
-        play = play_resp.json()
-        if play.get("code") != 0:
-            raise HTTPException(400, f"B站拉流失败: {play.get('message')}")
+            playurl = play["data"].get("playurl_info", {}).get("playurl", {})
+            streams, seen = [], set()
+            for stream in playurl.get("stream", []):
+                for fmt in stream.get("format", []):
+                    for codec in fmt.get("codec", []):
+                        for info in codec.get("url_info", []):
+                            u = info["host"] + codec["base_url"] + info["extra"]
+                            if u not in seen:
+                                seen.add(u)
+                                m = re.search(r"([a-z0-9]+)\.bilivideo", info["host"])
+                                streams.append({"cdn": f"{fmt['format_name'].upper()}-{m.group(1) if m else 'cdn'}",
+                                               "url": u, "type": "flv" if fmt["format_name"] == "flv" else "m3u8"})
+            streams.sort(key=lambda x: 0 if x["type"] == "flv" else 1)
+            if not streams:
+                raise HTTPException(400, "B站：流地址提取失败")
 
-        playurl = play["data"].get("playurl_info", {}).get("playurl", {})
-        streams, seen = [], set()
-        for stream in playurl.get("stream", []):
-            for fmt in stream.get("format", []):
-                for codec in fmt.get("codec", []):
-                    for info in codec.get("url_info", []):
-                        u = info["host"] + codec["base_url"] + info["extra"]
-                        if u not in seen:
-                            seen.add(u)
-                            m = re.search(r"([a-z0-9]+)\.bilivideo", info["host"])
-                            streams.append({"cdn": f"{fmt['format_name'].upper()}-{m.group(1) if m else 'cdn'}",
-                                           "url": u, "type": "flv" if fmt["format_name"] == "flv" else "m3u8"})
-        streams.sort(key=lambda x: 0 if x["type"] == "flv" else 1)
-        if not streams:
-            raise HTTPException(400, "B站：流地址提取失败")
+            name, avatar = "B站主播", ""
+            try:
+                ir = (await c.get(f"https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id={real_rid}")).json()
+                ri = ir.get("data", {}).get("room_info", {})
+                name = ri.get("uname") or ri.get("owner_name") or name
+                avatar = ri.get("face") or avatar
+            except Exception:
+                pass
 
-        name, avatar = "B站主播", ""
-        try:
-            ir_resp = await request_with_retry("GET", f"https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id={real_rid}", headers=hdrs)
-            ir = ir_resp.json()
-            ri = ir.get("data", {}).get("room_info", {})
-            name = ri.get("uname") or ri.get("owner_name") or name
-            avatar = ri.get("face") or avatar
-        except Exception:
-            pass
-
-        return {"streams": streams[:4], "title": name, "avatar": avatar}
+            return {"streams": streams[:4], "title": name, "avatar": avatar, "isLive": True}
     except HTTPException:
         raise
     except Exception as e:
@@ -357,26 +331,29 @@ async def parse_douyin(url):
         raw = json.loads(stream_obj.to_json())
         streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
         if not streams:
-            raise HTTPException(400, f"抖音未获取到流，可能未开播或链接无效")
+            # 未开播
+            return {"streams": [], "title": raw.get("anchor_name", ""), "avatar": raw.get("avatar", ""), "roomId": "", "ttwid": "", "isLive": False}
 
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         if not room_id.isdigit():
             try:
-                resp = await request_with_retry("GET", url, headers={"User-Agent": UA})
-                html = resp.text
-                match = re.search(r'"room_id":"(\d+)"', html)
-                if match:
-                    room_id = match.group(1)
+                async with httpx.AsyncClient(timeout=10, proxy=await get_working_proxy()) as c:
+                    resp = await c.get(url, headers={"User-Agent": UA})
+                    html = resp.text
+                    match = re.search(r'"room_id":"(\d+)"', html)
+                    if match:
+                        room_id = match.group(1)
             except Exception:
                 pass
 
         ttwid = ""
         try:
-            resp = await request_with_retry("GET", url, headers={"User-Agent": UA})
-            for cookie in resp.cookies:
-                if cookie.name == "ttwid":
-                    ttwid = cookie.value
-                    break
+            async with httpx.AsyncClient(timeout=10, proxy=await get_working_proxy()) as c:
+                resp = await c.get(url, headers={"User-Agent": UA})
+                for cookie in resp.cookies:
+                    if cookie.name == "ttwid":
+                        ttwid = cookie.value
+                        break
         except Exception:
             pass
 
@@ -385,7 +362,8 @@ async def parse_douyin(url):
             "title": raw.get("anchor_name", "抖音主播"),
             "avatar": raw.get("avatar", ""),
             "roomId": room_id,
-            "ttwid": ttwid
+            "ttwid": ttwid,
+            "isLive": True
         }
     except HTTPException:
         raise
@@ -528,55 +506,44 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
             time.sleep(3)
             douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
 
-    # 遍历代理列表尝试连接 WebSocket
-    for idx, proxy_url in enumerate(PROXY_URLS):
+    # 创建 WebSocket 连接，轮询代理列表找到可用的
+    ws = None
+    for _proxy_url in PROXY_LIST:
         try:
-            print(f"[抖音弹幕] 尝试使用代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy_url}")
-            if SOCKS_SUPPORT and proxy_url.startswith("socks5://"):
-                proxy = Proxy.from_url(proxy_url)
+            if SOCKS_SUPPORT and _proxy_url.startswith("socks5://"):
+                proxy = Proxy.from_url(_proxy_url)
                 sock = proxy.connect(("webcast3-ws-web-lq.douyin.com", 443))
                 ws = websocket.WebSocketApp(
-                    ws_url,
-                    header=headers,
-                    on_open=on_open,
-                    on_message=on_message,
-                    on_error=on_error,
-                    on_close=on_close,
+                    ws_url, header=headers,
+                    on_open=on_open, on_message=on_message,
+                    on_error=on_error, on_close=on_close,
                     sock=sock
                 )
-            elif proxy_url.startswith("http://") or proxy_url.startswith("https://"):
-                proxy_parts = urlparse(proxy_url)
+            elif _proxy_url.startswith("http://") or _proxy_url.startswith("https://"):
+                proxy_parts = urlparse(_proxy_url)
                 ws = websocket.WebSocketApp(
-                    ws_url,
-                    header=headers,
-                    on_open=on_open,
-                    on_message=on_message,
-                    on_error=on_error,
-                    on_close=on_close,
+                    ws_url, header=headers,
+                    on_open=on_open, on_message=on_message,
+                    on_error=on_error, on_close=on_close,
                     http_proxy_host=proxy_parts.hostname,
                     http_proxy_port=proxy_parts.port,
                     http_proxy_auth=(proxy_parts.username, proxy_parts.password) if proxy_parts.username else None,
                     proxy_type="http"
                 )
-            else:
-                # 无代理
-                ws = websocket.WebSocketApp(
-                    ws_url,
-                    header=headers,
-                    on_open=on_open,
-                    on_message=on_message,
-                    on_error=on_error,
-                    on_close=on_close,
-                )
-            ws.run_forever()
-            break  # 正常结束才跳出（通常不会到这里，因为 run_forever 会阻塞）
+            print(f"[抖音弹幕] 使用代理: {_proxy_url}")
+            break
         except Exception as e:
-            print(f"[抖音弹幕] 代理 {proxy_url} 连接失败: {e}，尝试下一个...")
-            if idx == len(PROXY_URLS) - 1:
-                print("[抖音弹幕] 所有代理均失败，停止重试")
-                return
-            time.sleep(1)
-            continue
+            print(f"[抖音弹幕] 代理 {_proxy_url} 连接失败: {e}，尝试下一个")
+            ws = None
+
+    if ws is None:
+        print("[抖音弹幕] 所有代理失败，尝试直连")
+        ws = websocket.WebSocketApp(
+            ws_url, header=headers,
+            on_open=on_open, on_message=on_message,
+            on_error=on_error, on_close=on_close,
+        )
+    ws.run_forever()
 
 
 # ==================== WebSocket 路由 ====================
@@ -587,11 +554,12 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
 
     ttwid = ""
     try:
-        resp = await request_with_retry("GET", f"https://live.douyin.com/{room_id}", headers={"User-Agent": UA})
-        for cookie in resp.cookies:
-            if cookie.name == "ttwid":
-                ttwid = cookie.value
-                break
+        async with httpx.AsyncClient(timeout=5, proxy=await get_working_proxy()) as c:
+            resp = await c.get(f"https://live.douyin.com/{room_id}", headers={"User-Agent": UA})
+            for cookie in resp.cookies:
+                if cookie.name == "ttwid":
+                    ttwid = cookie.value
+                    break
     except Exception:
         pass
 
