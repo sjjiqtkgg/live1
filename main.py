@@ -10,6 +10,7 @@ import base64
 import random
 import execjs
 import websocket
+import ssl
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -28,7 +29,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 
-# ==================== 代理加载（增强调试） ====================
+# ==================== 代理加载 ====================
 PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://43.139.29.27:1111")
 PROXY_LIST_STR = PROXY_LIST_STR.strip().strip('"').strip("'")
 PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
@@ -40,7 +41,6 @@ if not PROXY_URLS:
 
 
 async def request_with_retry(method: str, url: str, **kwargs):
-    """依次尝试代理列表，直到成功，全部失败则抛出异常"""
     last_error = None
     timeout = kwargs.pop("timeout", 15)
 
@@ -390,21 +390,23 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
             time.sleep(3)
             douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
 
-    
-        # 遍历代理建立 WebSocket 连接
+    # 遍历代理建立 WebSocket 连接
     for idx, proxy_url in enumerate(PROXY_URLS):
         try:
             print(f"[抖音弹幕] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy_url}")
-            if SOCKS_SUPPORT and proxy_url.startswith("socks5://"):
+            if SOCKS_SUPPORT and proxy_url and proxy_url.startswith("socks5://"):
                 proxy = Proxy.from_url(proxy_url)
                 sock = proxy.connect("webcast3-ws-web-lq.douyin.com", 443)
+                # 关键：包装为 SSL 套接字
+                ssl_context = ssl.create_default_context()
+                ssl_sock = ssl_context.wrap_socket(sock, server_hostname="webcast3-ws-web-lq.douyin.com")
                 ws = websocket.WebSocketApp(
                     ws_url, header=headers,
                     on_open=on_open, on_message=on_message,
                     on_error=on_error, on_close=on_close,
-                    socket=sock          # 修正点：sock -> socket
+                    socket=ssl_sock
                 )
-            elif proxy_url.startswith("http://") or proxy_url.startswith("https://"):
+            elif proxy_url and (proxy_url.startswith("http://") or proxy_url.startswith("https://")):
                 proxy_parts = urlparse(proxy_url)
                 ws = websocket.WebSocketApp(
                     ws_url, header=headers,
@@ -416,6 +418,7 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                     proxy_type="http"
                 )
             else:
+                # 直连
                 ws = websocket.WebSocketApp(
                     ws_url, header=headers,
                     on_open=on_open, on_message=on_message,
