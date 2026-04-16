@@ -11,5 +11,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping Render health endpoint
-        run: |
-          run: curl -X GET https://live1-cxe9.onrender.com/health
+        run: curl -X GET https://live1-cxe9.onrender.com/health
