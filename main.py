@@ -28,6 +28,7 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
 
 # ==================== 代理加载 ====================
 PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://43.139.29.27:1111")
@@ -43,7 +44,6 @@ if not PROXY_URLS:
 async def request_with_retry(method: str, url: str, **kwargs):
     last_error = None
     timeout = kwargs.pop("timeout", 15)
-
     for idx, proxy in enumerate(PROXY_URLS):
         try:
             print(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
@@ -82,6 +82,7 @@ def build_streams(flv, m3u8):
     return s
 
 
+# ==================== 虎牙 ====================
 async def fetch_huya_danmaku_params(room_id):
     try:
         resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
@@ -182,6 +183,7 @@ async def parse_huya(url):
         return {"streams": [], "isLive": False}
 
 
+# ==================== 斗鱼 ====================
 async def parse_douyu(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -210,6 +212,7 @@ async def parse_douyu(url):
         return {"streams": [], "isLive": False}
 
 
+# ==================== B站 ====================
 async def parse_bilibili(url):
     try:
         rid = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -257,6 +260,7 @@ async def parse_bilibili(url):
         return {"streams": [], "isLive": False}
 
 
+# ==================== 抖音 ====================
 async def parse_douyin(url):
     try:
         from streamget import DouyinLiveStream
@@ -276,7 +280,7 @@ async def parse_douyin(url):
                     room_id = match.group(1)
             except Exception:
                 pass
-        ttwid = await get_ttwid(url)  # 使用增强的获取函数
+        ttwid = await get_ttwid(url)
         return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"),
                 "avatar": raw.get("avatar", ""), "roomId": room_id, "ttwid": ttwid, "isLive": True}
     except Exception as e:
@@ -284,6 +288,7 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
+# ==================== 抖音弹幕签名与连接 ====================
 def get_douyin_signature(md5_str: str) -> str:
     try:
         with open("sign.js", "r", encoding="utf-8") as f:
@@ -296,20 +301,20 @@ def get_douyin_signature(md5_str: str) -> str:
 
 
 async def get_ttwid(url: str) -> str:
-    """增强的 ttwid 获取函数，失败时生成一个备用值"""
+    """增强的 ttwid 获取函数"""
     headers = {
         "User-Agent": UA,
         "Referer": "https://live.douyin.com/",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9",
     }
-    for _ in range(2):  # 重试一次
+    for _ in range(2):
         try:
             resp = await request_with_retry("GET", url, headers=headers)
-            for cookie in resp.cookies:
-                if cookie.name == "ttwid":
-                    return cookie.value
-            # 有时 ttwid 在 Set-Cookie 中但 httpx 未正确解析，尝试从原始响应头提取
+            # 优先使用 resp.cookies.get()
+            ttwid = resp.cookies.get("ttwid")
+            if ttwid:
+                return ttwid
+            # 备用：从 Set-Cookie 头提取
             set_cookie = resp.headers.get("set-cookie", "")
             match = re.search(r"ttwid=([^;]+)", set_cookie)
             if match:
@@ -317,152 +322,162 @@ async def get_ttwid(url: str) -> str:
         except Exception as e:
             print(f"[ttwid] 获取失败: {e}，重试中...")
             await asyncio.sleep(1)
-    # 如果全部失败，生成一个模拟 ttwid (格式：19位数字+随机字母数字)
-    fake_ttwid = "".join(random.choices("0123456789", k=19)) + "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=11))
-    print(f"[ttwid] 获取失败，使用模拟值: {fake_ttwid}")
-    return fake_ttwid
+    fake = "".join(random.choices("0123456789", k=19)) + "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=11))
+    print(f"[ttwid] 获取失败，使用模拟值: {fake}")
+    return fake
 
 
 def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threading.Event, callback):
     user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
-    base_ws_url = (
-        f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/"
-        f"?app_name=douyin_web&version_code=180800&webcast_sdk_version=1.0.14"
-        f"&update_version_code=1.0.14&compress=gzip&internal_ext=internal_src:dim"
-        f"|wss_push_room_id:{room_id}|wss_push_did:0|first_req_ms:{int(time.time()*1000)}"
-        f"|fetch_time:{int(time.time()*1000)}|seq:1|wss_info:0-0-0-0"
-        f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&debug=false"
-        f"&endpoint=live&support_wrds=1&im_path=/webcast/im/fetch/&user_unique_id={user_unique_id}"
-        f"&device_platform=web&cookie_enabled=true&screen_width=1920&screen_height=1080"
-        f"&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome"
-        f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
-        f"&identity=audience&room_id={room_id}&heartbeatDuration=0"
-    )
-    params_order = ("live_id", "aid", "version_code", "webcast_sdk_version",
-                    "room_id", "sub_room_id", "sub_channel_id", "did_rule",
-                    "user_unique_id", "device_platform", "device_type", "ac", "identity")
-    parsed = urlparse(base_ws_url)
-    qs_dict = parse_qs(parsed.query)
-    wss_maps = {k: v[0] if isinstance(v, list) else v for k, v in qs_dict.items()}
-    param_str = ','.join(f"{p}={wss_maps.get(p, '')}" for p in params_order)
-    md5_str = hashlib.md5(param_str.encode()).hexdigest()
-    signature = get_douyin_signature(md5_str)
-    ws_url = f"{base_ws_url}&signature={signature}"
-    headers = {
-        "User-Agent": UA,
-        "Origin": "https://live.douyin.com",
-        "Cookie": f"ttwid={ttwid}"  # 确保 Cookie 正确设置
-    }
 
-    def on_open(ws):
-        print(f"[抖音弹幕] 已连接房间 {room_id}")
-        def heartbeat():
-            while not stop_event.is_set():
-                time.sleep(10)
-                try:
-                    if ws.sock and ws.sock.connected:
-                        ws.send(b"", opcode=websocket.ABNF.OPCODE_PING)
-                except Exception:
-                    break
-        threading.Thread(target=heartbeat, daemon=True).start()
+    ws_configs = [
+        {"host": "webcast3-ws-web-lq.snssdk.com", "ua": MOBILE_UA, "need_ttwid": False},
+        {"host": "webcast3-ws-web-lq.douyin.com", "ua": UA, "need_ttwid": True},
+    ]
 
-    def on_message(ws, message):
-        if stop_event.is_set():
-            return
-        try:
-            push_frame = douyin.PushFrame().parse(message)
-            response = douyin.Response().parse(push_frame.payload)
-            for msg in response.messages_list:
-                method = msg.method
-                payload = msg.payload
-                if method == "WebcastChatMessage":
+    for cfg in ws_configs:
+        host = cfg["host"]
+        ua = cfg["ua"]
+        need_ttwid = cfg["need_ttwid"]
+
+        base_ws_url = (
+            f"wss://{host}/webcast/im/push/v2/"
+            f"?app_name=douyin_web&version_code=180800&webcast_sdk_version=1.0.14"
+            f"&update_version_code=1.0.14&compress=gzip&internal_ext=internal_src:dim"
+            f"|wss_push_room_id:{room_id}|wss_push_did:0|first_req_ms:{int(time.time()*1000)}"
+            f"|fetch_time:{int(time.time()*1000)}|seq:1|wss_info:0-0-0-0"
+            f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&debug=false"
+            f"&endpoint=live&support_wrds=1&im_path=/webcast/im/fetch/&user_unique_id={user_unique_id}"
+            f"&device_platform=web&cookie_enabled=true&screen_width=1920&screen_height=1080"
+            f"&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome"
+            f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
+            f"&identity=audience&room_id={room_id}&heartbeatDuration=0"
+        )
+
+        params_order = ("live_id", "aid", "version_code", "webcast_sdk_version",
+                        "room_id", "sub_room_id", "sub_channel_id", "did_rule",
+                        "user_unique_id", "device_platform", "device_type", "ac", "identity")
+        parsed = urlparse(base_ws_url)
+        qs_dict = parse_qs(parsed.query)
+        wss_maps = {k: v[0] if isinstance(v, list) else v for k, v in qs_dict.items()}
+        param_str = ','.join(f"{p}={wss_maps.get(p, '')}" for p in params_order)
+        md5_str = hashlib.md5(param_str.encode()).hexdigest()
+        signature = get_douyin_signature(md5_str)
+        ws_url = f"{base_ws_url}&signature={signature}"
+
+        headers = {"User-Agent": ua, "Origin": "https://live.douyin.com"}
+        if need_ttwid and ttwid:
+            headers["Cookie"] = f"ttwid={ttwid}"
+
+        print(f"[抖音弹幕] 尝试 {host} (移动端={not need_ttwid})")
+
+        def on_open(ws):
+            print(f"[抖音弹幕] 已连接房间 {room_id} via {host}")
+            def heartbeat():
+                while not stop_event.is_set():
+                    time.sleep(10)
                     try:
-                        chat = douyin.ChatMessage().parse(payload)
-                        if chat and chat.user and chat.content:
-                            callback({"type": "chat", "nick": chat.user.nick_name or "匿名用户",
-                                      "content": chat.content, "time": int(time.time() * 1000)})
-                    except Exception as e:
-                        print(f"[抖音弹幕] 解析聊天出错: {e}")
-                elif method == "WebcastGiftMessage":
-                    try:
-                        gift = douyin.GiftMessage().parse(payload)
-                        if gift and gift.user:
-                            callback({"type": "gift", "nick": gift.user.nick_name or "匿名用户",
-                                      "gift": gift.gift.name if gift.gift else "礼物",
-                                      "count": gift.repeat_count, "time": int(time.time() * 1000)})
-                    except Exception as e:
-                        print(f"[抖音弹幕] 解析礼物出错: {e}")
-                elif method == "WebcastLikeMessage":
-                    try:
-                        like = douyin.LikeMessage().parse(payload)
-                        if like and like.user:
-                            callback({"type": "like", "nick": like.user.nick_name or "匿名用户",
-                                      "count": like.count, "time": int(time.time() * 1000)})
-                    except Exception as e:
-                        print(f"[抖音弹幕] 解析点赞出错: {e}")
-        except Exception as e:
-            print(f"[抖音弹幕] 解析顶层错误: {e}")
+                        if ws.sock and ws.sock.connected:
+                            ws.send(b"", opcode=websocket.ABNF.OPCODE_PING)
+                    except:
+                        break
+            threading.Thread(target=heartbeat, daemon=True).start()
 
-    def on_error(ws, error):
-        print(f"[抖音弹幕] WebSocket 错误: {error}")
-
-    def on_close(ws, close_status_code, close_msg):
-        print(f"[抖音弹幕] 连接关闭: {close_status_code} {close_msg}")
-        if not stop_event.is_set():
-            time.sleep(3)
-            douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
-
-    for idx, proxy_url in enumerate(PROXY_URLS):
-        try:
-            print(f"[抖音弹幕] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy_url}")
-            if SOCKS_SUPPORT and proxy_url and proxy_url.startswith("socks5://"):
-                proxy = Proxy.from_url(proxy_url)
-                sock = proxy.connect("webcast3-ws-web-lq.douyin.com", 443)
-                ssl_context = ssl.create_default_context()
-                ssl_sock = ssl_context.wrap_socket(sock, server_hostname="webcast3-ws-web-lq.douyin.com")
-                ws = websocket.WebSocketApp(
-                    ws_url, header=headers,
-                    on_open=on_open, on_message=on_message,
-                    on_error=on_error, on_close=on_close,
-                    socket=ssl_sock
-                )
-            elif proxy_url and (proxy_url.startswith("http://") or proxy_url.startswith("https://")):
-                proxy_parts = urlparse(proxy_url)
-                ws = websocket.WebSocketApp(
-                    ws_url, header=headers,
-                    on_open=on_open, on_message=on_message,
-                    on_error=on_error, on_close=on_close,
-                    http_proxy_host=proxy_parts.hostname,
-                    http_proxy_port=proxy_parts.port,
-                    http_proxy_auth=(proxy_parts.username, proxy_parts.password) if proxy_parts.username else None,
-                    proxy_type="http"
-                )
-            else:
-                ws = websocket.WebSocketApp(
-                    ws_url, header=headers,
-                    on_open=on_open, on_message=on_message,
-                    on_error=on_error, on_close=on_close,
-                )
-            ws.run_forever()
-            break
-        except Exception as e:
-            print(f"[抖音弹幕] 代理 {proxy_url} 失败: {e}，尝试下一个...")
-            if idx == len(PROXY_URLS) - 1:
-                print("[抖音弹幕] 所有代理均失败，停止重试")
+        def on_message(ws, message):
+            if stop_event.is_set():
                 return
-            time.sleep(1)
+            try:
+                push_frame = douyin.PushFrame().parse(message)
+                response = douyin.Response().parse(push_frame.payload)
+                for msg in response.messages_list:
+                    method = msg.method
+                    payload = msg.payload
+                    if method == "WebcastChatMessage":
+                        try:
+                            chat = douyin.ChatMessage().parse(payload)
+                            if chat and chat.user and chat.content:
+                                callback({"type": "chat", "nick": chat.user.nick_name or "匿名用户",
+                                          "content": chat.content, "time": int(time.time()*1000)})
+                        except Exception as e:
+                            print(f"[抖音弹幕] 解析聊天出错: {e}")
+                    elif method == "WebcastGiftMessage":
+                        try:
+                            gift = douyin.GiftMessage().parse(payload)
+                            if gift and gift.user:
+                                callback({"type": "gift", "nick": gift.user.nick_name or "匿名用户",
+                                          "gift": gift.gift.name if gift.gift else "礼物",
+                                          "count": gift.repeat_count, "time": int(time.time()*1000)})
+                        except Exception as e:
+                            print(f"[抖音弹幕] 解析礼物出错: {e}")
+                    elif method == "WebcastLikeMessage":
+                        try:
+                            like = douyin.LikeMessage().parse(payload)
+                            if like and like.user:
+                                callback({"type": "like", "nick": like.user.nick_name or "匿名用户",
+                                          "count": like.count, "time": int(time.time()*1000)})
+                        except Exception as e:
+                            print(f"[抖音弹幕] 解析点赞出错: {e}")
+            except Exception as e:
+                print(f"[抖音弹幕] 解析顶层错误: {e}")
+
+        def on_error(ws, error):
+            print(f"[抖音弹幕] WebSocket 错误: {error}")
+
+        def on_close(ws, code, msg):
+            print(f"[抖音弹幕] 连接关闭: {code} {msg}")
+            if not stop_event.is_set():
+                time.sleep(3)
+                douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
+
+        for idx, proxy_url in enumerate(PROXY_URLS):
+            try:
+                print(f"[抖音弹幕] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy_url}")
+                if SOCKS_SUPPORT and proxy_url and proxy_url.startswith("socks5://"):
+                    proxy = Proxy.from_url(proxy_url)
+                    sock = proxy.connect(host, 443)
+                    ssl_context = ssl.create_default_context()
+                    ssl_sock = ssl_context.wrap_socket(sock, server_hostname=host)
+                    ws = websocket.WebSocketApp(
+                        ws_url, header=headers,
+                        on_open=on_open, on_message=on_message,
+                        on_error=on_error, on_close=on_close,
+                        socket=ssl_sock
+                    )
+                elif proxy_url and (proxy_url.startswith("http://") or proxy_url.startswith("https://")):
+                    proxy_parts = urlparse(proxy_url)
+                    ws = websocket.WebSocketApp(
+                        ws_url, header=headers,
+                        on_open=on_open, on_message=on_message,
+                        on_error=on_error, on_close=on_close,
+                        http_proxy_host=proxy_parts.hostname,
+                        http_proxy_port=proxy_parts.port,
+                        http_proxy_auth=(proxy_parts.username, proxy_parts.password) if proxy_parts.username else None,
+                        proxy_type="http"
+                    )
+                else:
+                    ws = websocket.WebSocketApp(
+                        ws_url, header=headers,
+                        on_open=on_open, on_message=on_message,
+                        on_error=on_error, on_close=on_close,
+                    )
+                ws.run_forever()
+                return
+            except Exception as e:
+                print(f"[抖音弹幕] 代理 {proxy_url} 失败: {e}")
+                if idx == len(PROXY_URLS) - 1:
+                    break
+                time.sleep(1)
+        print(f"[抖音弹幕] {host} 所有代理失败，尝试下一个接入点...")
+
+    print("[抖音弹幕] 所有接入点和代理均失败，停止重试")
 
 
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
-    # 重新获取 ttwid，确保是最新的
     ttwid = await get_ttwid(f"https://live.douyin.com/{room_id}")
-    if not ttwid:
-        print("[ttwid] 获取失败，连接可能被拒绝")
-    else:
-        print(f"[ttwid] 获取成功: {ttwid[:10]}...")
+    print(f"[ttwid] 最终使用: {ttwid[:10] if ttwid else 'None'}...")
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
 
@@ -479,7 +494,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                 await websocket.send_json(msg)
             except asyncio.TimeoutError:
                 continue
-            except Exception:
+            except:
                 break
 
     send_task = asyncio.create_task(send_worker())
@@ -500,6 +515,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         task.cancel()
 
 
+# ==================== 路由 ====================
 @app.get("/api/parse")
 async def api_parse(url: str = Query(...)):
     try:
