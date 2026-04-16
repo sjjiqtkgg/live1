@@ -31,7 +31,7 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Sa
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
 
 # ==================== 代理加载 ====================
-PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://43.139.29.27:1111")
+PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://123:123@43.100.108.223:3060")
 PROXY_LIST_STR = PROXY_LIST_STR.strip().strip('"').strip("'")
 PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
 print(f"[代理] 共加载 {len(PROXY_URLS)} 个代理: {PROXY_URLS}")
@@ -336,6 +336,9 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
     ]
 
     for cfg in ws_configs:
+        if stop_event.is_set():
+            return
+
         host = cfg["host"]
         ua = cfg["ua"]
         need_ttwid = cfg["need_ttwid"]
@@ -371,7 +374,12 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
 
         print(f"[抖音弹幕] 尝试 {host} (移动端={not need_ttwid})")
 
+        connection_success = threading.Event()
+        message_received = threading.Event()
+
         def on_open(ws):
+            nonlocal connection_success
+            connection_success.set()
             print(f"[抖音弹幕] 已连接房间 {room_id} via {host}")
             def heartbeat():
                 while not stop_event.is_set():
@@ -384,11 +392,13 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
             threading.Thread(target=heartbeat, daemon=True).start()
 
         def on_message(ws, message):
+            nonlocal message_received
             if stop_event.is_set():
                 return
             try:
                 push_frame = douyin.PushFrame().parse(message)
                 response = douyin.Response().parse(push_frame.payload)
+                message_received.set()
                 for msg in response.messages_list:
                     method = msg.method
                     payload = msg.payload
@@ -418,7 +428,11 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                         except Exception as e:
                             print(f"[抖音弹幕] 解析点赞出错: {e}")
             except Exception as e:
-                print(f"[抖音弹幕] 解析顶层错误: {e}")
+                err_str = str(e)
+                if 'uint64' in err_str:
+                    print(f"[抖音弹幕] Protobuf 解析错误 (uint64 类型不匹配)，跳过该消息")
+                else:
+                    print(f"[抖音弹幕] 解析顶层错误: {e}")
 
         def on_error(ws, error):
             print(f"[抖音弹幕] WebSocket 错误: {error}")
@@ -426,10 +440,18 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         def on_close(ws, code, msg):
             print(f"[抖音弹幕] 连接关闭: {code} {msg}")
             if not stop_event.is_set():
+                # 如果连接成功过且没有收到任何消息，可能是协议不兼容，尝试下一个 host
+                if connection_success.is_set() and not message_received.is_set():
+                    print(f"[抖音弹幕] {host} 连接成功但未收到有效弹幕，尝试下一个接入点...")
+                    return  # 退出当前 host 循环，进入下一个 cfg
+                # 否则稍后重连同一个 host
                 time.sleep(3)
                 douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
 
+        # 尝试代理
         for idx, proxy_url in enumerate(PROXY_URLS):
+            if stop_event.is_set():
+                return
             try:
                 print(f"[抖音弹幕] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy_url}")
                 if SOCKS_SUPPORT and proxy_url and proxy_url.startswith("socks5://"):
@@ -461,7 +483,10 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
                         on_error=on_error, on_close=on_close,
                     )
                 ws.run_forever()
-                return
+                # run_forever 返回后，检查是否因为 host 不兼容而需要尝试下一个
+                if connection_success.is_set() and not message_received.is_set():
+                    break  # 跳出代理循环，继续下一个 cfg
+                return  # 否则正常结束（可能已重连）
             except Exception as e:
                 print(f"[抖音弹幕] 代理 {proxy_url} 失败: {e}")
                 if idx == len(PROXY_URLS) - 1:
@@ -470,7 +495,6 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
         print(f"[抖音弹幕] {host} 所有代理失败，尝试下一个接入点...")
 
     print("[抖音弹幕] 所有接入点和代理均失败，停止重试")
-
 
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
