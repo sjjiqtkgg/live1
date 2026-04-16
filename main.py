@@ -18,7 +18,6 @@ from protobuf import douyin
 
 try:
     from python_socks.sync import Proxy
-    from python_socks import ProxyType
     SOCKS_SUPPORT = True
 except ImportError:
     SOCKS_SUPPORT = False
@@ -31,15 +30,13 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Sa
 
 # ==================== 代理加载（增强调试） ====================
 PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://43.139.29.27:1111")
-# 去除可能存在的引号、空格
 PROXY_LIST_STR = PROXY_LIST_STR.strip().strip('"').strip("'")
 PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
 print(f"[代理] 共加载 {len(PROXY_URLS)} 个代理: {PROXY_URLS}")
 
-# 可选：检查代理列表是否为空
 if not PROXY_URLS:
     print("[代理] 警告：代理列表为空，将直连")
-    PROXY_URLS = [None]  # 直连
+    PROXY_URLS = [None]
 
 
 async def request_with_retry(method: str, url: str, **kwargs):
@@ -59,8 +56,6 @@ async def request_with_retry(method: str, url: str, **kwargs):
             error_type = type(e).__name__
             error_msg = str(e) or "无具体信息"
             print(f"[请求重试] 代理 {proxy or '直连'} 失败: {error_type}: {error_msg}，尝试下一个...")
-            # 继续尝试下一个代理
-    # 所有代理都失败
     raise last_error or Exception("所有代理均失败")
 
 
@@ -395,26 +390,39 @@ def douyin_danmaku_collector_sync(room_id: str, ttwid: str, stop_event: threadin
             time.sleep(3)
             douyin_danmaku_collector_sync(room_id, ttwid, stop_event, callback)
 
+    # 遍历代理建立 WebSocket 连接
     for idx, proxy_url in enumerate(PROXY_URLS):
         try:
             print(f"[抖音弹幕] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy_url}")
             if SOCKS_SUPPORT and proxy_url.startswith("socks5://"):
                 proxy = Proxy.from_url(proxy_url)
-                sock = proxy.connect(("webcast3-ws-web-lq.douyin.com", 443))
-                ws = websocket.WebSocketApp(ws_url, header=headers, on_open=on_open,
-                    on_message=on_message, on_error=on_error, on_close=on_close, sock=sock)
+                # 修正点：connect 接受 (host, port) 两个参数，不是元组
+                sock = proxy.connect("webcast3-ws-web-lq.douyin.com", 443)
+                ws = websocket.WebSocketApp(
+                    ws_url, header=headers,
+                    on_open=on_open, on_message=on_message,
+                    on_error=on_error, on_close=on_close,
+                    sock=sock
+                )
             elif proxy_url.startswith("http://") or proxy_url.startswith("https://"):
                 proxy_parts = urlparse(proxy_url)
-                ws = websocket.WebSocketApp(ws_url, header=headers, on_open=on_open,
-                    on_message=on_message, on_error=on_error, on_close=on_close,
-                    http_proxy_host=proxy_parts.hostname, http_proxy_port=proxy_parts.port,
+                ws = websocket.WebSocketApp(
+                    ws_url, header=headers,
+                    on_open=on_open, on_message=on_message,
+                    on_error=on_error, on_close=on_close,
+                    http_proxy_host=proxy_parts.hostname,
+                    http_proxy_port=proxy_parts.port,
                     http_proxy_auth=(proxy_parts.username, proxy_parts.password) if proxy_parts.username else None,
-                    proxy_type="http")
+                    proxy_type="http"
+                )
             else:
-                ws = websocket.WebSocketApp(ws_url, header=headers, on_open=on_open,
-                    on_message=on_message, on_error=on_error, on_close=on_close)
+                ws = websocket.WebSocketApp(
+                    ws_url, header=headers,
+                    on_open=on_open, on_message=on_message,
+                    on_error=on_error, on_close=on_close,
+                )
             ws.run_forever()
-            break
+            break  # 连接成功并 run_forever 后退出循环
         except Exception as e:
             print(f"[抖音弹幕] 代理 {proxy_url} 失败: {e}，尝试下一个...")
             if idx == len(PROXY_URLS) - 1:
