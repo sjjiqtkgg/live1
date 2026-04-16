@@ -29,22 +29,38 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 
+# ==================== 代理加载（增强调试） ====================
 PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://43.139.29.27:1111")
+# 去除可能存在的引号、空格
+PROXY_LIST_STR = PROXY_LIST_STR.strip().strip('"').strip("'")
 PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
 print(f"[代理] 共加载 {len(PROXY_URLS)} 个代理: {PROXY_URLS}")
 
+# 可选：检查代理列表是否为空
+if not PROXY_URLS:
+    print("[代理] 警告：代理列表为空，将直连")
+    PROXY_URLS = [None]  # 直连
+
 
 async def request_with_retry(method: str, url: str, **kwargs):
+    """依次尝试代理列表，直到成功，全部失败则抛出异常"""
     last_error = None
     timeout = kwargs.pop("timeout", 15)
-    for proxy in PROXY_URLS:
+
+    for idx, proxy in enumerate(PROXY_URLS):
         try:
+            print(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
             async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
                 resp = await client.request(method, url, **kwargs)
+                print(f"[请求重试] 代理 {proxy or '直连'} 成功")
                 return resp
         except Exception as e:
             last_error = e
-            print(f"[请求重试] 代理 {proxy} 失败: {e}，尝试下一个...")
+            error_type = type(e).__name__
+            error_msg = str(e) or "无具体信息"
+            print(f"[请求重试] 代理 {proxy or '直连'} 失败: {error_type}: {error_msg}，尝试下一个...")
+            # 继续尝试下一个代理
+    # 所有代理都失败
     raise last_error or Exception("所有代理均失败")
 
 
@@ -480,6 +496,8 @@ async def api_parse(url: str = Query(...)):
 @app.get("/")
 def root():
     return {"status": "ok", "message": "多平台直播解析 API"}
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "alive"}
