@@ -171,42 +171,10 @@ async def parse_huya(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== 斗鱼多 CDN 解析（修复版） ====================
-def douyu_parse_crptext(crptext: str, room_id: str) -> dict:
-    """
-    解析 crptext 获取请求参数 v, did, tt, sign。
-    如果 crptext 为明文参数字符串则直接解析；否则用默认值生成。
-    """
-    params = {}
-    # 尝试解析为 URL 参数字符串
-    if "=" in crptext and "&" in crptext:
-        try:
-            for part in crptext.split("&"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    params[k] = v
-        except:
-            pass
-
-    # 补全必要参数（若缺失则生成默认值）
-    if "v" not in params:
-        params["v"] = "250120"
-    if "did" not in params:
-        params["did"] = hashlib.md5(str(random.random()).encode()).hexdigest()[:16]
-    if "tt" not in params:
-        params["tt"] = str(int(time.time()))
-    if "sign" not in params:
-        sign_str = f"{room_id}{params['did']}{params['tt']}1231"
-        params["sign"] = hashlib.md5(sign_str.encode()).hexdigest()
-    return params
-
-
 async def parse_douyu(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         hdrs = {"User-Agent": UA, "Referer": f"https://www.douyu.com/{room_id}"}
-
-        # 1. 获取房间基本信息
         info_resp = await request_with_retry("GET", f"https://www.douyu.com/betard/{room_id}", headers=hdrs)
         info = info_resp.json()
         room = info.get("room")
@@ -215,86 +183,22 @@ async def parse_douyu(url):
         if room.get("show_status") != 1 or room.get("videoLoop") == 1:
             return {"streams": [], "isLive": False}
         real_id = str(room["room_id"])
-
-        # 2. 获取签名所需的 crptext
         enc_resp = await request_with_retry("GET", f"https://www.douyu.com/swf_api/homeH5Enc?rids={real_id}", headers=hdrs)
         enc = enc_resp.json()
         crptext = enc.get("data", {}).get(f"room{real_id}")
         if not crptext:
             return {"streams": [], "isLive": False}
-
-        # 3. 解析参数
-        sign_params = douyu_parse_crptext(crptext, real_id)
-
-        # 4. 遍历 CDN 列表获取流地址
-        DOUYU_CDN_TYPES = ["tct-h5", "hs-h5", "ws-h5", "ali-h5", "tx-h5", "hw-h5"]
-        all_streams = []
-        seen_urls = set()
-
-        for cdn in DOUYU_CDN_TYPES:
-            try:
-                print(f"[斗鱼] 尝试 CDN: {cdn}")
-                post_data = {
-                    "cdn": cdn,
-                    "rate": "0",
-                    "v": sign_params.get("v", ""),
-                    "did": sign_params.get("did", ""),
-                    "tt": sign_params.get("tt", ""),
-                    "sign": sign_params.get("sign", "")
-                }
-                play_resp = await request_with_retry(
-                    "POST",
-                    f"https://www.douyu.com/lapi/live/getH5Play/{real_id}",
-                    data=post_data,
-                    headers=hdrs
-                )
-                # 打印原始响应前200字符，方便调试
-                resp_text = play_resp.text
-                print(f"[斗鱼] {cdn} 响应: {resp_text[:200]}")
-
-                play_data = play_resp.json()
-                if play_data.get("error") == 0:
-                    data = play_data.get("data", {})
-                    stream_url = None
-                    if isinstance(data, str):
-                        stream_url = data
-                    elif isinstance(data, dict):
-                        stream_url = data.get("rtmp_url") or data.get("rtmp_live")
-                    if stream_url and stream_url not in seen_urls:
-                        seen_urls.add(stream_url)
-                        all_streams.append({
-                            "cdn": cdn.upper(),
-                            "url": stream_url,
-                            "type": "flv"
-                        })
-                        print(f"[斗鱼] CDN {cdn} 成功获取流")
-                else:
-                    print(f"[斗鱼] CDN {cdn} 返回错误: {play_data.get('msg')}")
-            except Exception as e:
-                print(f"[斗鱼] CDN {cdn} 请求异常: {e}")
-                continue
-            # 添加短暂延迟，避免请求过快被限制
-            await asyncio.sleep(0.5)
-
-        if not all_streams:
-            return {"streams": [], "isLive": False}
-
         raw_av = room.get("room_icon") or room.get("avatar") or ""
         if isinstance(raw_av, dict):
             raw_av = raw_av.get("big") or raw_av.get("middle") or raw_av.get("small") or ""
-
-        return {
-            "streams": all_streams,
-            "title": room.get("nickname") or room.get("owner_name") or "斗鱼主播",
-            "avatar": raw_av,
-            "isLive": True
-        }
+        return {"client": True, "crptext": crptext, "roomId": real_id,
+                "anchorName": room.get("nickname") or room.get("owner_name") or "斗鱼主播",
+                "avatar": raw_av, "isLive": True}
     except Exception as e:
         print(f"[斗鱼] 解析异常: {e}")
         return {"streams": [], "isLive": False}
 
 
-# ==================== B站 ====================
 async def parse_bilibili(url):
     try:
         rid = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -342,7 +246,6 @@ async def parse_bilibili(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== 抖音 ====================
 async def parse_douyin(url):
     try:
         from streamget import DouyinLiveStream
@@ -577,8 +480,6 @@ async def api_parse(url: str = Query(...)):
 @app.get("/")
 def root():
     return {"status": "ok", "message": "多平台直播解析 API"}
-
-
 @app.get("/health")
 async def health_check():
     return {"status": "alive"}
