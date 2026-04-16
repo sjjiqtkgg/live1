@@ -480,3 +480,6 @@ async def api_parse(url: str = Query(...)):
 @app.get("/")
 def root():
     return {"status": "ok", "message": "多平台直播解析 API"}
+@app.get("/health")
+async def health_check():
+    return {"status": "alive"}
