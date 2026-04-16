@@ -171,7 +171,7 @@ async def parse_huya(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== 斗鱼多 CDN 解析（新） ====================
+# ==================== 斗鱼多 CDN 解析（修复版） ====================
 def douyu_parse_crptext(crptext: str, room_id: str) -> dict:
     """
     解析 crptext 获取请求参数 v, did, tt, sign。
@@ -236,7 +236,7 @@ async def parse_douyu(url):
                 print(f"[斗鱼] 尝试 CDN: {cdn}")
                 post_data = {
                     "cdn": cdn,
-                    "rate": "0",  # 0 表示最高画质
+                    "rate": "0",
                     "v": sign_params.get("v", ""),
                     "did": sign_params.get("did", ""),
                     "tt": sign_params.get("tt", ""),
@@ -248,11 +248,18 @@ async def parse_douyu(url):
                     data=post_data,
                     headers=hdrs
                 )
+                # 打印原始响应前200字符，方便调试
+                resp_text = play_resp.text
+                print(f"[斗鱼] {cdn} 响应: {resp_text[:200]}")
+
                 play_data = play_resp.json()
                 if play_data.get("error") == 0:
                     data = play_data.get("data", {})
-                    # 斗鱼可能返回 rtmp_url 或 rtmp_live
-                    stream_url = data.get("rtmp_url") or data.get("rtmp_live")
+                    stream_url = None
+                    if isinstance(data, str):
+                        stream_url = data
+                    elif isinstance(data, dict):
+                        stream_url = data.get("rtmp_url") or data.get("rtmp_live")
                     if stream_url and stream_url not in seen_urls:
                         seen_urls.add(stream_url)
                         all_streams.append({
@@ -260,17 +267,18 @@ async def parse_douyu(url):
                             "url": stream_url,
                             "type": "flv"
                         })
-                        print(f"[斗鱼] CDN {cdn} 成功")
+                        print(f"[斗鱼] CDN {cdn} 成功获取流")
                 else:
-                    print(f"[斗鱼] CDN {cdn} 错误: {play_data.get('msg')}")
+                    print(f"[斗鱼] CDN {cdn} 返回错误: {play_data.get('msg')}")
             except Exception as e:
-                print(f"[斗鱼] CDN {cdn} 异常: {e}")
+                print(f"[斗鱼] CDN {cdn} 请求异常: {e}")
                 continue
+            # 添加短暂延迟，避免请求过快被限制
+            await asyncio.sleep(0.5)
 
         if not all_streams:
             return {"streams": [], "isLive": False}
 
-        # 主播头像
         raw_av = room.get("room_icon") or room.get("avatar") or ""
         if isinstance(raw_av, dict):
             raw_av = raw_av.get("big") or raw_av.get("middle") or raw_av.get("small") or ""
