@@ -31,7 +31,7 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Sa
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
 
 # ==================== 代理加载 ====================
-PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://43.139.29.27:1111")
+PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://123:123@175.178.251.18:1080")
 PROXY_LIST_STR = PROXY_LIST_STR.strip().strip('"').strip("'")
 PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
 print(f"[代理] 共加载 {len(PROXY_URLS)} 个代理: {PROXY_URLS}")
