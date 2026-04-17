@@ -52,6 +52,22 @@ class ChatMessage(betterproto.Message):
     content: str = betterproto.string_field(3)
     visible_to_sender: bool = betterproto.bool_field(4)
     text_effect: "TextEffect" = betterproto.message_field(5)
+    background_image: "Image" = betterproto.message_field(6)
+    full_screen_text_color: str = betterproto.string_field(7)
+    background_image_v2: "Image" = betterproto.message_field(8)
+    public_area_common: "PublicAreaCommon" = betterproto.message_field(9)
+    gift_image: "Image" = betterproto.message_field(10)
+    agree_msg_id: int = betterproto.uint64_field(11)
+    priority_level: int = betterproto.uint32_field(12)
+    landscape_area_common: "LandscapeAreaCommon" = betterproto.message_field(13)
+    event_time: int = betterproto.uint64_field(14)
+    send_gift_during_game: bool = betterproto.bool_field(15)
+    send_gift_during_game_msg_id: int = betterproto.uint64_field(16)
+    fan_ticket_info: "FanTicketInfo" = betterproto.message_field(17)
+    show_type: int = betterproto.int32_field(18)
+    color: str = betterproto.string_field(19)
+    chat_by: str = betterproto.string_field(20)
+    priority: "Priority" = betterproto.message_field(21)
 
 
 @dataclass(eq=False, repr=False)
@@ -65,6 +81,12 @@ class GiftMessage(betterproto.Message):
     to_user: "User" = betterproto.message_field(7)
     gift: "Gift" = betterproto.message_field(8)
     describe: str = betterproto.string_field(9)
+    priority: "Priority" = betterproto.message_field(10)
+    fan_ticket_count: int = betterproto.uint64_field(11)
+    event_time: int = betterproto.uint64_field(12)
+    batch_info: "BatchInfo" = betterproto.message_field(13)
+    gift_group_id: int = betterproto.uint64_field(14)
+    send_gift_during_game: bool = betterproto.bool_field(15)
 
 
 @dataclass(eq=False, repr=False)
@@ -75,6 +97,8 @@ class LikeMessage(betterproto.Message):
     color: int = betterproto.uint64_field(4)
     user: "User" = betterproto.message_field(5)
     icon: str = betterproto.string_field(6)
+    double_like_detail: "DoubleLikeDetail" = betterproto.message_field(7)
+    display_style: "DisplayStyle" = betterproto.message_field(8)
 
 
 @dataclass(eq=False, repr=False)
@@ -86,6 +110,8 @@ class Common(betterproto.Message):
     monitor: int = betterproto.uint64_field(5)
     show_msg: bool = betterproto.bool_field(6)
     fold_type: bool = betterproto.bool_field(7)
+    anchor_fold_type: bool = betterproto.bool_field(8)
+    priority_score: int = betterproto.uint64_field(9)
 
 
 @dataclass(eq=False, repr=False)
@@ -168,3 +194,45 @@ class Gift(betterproto.Message):
     duration: int = betterproto.uint32_field(6)
     icon: "Image" = betterproto.message_field(7)
     gift_image: "Image" = betterproto.message_field(8)
+
+
+@dataclass(eq=False, repr=False)
+class PublicAreaCommon(betterproto.Message):
+    user_label: "UserLabel" = betterproto.message_field(1)
+    user_consume_in_room: int = betterproto.uint64_field(2)
+
+
+@dataclass(eq=False, repr=False)
+class UserLabel(betterproto.Message):
+    type: int = betterproto.int32_field(1)
+    content: str = betterproto.string_field(2)
+
+
+@dataclass(eq=False, repr=False)
+class LandscapeAreaCommon(betterproto.Message):
+    pass
+
+
+@dataclass(eq=False, repr=False)
+class FanTicketInfo(betterproto.Message):
+    pass
+
+
+@dataclass(eq=False, repr=False)
+class Priority(betterproto.Message):
+    pass
+
+
+@dataclass(eq=False, repr=False)
+class BatchInfo(betterproto.Message):
+    pass
+
+
+@dataclass(eq=False, repr=False)
+class DoubleLikeDetail(betterproto.Message):
+    pass
+
+
+@dataclass(eq=False, repr=False)
+class DisplayStyle(betterproto.Message):
+    pass
