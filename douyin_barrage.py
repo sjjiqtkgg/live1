@@ -153,7 +153,7 @@ class DouyinBarrageCollector:
 
     def start(self):
         configs = [
-            {"host": "webcast3-ws-web-lq.snssdk.com", "ua": MOBILE_UA, "need_ttwid": False},
+            # {"host": "webcast3-ws-web-lq.snssdk.com", "ua": MOBILE_UA, "need_ttwid": False},  # 移动端，代理不支持暂时禁用
             {"host": "webcast3-ws-web-lq.douyin.com", "ua": UA, "need_ttwid": True},
         ]
 
