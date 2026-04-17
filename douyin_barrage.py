@@ -7,7 +7,6 @@ import ssl
 from urllib.parse import urlparse, parse_qs
 import websocket
 
-# 从主文件导入共享变量和函数
 from main import (
     UA, MOBILE_UA, PROXY_URLS, SOCKS_SUPPORT,
     get_douyin_signature
@@ -16,7 +15,6 @@ from main import (
 if SOCKS_SUPPORT:
     from python_socks.sync import Proxy
 
-# 导入 Protobuf 定义
 from protobuf import douyin
 
 
@@ -91,62 +89,61 @@ class DouyinBarrageCollector:
             response = douyin.Response().parse(push_frame.payload)
 
             for msg in response.messages_list:
-                method = msg.method
-                payload = msg.payload
+                try:
+                    method = msg.method
+                    payload = msg.payload
 
-                # 聊天消息
-                if method == "WebcastChatMessage":
-                    try:
-                        chat = douyin.ChatMessage().parse(payload)
-                        if chat and chat.user and chat.content:
-                            if self.callback:
+                    if method == "WebcastChatMessage":
+                        try:
+                            chat = douyin.ChatMessage().parse(payload)
+                            if chat and chat.user and chat.content:
+                                if self.callback:
+                                    self.callback({
+                                        "type": "chat",
+                                        "nick": chat.user.nick_name or "匿名用户",
+                                        "content": chat.content,
+                                        "time": int(time.time() * 1000)
+                                    })
+                        except Exception as e:
+                            print(f"[抖音弹幕] 解析聊天消息出错 ({method}): {e}")
+
+                    elif method == "WebcastGiftMessage":
+                        try:
+                            gift = douyin.GiftMessage().parse(payload)
+                            if gift and gift.user and self.callback:
                                 self.callback({
-                                    "type": "chat",
-                                    "nick": chat.user.nick_name or "匿名用户",
-                                    "content": chat.content,
+                                    "type": "gift",
+                                    "nick": gift.user.nick_name or "匿名用户",
+                                    "gift": gift.gift.name if gift.gift else "礼物",
+                                    "count": gift.repeat_count,
                                     "time": int(time.time() * 1000)
                                 })
-                    except Exception as e:
-                        print(f"[抖音弹幕] 解析聊天出错: {e}")
+                        except Exception as e:
+                            print(f"[抖音弹幕] 解析礼物消息出错 ({method}): {e}")
 
-                # 礼物消息
-                elif method == "WebcastGiftMessage":
-                    try:
-                        gift = douyin.GiftMessage().parse(payload)
-                        if gift and gift.user and self.callback:
-                            self.callback({
-                                "type": "gift",
-                                "nick": gift.user.nick_name or "匿名用户",
-                                "gift": gift.gift.name if gift.gift else "礼物",
-                                "count": gift.repeat_count,
-                                "time": int(time.time() * 1000)
-                            })
-                    except Exception as e:
-                        print(f"[抖音弹幕] 解析礼物出错: {e}")
+                    elif method == "WebcastLikeMessage":
+                        try:
+                            like = douyin.LikeMessage().parse(payload)
+                            if like and like.user and self.callback:
+                                self.callback({
+                                    "type": "like",
+                                    "nick": like.user.nick_name or "匿名用户",
+                                    "count": like.count,
+                                    "time": int(time.time() * 1000)
+                                })
+                        except Exception as e:
+                            print(f"[抖音弹幕] 解析点赞消息出错 ({method}): {e}")
 
-                # 点赞消息
-                elif method == "WebcastLikeMessage":
-                    try:
-                        like = douyin.LikeMessage().parse(payload)
-                        if like and like.user and self.callback:
-                            self.callback({
-                                "type": "like",
-                                "nick": like.user.nick_name or "匿名用户",
-                                "count": like.count,
-                                "time": int(time.time() * 1000)
-                            })
-                    except Exception as e:
-                        print(f"[抖音弹幕] 解析点赞出错: {e}")
+                    else:
+                        # 其他消息静默忽略
+                        pass
 
-                # 其他未知消息，可选择性打印
-                else:
-                    # 可取消注释以调试
-                    # print(f"[抖音弹幕] 未处理消息类型: {method}")
-                    pass
+                except Exception as e:
+                    # 单条消息解析失败不影响后续
+                    print(f"[抖音弹幕] 处理消息时出错 (method={msg.method if 'msg' in locals() else 'unknown'}): {e}")
 
         except Exception as e:
-            # 如果解析顶层出错，打印错误但不崩溃
-            print(f"[抖音弹幕] 解析顶层错误: {e}")
+            print(f"[抖音弹幕] 解析顶层 PushFrame/Response 错误: {e}")
 
     def _on_error(self, ws, error):
         print(f"[抖音弹幕] WebSocket 错误: {error}")
