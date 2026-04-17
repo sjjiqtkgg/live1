@@ -7,7 +7,7 @@ import ssl
 from urllib.parse import urlparse, parse_qs
 import websocket
 
-# 从主文件导入共享变量和函数（确保 main.py 中已定义这些）
+# 从主文件导入共享变量和函数
 from main import (
     UA, MOBILE_UA, PROXY_URLS, SOCKS_SUPPORT,
     get_douyin_signature
@@ -29,7 +29,6 @@ class DouyinBarrageCollector:
         self.user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
 
     def _generate_ttwid(self) -> str:
-        """生成符合抖音规范的 ttwid：19位数字 + 11位随机字母数字"""
         return "".join(random.choices("0123456789", k=19)) + "".join(
             random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=11)
         )
@@ -87,23 +86,30 @@ class DouyinBarrageCollector:
         if self.stop_event.is_set():
             return
         try:
+            # 解析 PushFrame
             push_frame = douyin.PushFrame().parse(message)
             response = douyin.Response().parse(push_frame.payload)
+
             for msg in response.messages_list:
                 method = msg.method
                 payload = msg.payload
+
+                # 聊天消息
                 if method == "WebcastChatMessage":
                     try:
                         chat = douyin.ChatMessage().parse(payload)
-                        if chat and chat.user and chat.content and self.callback:
-                            self.callback({
-                                "type": "chat",
-                                "nick": chat.user.nick_name or "匿名用户",
-                                "content": chat.content,
-                                "time": int(time.time() * 1000)
-                            })
+                        if chat and chat.user and chat.content:
+                            if self.callback:
+                                self.callback({
+                                    "type": "chat",
+                                    "nick": chat.user.nick_name or "匿名用户",
+                                    "content": chat.content,
+                                    "time": int(time.time() * 1000)
+                                })
                     except Exception as e:
                         print(f"[抖音弹幕] 解析聊天出错: {e}")
+
+                # 礼物消息
                 elif method == "WebcastGiftMessage":
                     try:
                         gift = douyin.GiftMessage().parse(payload)
@@ -117,6 +123,8 @@ class DouyinBarrageCollector:
                             })
                     except Exception as e:
                         print(f"[抖音弹幕] 解析礼物出错: {e}")
+
+                # 点赞消息
                 elif method == "WebcastLikeMessage":
                     try:
                         like = douyin.LikeMessage().parse(payload)
@@ -129,7 +137,15 @@ class DouyinBarrageCollector:
                             })
                     except Exception as e:
                         print(f"[抖音弹幕] 解析点赞出错: {e}")
+
+                # 其他未知消息，可选择性打印
+                else:
+                    # 可取消注释以调试
+                    # print(f"[抖音弹幕] 未处理消息类型: {method}")
+                    pass
+
         except Exception as e:
+            # 如果解析顶层出错，打印错误但不崩溃
             print(f"[抖音弹幕] 解析顶层错误: {e}")
 
     def _on_error(self, ws, error):
