@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import random
 import string
@@ -85,7 +86,14 @@ class DouyinBarrageCollector:
             return
         try:
             push_frame = douyin.PushFrame().parse(message)
-            response = douyin.Response().parse(push_frame.payload)
+            payload = push_frame.payload
+            # 如果数据经过 gzip 压缩则先解压
+            if push_frame.payload_encoding == "gzip":
+                try:
+                    payload = gzip.decompress(payload)
+                except Exception:
+                    pass
+            response = douyin.Response().parse(payload)
 
             for msg in response.messages_list:
                 method = msg.method
