@@ -147,9 +147,14 @@ class DouyinBarrageCollector:
 
     def _on_close(self, ws, code, msg):
         print(f"[抖音弹幕] 连接关闭: {code} {msg}")
-        if not self.stop_event.is_set():
-            time.sleep(3)
-            self.start()
+        if self.stop_event.is_set():
+            print("[抖音弹幕] 已收到停止信号，不再重连")
+            return
+        time.sleep(3)
+        if self.stop_event.is_set():
+            print("[抖音弹幕] 等待期间收到停止信号，不再重连")
+            return
+        self.start()
 
     def start(self):
         configs = [
