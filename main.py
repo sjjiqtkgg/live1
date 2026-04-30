@@ -195,30 +195,23 @@ async def parse_huya(url):
         if not anchor_name:
             anchor_name = "虎牙主播"
 
-        # 从移动端页面抓取头像（最可靠）
+        # 从移动端页面抓取头像
         avatar = ""
         try:
-            mob_resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
-                headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"})
-            mob_html = mob_resp.text
-            for pattern in [
-                r'"avatar180":"([^"]+)"',
-                r'"avatar90":"([^"]+)"',
-                r'"headImg":"([^"]+)"',
-                r'"avatar":"([^"]+)"',
-            ]:
+            async with httpx.AsyncClient(timeout=10, proxy=PROXY_URL) as c:
+                mob_r = await c.get(f"https://m.huya.com/{room_id}",
+                    headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"})
+                mob_html = mob_r.text
+            for pattern in [r'"avatar180":"([^"]+)"', r'"avatar90":"([^"]+)"',
+                            r'"headImg":"([^"]+)"', r'"avatar":"([^"]+)"']:
                 m = re.search(pattern, mob_html)
                 if m:
                     av = m.group(1).replace("\/", "/")
-                    if av.startswith("//"):
-                        av = "https:" + av
-                    if av.startswith("http"):
-                        avatar = av
-                        break
+                    if av.startswith("//"): av = "https:" + av
+                    if av.startswith("http"): avatar = av; break
             if anchor_name == "虎牙主播":
-                title_match = re.search(r'<title>(.*?)</title>', mob_html)
-                if title_match:
-                    anchor_name = title_match.group(1).split("_")[0].strip()
+                t = re.search(r'<title>(.*?)</title>', mob_html)
+                if t: anchor_name = t.group(1).split("_")[0].strip()
         except Exception as e:
             print(f"[虎牙] 头像抓取失败: {e}")
 
