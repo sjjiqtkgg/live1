@@ -196,10 +196,10 @@ async def parse_huya(url):
             anchor_name = "虎牙主播"
 
         avatar = (
-            profile.get("avatar") or
-            room_info.get("avatar") or
-            live_data.get("avatar") or
-            anchor.get("avatar") or
+            profile.get("avatar180") or profile.get("avatar") or
+            room_info.get("avatar180") or room_info.get("avatar") or
+            live_data.get("avatar180") or live_data.get("avatar") or
+            anchor.get("avatar180") or anchor.get("avatar") or
             ""
         )
 
@@ -209,7 +209,7 @@ async def parse_huya(url):
         raise
     except Exception as e:
         print(f"[虎牙] 解析异常: {e}")
-        return {"streams": [], "isLive": False}
+        raise HTTPException(500, f"虎牙解析失败: {str(e)}")
 
 
 # ==================== 斗鱼 ====================
