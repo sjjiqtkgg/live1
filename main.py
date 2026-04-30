@@ -195,7 +195,6 @@ async def parse_huya(url):
         if not anchor_name:
             anchor_name = "虎牙主播"
 
-        # 先尝试从 API 字段获取头像
         avatar = (
             profile.get("avatar") or
             room_info.get("avatar") or
@@ -204,32 +203,13 @@ async def parse_huya(url):
             ""
         )
 
-        # API 没有头像则从移动端页面抓取
-        if not avatar:
-            try:
-                async with httpx.AsyncClient(timeout=10, proxy=PROXY_URL) as c:
-                    mob_r = await c.get(f"https://m.huya.com/{room_id}",
-                        headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"})
-                mob_html = mob_r.text
-                for pattern in [r'"avatar180":"([^"]+)"', r'"avatar90":"([^"]+)"',
-                                r'"headImg":"([^"]+)"', r'"avatar":"([^"]+)"']:
-                    m = re.search(pattern, mob_html)
-                    if m:
-                        av = m.group(1).replace("\/", "/")
-                        if av.startswith("//"): av = "https:" + av
-                        if av.startswith("http"):
-                            avatar = av
-                            break
-            except Exception as e:
-                print(f"[虎牙] 头像抓取失败: {e}")
-
         danmaku = await fetch_huya_danmaku_params(room_id)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku}
     except HTTPException:
         raise
     except Exception as e:
         print(f"[虎牙] 解析异常: {e}")
-        raise HTTPException(500, f"虎牙解析失败: {str(e)}")
+        return {"streams": [], "isLive": False}
 
 
 # ==================== 斗鱼 ====================
