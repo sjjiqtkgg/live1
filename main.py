@@ -165,8 +165,6 @@ async def parse_huya(url):
         room_info = live.get("roomInfo", {})
         live_data = live.get("liveData", {})
         anchor = live.get("anchor", {})
-        print(f"[虎牙调试] anchor字段: {json.dumps(anchor, ensure_ascii=False)[:500]}")
-        print(f"[虎牙调试] profileRoom字段: {json.dumps(live.get('profileRoom', {}), ensure_ascii=False)[:300]}")
 
         anchor_name = (
             profile.get("nick") or
