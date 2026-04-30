@@ -59,7 +59,13 @@ async def request_with_retry(method: str, url: str, **kwargs):
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
-    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com"]
+    # ✅ 已补充常见 CDN 域名
+    ALLOWED = [
+        "douyu.com", "huya.com", "bilibili.com", "bilivideo.com",
+        "douyucdn.cn", "douyin.com", "live.bilibili.com",
+        "douyinpic.com",  # 抖音头像 CDN
+        "huyaimg.com"     # 虎牙头像 CDN
+    ]
     if not any(d in url for d in ALLOWED):
         raise HTTPException(403, "domain not allowed")
     body = await request.body() if request.method == "POST" else None
@@ -174,6 +180,9 @@ async def parse_huya(url):
                 pass
         anchor_name = anchor_name or "虎牙主播"
         avatar = profile.get("avatar") or room_info.get("avatar") or live_data.get("avatar") or anchor.get("avatar") or ""
+        # ✅ 强制转 HTTPS
+        if avatar and avatar.startswith("http://"):
+            avatar = avatar.replace("http://", "https://")
         danmaku = await fetch_huya_danmaku_params(room_id)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
     except Exception as e:
@@ -278,7 +287,6 @@ async def parse_douyin(url):
                     room_id = match.group(1)
             except Exception:
                 pass
-        # 不再返回 ttwid，由弹幕模块自行处理
         return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"),
                 "avatar": raw.get("avatar", ""), "roomId": room_id, "isLive": True}
     except Exception as e:
@@ -297,7 +305,6 @@ def get_douyin_signature(md5_str: str) -> str:
         return ""
 
 
-# 导入新模块（放在函数定义之后，避免循环导入）
 from douyin_barrage import DouyinBarrageCollector
 
 
@@ -351,6 +358,62 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         except:
             pass
         task.cancel()
+
+
+# ==================== 新增：虎牙主播信息专用接口 ====================
+@app.get("/api/huya/info")
+async def api_huya_info(room_id: str = Query(...)):
+    """通过解析虎牙移动端页面获取主播头像和昵称（不受开播状态影响）"""
+    headers = {
+        "User-Agent": MOBILE_UA,
+        "Referer": f"https://m.huya.com/{room_id}"
+    }
+    try:
+        resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}", headers=headers)
+        if resp.status_code != 200:
+            return {"title": "虎牙主播", "avatar": ""}
+        html = resp.text
+
+        avatar = ""
+        title = ""
+
+        # 1. 优先从 JSON-LD 结构化数据中提取
+        json_match = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                avatar = data.get("image", "")
+                if avatar and avatar.startswith("//"):
+                    avatar = "https:" + avatar
+                elif avatar and avatar.startswith("http://"):
+                    avatar = avatar.replace("http://", "https://")
+                title = data.get("name", "")
+            except json.JSONDecodeError:
+                pass
+
+        # 2. 降级使用正则表达式查找
+        if not avatar:
+            av_match = re.search(r'"avatar"\s*:\s*"([^"]+)"', html)
+            if not av_match:
+                av_match = re.search(r'<img[^>]+class="avatar"[^>]+src="([^"]+)"', html, re.I)
+            if av_match:
+                avatar = av_match.group(1)
+                if avatar.startswith("//"):
+                    avatar = "https:" + avatar
+                elif avatar.startswith("http://"):
+                    avatar = avatar.replace("http://", "https://")
+
+        if not title:
+            title_match = re.search(r'<meta name="description" content="([^"]+)"', html)
+            if title_match:
+                title = title_match.group(1).split("，")[0].strip()
+            else:
+                title = "虎牙主播"
+
+        return {"title": title, "avatar": avatar}
+    except Exception as e:
+        print(f"[虎牙信息] 获取主播信息异常: {e}")
+        return {"title": "虎牙主播", "avatar": ""}
 
 
 @app.get("/api/parse")
