@@ -126,13 +126,13 @@ async def parse_huya(url):
             headers={"User-Agent": UA, "Referer": "https://www.huya.com/"})
         data = resp.json()
         if data.get("status") != 200:
-            return {"streams": [], "isLive": False}
+            return {"streams": [], "title": "虎牙主播", "avatar": "", "isLive": False}
         live = data["data"]
         if live.get("realLiveStatus") != "ON":
-            return {"streams": [], "isLive": False}
+            return {"streams": [], "title": "虎牙主播", "avatar": "", "isLive": False}
         cdn_list = live.get("stream", {}).get("baseSteamInfoList", [])
         if not cdn_list:
-            return {"streams": [], "isLive": False}
+            return {"streams": [], "title": "虎牙主播", "avatar": "", "isLive": False}
         cdn_list.sort(key=lambda s: CDN_ORDER.get(s.get("sCdnType", "ZZ"), 9))
         streams = []
         seen_cdns = set()
@@ -152,33 +152,56 @@ async def parse_huya(url):
             streams.append({"cdn": label, "url": full_url.replace("http://", "https://"), "type": "flv"})
             seen_cdns.add(cdn_type)
         if not streams:
-            return {"streams": [], "isLive": False}
+            return {"streams": [], "title": "虎牙主播", "avatar": "", "isLive": False}
+
         profile = live.get("profileRoom", {})
         room_info = live.get("roomInfo", {})
         live_data = live.get("liveData", {})
         anchor = live.get("anchor", {})
+
+        # 提取主播名
         anchor_name = profile.get("nick") or room_info.get("nick") or live_data.get("nick") or anchor.get("nick")
         if not anchor_name:
+            anchor_name = "虎牙主播"
+
+        # 提取头像：多字段尝试
+        avatar = profile.get("avatar") or room_info.get("avatar") or live_data.get("avatar") or anchor.get("avatar")
+        if not avatar:
+            # 尝试从 anchor 中获取不同尺寸的头像
+            for k in ("avatar180", "avatar_180", "avatar90", "avatar_90"):
+                av = anchor.get(k)
+                if av:
+                    avatar = av
+                    break
+        if not avatar:
+            # 最终备用：从移动端页面抓取
             try:
                 mob_resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
                     headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"})
                 mob_html = mob_resp.text
+                # 尝试从 HTML 中提取头像
+                avatar_match = re.search(r'<img[^>]+class="avatar"[^>]+src="([^"]+)"', mob_html, re.I)
+                if not avatar_match:
+                    avatar_match = re.search(r'"avatar":"([^"]+)"', mob_html)
+                if avatar_match:
+                    avatar = avatar_match.group(1)
+                    if avatar.startswith("//"):
+                        avatar = "https:" + avatar
+                # 如果主播名还是默认值，也尝试提取
                 title_match = re.search(r'<title>(.*?)</title>', mob_html)
-                if title_match:
+                if title_match and anchor_name == "虎牙主播":
                     anchor_name = title_match.group(1).split("_")[0].strip()
-                else:
-                    nick_match = re.search(r'"nick":"([^"]+)"', mob_html)
-                    if nick_match:
-                        anchor_name = nick_match.group(1)
             except Exception:
                 pass
-        anchor_name = anchor_name or "虎牙主播"
-        avatar = profile.get("avatar") or room_info.get("avatar") or live_data.get("avatar") or anchor.get("avatar") or ""
+
+        if not avatar:
+            avatar = ""  # 确保字段存在
+
         danmaku = await fetch_huya_danmaku_params(room_id)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
     except Exception as e:
         print(f"[虎牙] 解析异常: {e}")
-        return {"streams": [], "isLive": False}
+        return {"streams": [], "title": "虎牙主播", "avatar": "", "isLive": False}
 
 
 # ==================== 斗鱼 ====================
