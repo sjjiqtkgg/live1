@@ -376,6 +376,6 @@ def root():
     return {"status": "ok", "message": "多平台直播解析 API"}
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "alive"}
