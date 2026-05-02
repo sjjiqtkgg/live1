@@ -11,3 +11,4 @@ PyExecJS
 python-socks
 pyyaml
 psutil
+loguru
