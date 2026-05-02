@@ -371,6 +371,36 @@ async def api_parse(url: str = Query(...)):
         raise HTTPException(500, str(e))
 
 
+
+@app.get("/api/douyin/sign")
+async def douyin_sign(room_id: str = Query(...)):
+    """生成抖音弹幕 WebSocket 签名，供前端直连使用"""
+    user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
+    base_ws_url = (
+        f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/"
+        f"?app_name=douyin_web&version_code=180800&webcast_sdk_version=1.0.14"
+        f"&update_version_code=1.0.14&compress=gzip&internal_ext=internal_src:dim"
+        f"|wss_push_room_id:{room_id}|wss_push_did:0|first_req_ms:{int(time.time()*1000)}"
+        f"|fetch_time:{int(time.time()*1000)}|seq:1|wss_info:0-0-0-0"
+        f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&debug=false"
+        f"&endpoint=live&support_wrds=1&im_path=/webcast/im/fetch/&user_unique_id={user_unique_id}"
+        f"&device_platform=web&cookie_enabled=true&screen_width=1920&screen_height=1080"
+        f"&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome"
+        f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
+        f"&identity=audience&room_id={room_id}&heartbeatDuration=0"
+    )
+    params_order = ("live_id", "aid", "version_code", "webcast_sdk_version",
+                    "room_id", "sub_room_id", "sub_channel_id", "did_rule",
+                    "user_unique_id", "device_platform", "device_type", "ac", "identity")
+    parsed = urlparse(base_ws_url)
+    qs_dict = parse_qs(parsed.query)
+    wss_maps = {k: v[0] if isinstance(v, list) else v for k, v in qs_dict.items()}
+    param_str = ','.join(f"{p}={wss_maps.get(p, '')}" for p in params_order)
+    md5_str = hashlib.md5(param_str.encode()).hexdigest()
+    signature = get_douyin_signature(md5_str)
+    ws_url = f"{base_ws_url}&signature={signature}"
+    return {"wsUrl": ws_url}
+
 @app.get("/")
 def root():
     return {"status": "ok", "message": "多平台直播解析 API"}
