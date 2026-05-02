@@ -320,7 +320,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         asyncio.run_coroutine_threadsafe(message_queue.put(msg), loop)
 
     collector = DouyinBarrageCollector(room_id, ttwid, callback)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     task = loop.run_in_executor(None, collector.start)
 
     async def send_worker():
