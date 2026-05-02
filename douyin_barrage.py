@@ -80,8 +80,6 @@ class DouyinBarrageCollector:
     def _on_open(self, ws):
         print(f"[抖音弹幕] 已连接房间 {self.room_id} via {ws._host}")
         self.retry_count = 0
-
-        # 测试弹幕验证通道
         if self.callback:
             self.callback({
                 "type": "chat",
@@ -99,7 +97,6 @@ class DouyinBarrageCollector:
                         ws.send(b"", opcode=websocket.ABNF.OPCODE_PING)
                 except:
                     break
-
         threading.Thread(target=heartbeat, daemon=True).start()
 
     def _on_message(self, ws, message):
@@ -132,7 +129,6 @@ class DouyinBarrageCollector:
                             })
                     except Exception as e:
                         print(f"[抖音弹幕] 解析聊天出错: {e}")
-
                 elif method == "WebcastGiftMessage":
                     try:
                         gift = douyin.GiftMessage().parse(payload)
@@ -146,7 +142,6 @@ class DouyinBarrageCollector:
                             })
                     except Exception as e:
                         print(f"[抖音弹幕] 解析礼物出错: {e}")
-
                 elif method == "WebcastLikeMessage":
                     try:
                         like = douyin.LikeMessage().parse(payload)
@@ -159,13 +154,40 @@ class DouyinBarrageCollector:
                             })
                     except Exception as e:
                         print(f"[抖音弹幕] 解析点赞出错: {e}")
-
-                else:
-                    # 忽略未处理的消息类型，避免抛出异常
-                    pass
+                # 所有其他未处理的消息类型直接忽略
 
         except Exception as e:
             print(f"[抖音弹幕] 解析 PushFrame/Response 错误: {e}")
+            # 在这里增加一层终极容错：尝试只提取 method 而不解析 payload
+            try:
+                push_frame = douyin.PushFrame().parse(message)
+                if push_frame.payload_encoding == "gzip":
+                    try:
+                        payload = gzip.decompress(push_frame.payload)
+                    except:
+                        pass
+                response = douyin.Response().parse(payload)
+                for msg in response.messages_list:
+                    method = msg.method
+                    # 只提取已知类型的消息
+                    if method in ("WebcastChatMessage", "WebcastGiftMessage", "WebcastLikeMessage"):
+                        try:
+                            if method == "WebcastChatMessage":
+                                chat = douyin.ChatMessage().parse(msg.payload)
+                                if chat and self.callback:
+                                    self.callback({"type": "chat", "nick": chat.user.nick_name or "匿名", "content": chat.content, "time": int(time.time()*1000)})
+                            elif method == "WebcastGiftMessage":
+                                gift = douyin.GiftMessage().parse(msg.payload)
+                                if gift and self.callback:
+                                    self.callback({"type": "gift", "nick": gift.user.nick_name or "匿名", "gift": gift.gift.name if gift.gift else "礼物", "count": gift.repeat_count, "time": int(time.time()*1000)})
+                            elif method == "WebcastLikeMessage":
+                                like = douyin.LikeMessage().parse(msg.payload)
+                                if like and self.callback:
+                                    self.callback({"type": "like", "nick": like.user.nick_name or "匿名", "count": like.count, "time": int(time.time()*1000)})
+                        except:
+                            pass
+            except:
+                pass
 
     def _on_error(self, ws, error):
         print(f"[抖音弹幕] WebSocket 错误: {error}")
@@ -175,7 +197,6 @@ class DouyinBarrageCollector:
         if self.stop_event.is_set():
             print("[抖音弹幕] 已收到停止信号，退出")
             return
-
         self.retry_count += 1
         wait_time = min(1.6 ** self.retry_count, self.max_retry_backoff)
         print(f"[抖音弹幕] {wait_time:.1f} 秒后重连...")
@@ -188,13 +209,10 @@ class DouyinBarrageCollector:
     def start(self):
         if self.stop_event.is_set():
             return
-
         headers = self._build_headers(UA)
-
         for host in self.WS_DOMAINS:
             ws_url = self._build_ws_url(host)
             print(f"[抖音弹幕] 尝试 {host}")
-
             proxies = PROXY_URLS if PROXY_URLS else [None]
             for idx, proxy_url in enumerate(proxies):
                 if self.stop_event.is_set():
@@ -238,7 +256,5 @@ class DouyinBarrageCollector:
                     print(f"[抖音弹幕] 连接失败 {host}: {e}")
                     time.sleep(1)
                     continue
-
             print(f"[抖音弹幕] 域名 {host} 所有代理失败，尝试下一个域名")
-
         print("[抖音弹幕] 所有域名和代理均失败，停止重试")
