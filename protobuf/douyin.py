@@ -1,4 +1,3 @@
-# protobuf/douyin.py
 from dataclasses import dataclass
 from typing import List, Optional
 import betterproto
@@ -36,8 +35,9 @@ class Message(betterproto.Message):
     method: str = betterproto.string_field(1)
     payload: bytes = betterproto.bytes_field(2)
     msg_id: int = betterproto.int64_field(3)
-    msg_type: int = betterproto.int32_field(4)
+    msg_type: int = betterproto.int64_field(4)  # 修复：int32 → int64
     offset: int = betterproto.int64_field(5)
+    room_id: int = betterproto.int64_field(6)   # 新增
 
 
 @dataclass
