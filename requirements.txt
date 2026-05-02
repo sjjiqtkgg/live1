@@ -9,3 +9,5 @@ betterproto>=2.0.0b6
 websocket-client>=1.6.0
 PyExecJS
 python-socks
+pyyaml
+psutil
