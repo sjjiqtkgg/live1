@@ -82,6 +82,15 @@ class DouyinBarrageCollector:
 
     def _on_open(self, ws):
         print(f"[抖音弹幕] 已连接房间 {self.room_id} via {ws._host}")
+                # 发送测试弹幕验证通道
+        if self.callback:
+            self.callback({
+                "type": "chat",
+                "nick": "系统测试",
+                "content": "弹幕通道测试成功！",
+                "time": int(time.time() * 1000)
+            })
+            print("[抖音弹幕] 已发送测试弹幕到回调")
         self.retry_count = 0
 
         def heartbeat():
