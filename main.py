@@ -296,7 +296,6 @@ def get_douyin_signature(md5_str: str) -> str:
         return ""
 
 
-# 导入新模块（放在函数定义之后，避免循环导入）
 from douyin_barrage import DouyinBarrageCollector
 
 
@@ -313,14 +312,15 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         pass
     print(f"[ttwid] 使用: {ttwid[:10] if ttwid else '自动生成'}...")
 
-    stop_event = threading.Event()  # 仅控制前端消息队列
+    stop_event = threading.Event()
     message_queue = asyncio.Queue()
+
+    loop = asyncio.get_running_loop()
 
     def callback(msg):
         asyncio.run_coroutine_threadsafe(message_queue.put(msg), loop)
 
     collector = DouyinBarrageCollector(room_id, ttwid, callback)
-    loop = asyncio.get_running_loop()
     task = loop.run_in_executor(None, collector.start)
 
     async def send_worker():
@@ -348,7 +348,6 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
             await send_task
         except:
             pass
-        # 注意：不调用 collector.stop_event.set()，让采集器自行管理重连
         task.cancel()
 
 

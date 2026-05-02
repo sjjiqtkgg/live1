@@ -20,7 +20,6 @@ from protobuf import douyin
 
 
 class DouyinBarrageCollector:
-    # 多域名故障转移列表
     WS_DOMAINS = [
         "webcast3-ws-web-lq.douyin.com",
         "webcast5-ws-web-lf.douyin.com",
@@ -34,8 +33,6 @@ class DouyinBarrageCollector:
         self.callback = callback
         self.stop_event = threading.Event()
         self.user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
-
-        # 指数退避参数
         self.retry_count = 0
         self.max_retry_backoff = 60
 
@@ -82,7 +79,9 @@ class DouyinBarrageCollector:
 
     def _on_open(self, ws):
         print(f"[抖音弹幕] 已连接房间 {self.room_id} via {ws._host}")
-                # 发送测试弹幕验证通道
+        self.retry_count = 0
+
+        # 测试弹幕验证通道
         if self.callback:
             self.callback({
                 "type": "chat",
@@ -91,7 +90,6 @@ class DouyinBarrageCollector:
                 "time": int(time.time() * 1000)
             })
             print("[抖音弹幕] 已发送测试弹幕到回调")
-        self.retry_count = 0
 
         def heartbeat():
             while not self.stop_event.is_set():
@@ -105,6 +103,7 @@ class DouyinBarrageCollector:
         threading.Thread(target=heartbeat, daemon=True).start()
 
     def _on_message(self, ws, message):
+        print(f"[抖音弹幕] 收到原始消息长度: {len(message)}")
         if self.stop_event.is_set():
             return
         try:
@@ -161,6 +160,10 @@ class DouyinBarrageCollector:
                     except Exception as e:
                         print(f"[抖音弹幕] 解析点赞出错: {e}")
 
+                else:
+                    # 忽略未处理的消息类型，避免抛出异常
+                    pass
+
         except Exception as e:
             print(f"[抖音弹幕] 解析 PushFrame/Response 错误: {e}")
 
@@ -173,7 +176,6 @@ class DouyinBarrageCollector:
             print("[抖音弹幕] 已收到停止信号，退出")
             return
 
-        # 指数退避重连
         self.retry_count += 1
         wait_time = min(1.6 ** self.retry_count, self.max_retry_backoff)
         print(f"[抖音弹幕] {wait_time:.1f} 秒后重连...")
@@ -181,7 +183,6 @@ class DouyinBarrageCollector:
         self.start()
 
     def stop(self):
-        """外部调用以停止采集器"""
         self.stop_event.set()
 
     def start(self):
