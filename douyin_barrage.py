@@ -20,7 +20,7 @@ from protobuf import douyin
 
 
 class DouyinBarrageCollector:
-    # 全套 WebSocket 域名，按优先级排序，失败自动切换
+    # 多域名故障转移列表
     WS_DOMAINS = [
         "webcast3-ws-web-lq.douyin.com",
         "webcast5-ws-web-lf.douyin.com",
@@ -35,9 +35,9 @@ class DouyinBarrageCollector:
         self.stop_event = threading.Event()
         self.user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
 
-        # 指数退避重连参数
+        # 指数退避参数
         self.retry_count = 0
-        self.max_retry_backoff = 60  # 最大重连间隔
+        self.max_retry_backoff = 60
 
     def _generate_ttwid(self) -> str:
         return "".join(random.choices("0123456789", k=19)) + "".join(
@@ -82,7 +82,7 @@ class DouyinBarrageCollector:
 
     def _on_open(self, ws):
         print(f"[抖音弹幕] 已连接房间 {self.room_id} via {ws._host}")
-        self.retry_count = 0  # 连接成功，重置重试计数
+        self.retry_count = 0
 
         def heartbeat():
             while not self.stop_event.is_set():
@@ -161,8 +161,9 @@ class DouyinBarrageCollector:
     def _on_close(self, ws, code, msg):
         print(f"[抖音弹幕] 连接关闭: {code} {msg}")
         if self.stop_event.is_set():
-            print("[抖音弹幕] 已收到停止信号，不再重连")
+            print("[抖音弹幕] 已收到停止信号，退出")
             return
+
         # 指数退避重连
         self.retry_count += 1
         wait_time = min(1.6 ** self.retry_count, self.max_retry_backoff)
@@ -170,15 +171,20 @@ class DouyinBarrageCollector:
         time.sleep(wait_time)
         self.start()
 
+    def stop(self):
+        """外部调用以停止采集器"""
+        self.stop_event.set()
+
     def start(self):
+        if self.stop_event.is_set():
+            return
+
         headers = self._build_headers(UA)
 
-        # 遍历多个服务器域名
         for host in self.WS_DOMAINS:
             ws_url = self._build_ws_url(host)
             print(f"[抖音弹幕] 尝试 {host}")
 
-            # 遍历代理列表
             proxies = PROXY_URLS if PROXY_URLS else [None]
             for idx, proxy_url in enumerate(proxies):
                 if self.stop_event.is_set():
@@ -216,7 +222,6 @@ class DouyinBarrageCollector:
                             on_error=self._on_error, on_close=self._on_close,
                         )
                         ws._host = host
-                    # run_forever 会阻塞直到连接关闭
                     ws.run_forever()
                     return
                 except Exception as e:

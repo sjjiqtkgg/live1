@@ -278,7 +278,6 @@ async def parse_douyin(url):
                     room_id = match.group(1)
             except Exception:
                 pass
-        # 不再返回 ttwid，由弹幕模块自行处理
         return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"),
                 "avatar": raw.get("avatar", ""), "roomId": room_id, "isLive": True}
     except Exception as e:
@@ -314,7 +313,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         pass
     print(f"[ttwid] 使用: {ttwid[:10] if ttwid else '自动生成'}...")
 
-    stop_event = threading.Event()
+    stop_event = threading.Event()  # 仅控制前端消息队列
     message_queue = asyncio.Queue()
 
     def callback(msg):
@@ -344,12 +343,12 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         print(f"[WS] 前端断开抖音弹幕: {room_id}")
     finally:
         stop_event.set()
-        collector.stop_event.set()
         send_task.cancel()
         try:
             await send_task
         except:
             pass
+        # 注意：不调用 collector.stop_event.set()，让采集器自行管理重连
         task.cancel()
 
 
