@@ -9,20 +9,14 @@ import hashlib
 import base64
 import random
 import execjs
-import websocket
 import ssl
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs
-from protobuf import douyin
 
-try:
-    from python_socks.sync import Proxy
-    SOCKS_SUPPORT = True
-except ImportError:
-    SOCKS_SUPPORT = False
-    print("[警告] python_socks 未安装，WebSocket 将不使用代理")
+# 导入我们自己的弹幕采集器（官方 protobuf 版本）
+from douyin_barrage import DouyinBarrageCollector
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -278,7 +272,6 @@ async def parse_douyin(url):
                     room_id = match.group(1)
             except Exception:
                 pass
-        # 不再返回 ttwid，由弹幕模块自行处理
         return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"),
                 "avatar": raw.get("avatar", ""), "roomId": room_id, "isLive": True}
     except Exception as e:
@@ -297,10 +290,7 @@ def get_douyin_signature(md5_str: str) -> str:
         return ""
 
 
-# 导入新模块（放在函数定义之后，避免循环导入）
-from douyin_barrage import DouyinBarrageCollector
-
-
+# ==================== WebSocket 弹幕中继 ====================
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
@@ -317,11 +307,12 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
 
+    loop = asyncio.get_running_loop()
+
     def callback(msg):
         asyncio.run_coroutine_threadsafe(message_queue.put(msg), loop)
 
     collector = DouyinBarrageCollector(room_id, ttwid, callback)
-    loop = asyncio.get_event_loop()
     task = loop.run_in_executor(None, collector.start)
 
     async def send_worker():
@@ -344,7 +335,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         print(f"[WS] 前端断开抖音弹幕: {room_id}")
     finally:
         stop_event.set()
-        collector.stop_event.set()
+        collector.stop()
         send_task.cancel()
         try:
             await send_task
@@ -353,6 +344,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         task.cancel()
 
 
+# ==================== 解析路由 ====================
 @app.get("/api/parse")
 async def api_parse(url: str = Query(...)):
     try:
