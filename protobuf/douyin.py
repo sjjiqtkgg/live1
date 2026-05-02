@@ -1,4 +1,4 @@
-# protobuf/douyin.py (最终修复版)
+# protobuf/douyin.py (移除 msg_type，彻底避免 uint64 错误)
 from dataclasses import dataclass
 from typing import List, Optional
 import betterproto
@@ -36,7 +36,7 @@ class Message(betterproto.Message):
     method: str = betterproto.string_field(1)
     payload: bytes = betterproto.bytes_field(2)
     msg_id: int = betterproto.int64_field(3)
-    msg_type: int = betterproto.int32_field(4)   # 恢复为 int32，与新协议一致
+    # msg_type 字段已移除，防止解析错误
     offset: int = betterproto.int64_field(5)
 
 
