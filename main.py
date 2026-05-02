@@ -1,21 +1,28 @@
 import json
 import re
 import os
+import httpx
 import asyncio
 import threading
 import time
 import hashlib
 import base64
 import random
-import httpx
+import execjs
+import websocket
+import ssl
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs
+from protobuf import douyin
 
-# 导入 DouyinBarrage 及自定义输出器
-from service.fetcher import DouyinBarrage
-from custom_output import CallbackOutput
+try:
+    from python_socks.sync import Proxy
+    SOCKS_SUPPORT = True
+except ImportError:
+    SOCKS_SUPPORT = False
+    print("[警告] python_socks 未安装，WebSocket 将不使用代理")
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -271,6 +278,7 @@ async def parse_douyin(url):
                     room_id = match.group(1)
             except Exception:
                 pass
+        # 不再返回 ttwid，由弹幕模块自行处理
         return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"),
                 "avatar": raw.get("avatar", ""), "roomId": room_id, "isLive": True}
     except Exception as e:
@@ -278,38 +286,49 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
+def get_douyin_signature(md5_str: str) -> str:
+    try:
+        with open("sign.js", "r", encoding="utf-8") as f:
+            js_code = f.read()
+        ctx = execjs.compile(js_code)
+        return ctx.call("get_sign", md5_str)
+    except Exception as e:
+        print(f"[签名] 生成失败: {e}")
+        return ""
+
+
+# 导入新模块（放在函数定义之后，避免循环导入）
+from douyin_barrage import DouyinBarrageCollector
+
+
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
 
+    ttwid = ""
+    try:
+        resp = await request_with_retry("GET", f"https://live.douyin.com/{room_id}", headers={"User-Agent": UA})
+        ttwid = resp.cookies.get("ttwid", "")
+    except Exception:
+        pass
+    print(f"[ttwid] 使用: {ttwid[:10] if ttwid else '自动生成'}...")
+
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
 
-    def on_message(msg: dict):
-        # 安全地放入异步队列
+    def callback(msg):
         asyncio.run_coroutine_threadsafe(message_queue.put(msg), loop)
 
-    # 使用 DouyinBarrage 内核，通过自定义输出器获取弹幕
-    barrage = DouyinBarrage(room_id, log_level=None)
-    barrage.output = CallbackOutput(room_id, on_message)
-
-    # 将阻塞的 start() 放到线程执行器
-    task = loop.run_in_executor(None, barrage.start)
+    collector = DouyinBarrageCollector(room_id, ttwid, callback)
+    loop = asyncio.get_event_loop()
+    task = loop.run_in_executor(None, collector.start)
 
     async def send_worker():
         while not stop_event.is_set():
             try:
                 msg = await asyncio.wait_for(message_queue.get(), timeout=1.0)
-                # 格式化为前端所需格式
-                formatted = {
-                    "type": msg.get("type", "chat"),
-                    "nick": msg.get("nick", "匿名用户"),
-                    "content": msg.get("content", ""),
-                    "time": msg.get("time", 0)
-                }
-                await websocket.send_json(formatted)
+                await websocket.send_json(msg)
             except asyncio.TimeoutError:
                 continue
             except Exception:
@@ -325,7 +344,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         print(f"[WS] 前端断开抖音弹幕: {room_id}")
     finally:
         stop_event.set()
-        barrage.stop()
+        collector.stop_event.set()
         send_task.cancel()
         try:
             await send_task
