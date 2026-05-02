@@ -20,12 +20,24 @@ from protobuf import douyin
 
 
 class DouyinBarrageCollector:
+    # 全套 WebSocket 域名，按优先级排序，失败自动切换
+    WS_DOMAINS = [
+        "webcast3-ws-web-lq.douyin.com",
+        "webcast5-ws-web-lf.douyin.com",
+        "webcast3-ws-web-hl.douyin.com",
+        "webcast3-ws-web-bj.douyin.com"
+    ]
+
     def __init__(self, room_id: str, ttwid: str = "", callback=None):
         self.room_id = room_id
         self.ttwid = ttwid or self._generate_ttwid()
         self.callback = callback
         self.stop_event = threading.Event()
         self.user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
+
+        # 指数退避重连参数
+        self.retry_count = 0
+        self.max_retry_backoff = 60  # 最大重连间隔
 
     def _generate_ttwid(self) -> str:
         return "".join(random.choices("0123456789", k=19)) + "".join(
@@ -60,17 +72,18 @@ class DouyinBarrageCollector:
         signature = get_douyin_signature(md5_str)
         return f"{base_ws_url}&signature={signature}"
 
-    def _build_headers(self, ua: str, need_ttwid: bool = True):
+    def _build_headers(self, ua: str):
         headers = {
             "User-Agent": ua,
             "Origin": "https://live.douyin.com",
+            "Cookie": f"ttwid={self.ttwid}"
         }
-        if need_ttwid and self.ttwid:
-            headers["Cookie"] = f"ttwid={self.ttwid}"
         return headers
 
     def _on_open(self, ws):
         print(f"[抖音弹幕] 已连接房间 {self.room_id} via {ws._host}")
+        self.retry_count = 0  # 连接成功，重置重试计数
+
         def heartbeat():
             while not self.stop_event.is_set():
                 time.sleep(10)
@@ -79,6 +92,7 @@ class DouyinBarrageCollector:
                         ws.send(b"", opcode=websocket.ABNF.OPCODE_PING)
                 except:
                     break
+
         threading.Thread(target=heartbeat, daemon=True).start()
 
     def _on_message(self, ws, message):
@@ -87,7 +101,6 @@ class DouyinBarrageCollector:
         try:
             push_frame = douyin.PushFrame().parse(message)
             payload = push_frame.payload
-            # 如果数据经过 gzip 压缩则先解压
             if push_frame.payload_encoding == "gzip":
                 try:
                     payload = gzip.decompress(payload)
@@ -150,31 +163,28 @@ class DouyinBarrageCollector:
         if self.stop_event.is_set():
             print("[抖音弹幕] 已收到停止信号，不再重连")
             return
-        time.sleep(3)
-        if self.stop_event.is_set():
-            print("[抖音弹幕] 等待期间收到停止信号，不再重连")
-            return
+        # 指数退避重连
+        self.retry_count += 1
+        wait_time = min(1.6 ** self.retry_count, self.max_retry_backoff)
+        print(f"[抖音弹幕] {wait_time:.1f} 秒后重连...")
+        time.sleep(wait_time)
         self.start()
 
     def start(self):
-        configs = [
-            # {"host": "webcast3-ws-web-lq.snssdk.com", "ua": MOBILE_UA, "need_ttwid": False},  # 移动端，代理不支持暂时禁用
-            {"host": "webcast3-ws-web-lq.douyin.com", "ua": UA, "need_ttwid": True},
-        ]
+        headers = self._build_headers(UA)
 
-        for cfg in configs:
-            host = cfg["host"]
-            ua = cfg["ua"]
-            need_ttwid = cfg["need_ttwid"]
-
+        # 遍历多个服务器域名
+        for host in self.WS_DOMAINS:
             ws_url = self._build_ws_url(host)
-            headers = self._build_headers(ua, need_ttwid)
+            print(f"[抖音弹幕] 尝试 {host}")
 
-            print(f"[抖音弹幕] 尝试 {host} (移动端={not need_ttwid})")
-
-            for idx, proxy_url in enumerate(PROXY_URLS):
+            # 遍历代理列表
+            proxies = PROXY_URLS if PROXY_URLS else [None]
+            for idx, proxy_url in enumerate(proxies):
+                if self.stop_event.is_set():
+                    return
                 try:
-                    print(f"[抖音弹幕] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy_url}")
+                    print(f"[抖音弹幕] 尝试代理 [{idx+1}/{len(proxies)}]: {proxy_url or '直连'}")
                     if SOCKS_SUPPORT and proxy_url and proxy_url.startswith("socks5://"):
                         proxy = Proxy.from_url(proxy_url)
                         sock = proxy.connect(host, 443)
@@ -187,7 +197,7 @@ class DouyinBarrageCollector:
                             socket=ssl_sock
                         )
                         ws._host = host
-                    elif proxy_url and (proxy_url.startswith("http://") or proxy_url.startswith("https://")):
+                    elif proxy_url and proxy_url.startswith(("http://", "https://")):
                         proxy_parts = urlparse(proxy_url)
                         ws = websocket.WebSocketApp(
                             ws_url, header=headers,
@@ -206,13 +216,14 @@ class DouyinBarrageCollector:
                             on_error=self._on_error, on_close=self._on_close,
                         )
                         ws._host = host
+                    # run_forever 会阻塞直到连接关闭
                     ws.run_forever()
                     return
                 except Exception as e:
-                    print(f"[抖音弹幕] 代理 {proxy_url} 失败: {e}")
-                    if idx == len(PROXY_URLS) - 1:
-                        break
+                    print(f"[抖音弹幕] 连接失败 {host}: {e}")
                     time.sleep(1)
-            print(f"[抖音弹幕] {host} 所有代理失败，尝试下一个接入点...")
+                    continue
 
-        print("[抖音弹幕] 所有接入点和代理均失败，停止重试")
+            print(f"[抖音弹幕] 域名 {host} 所有代理失败，尝试下一个域名")
+
+        print("[抖音弹幕] 所有域名和代理均失败，停止重试")
