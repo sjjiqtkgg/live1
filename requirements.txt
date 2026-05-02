@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-streamget
+streamget>=4.0.9
 httpx[socks]
 websockets
 protobuf>=3.19.0
