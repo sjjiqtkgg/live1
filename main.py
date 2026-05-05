@@ -92,7 +92,6 @@ async def request_with_proxy_group(method: str, url: str, proxy_list: list, **kw
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
-    # 注意：已新增 SOOP 相关的 CDN 域名
     ALLOWED = [
         "douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn",
         "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net",
@@ -106,7 +105,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    # 外网域名分流（新增 SOOP 相关）
     EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "livestream-manager.sooplive.com"]
     use_external = any(domain in url for domain in EXTERNAL_DOMAINS)
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
@@ -434,13 +432,13 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（最终稳定版） ====================
+# ==================== SOOP 流解析（返回代理地址） ====================
 async def parse_soop(url):
     try:
         parts = url.rstrip("/").split("/")
         if len(parts) >= 5:
-            bid = parts[-2]      # 主播ID
-            bno = parts[-1]      # 房间号
+            bid = parts[-2]
+            bno = parts[-1]
         elif len(parts) == 4:
             bid = parts[-1]
             bno = ""
@@ -450,64 +448,54 @@ async def parse_soop(url):
         proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
         print(f"[SOOP DEBUG] 使用代理: {proxy}, bid={bid}, bno={bno}")
 
-        # 1. 获取主播昵称
-        headers = {"User-Agent": UA, "Referer": "https://play.sooplive.com", "Accept": "application/json"}
+        import traceback
         try:
-            info_url = f"https://st.sooplive.com/api/get_station_status.php?szBjId={bid}"
-            info_resp = await request_with_proxy_group("GET", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers)
-            if info_resp.status_code == 200:
-                info_data = info_resp.json()
-                anchor_name = info_data.get("DATA", {}).get("user_nick", bid)
-            else:
-                anchor_name = bid
+            resp = await request_with_proxy_group(
+                "POST",
+                "https://live.sooplive.com/afreeca/player_live_api.php",
+                proxy_list=EXTERNAL_PROXY_URLS,
+                headers={
+                    "User-Agent": UA,
+                    "Origin": "https://play.sooplive.com",
+                    "Referer": url,
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+                },
+                data={
+                    "bid": bid,
+                    "bno": bno,
+                    "type": "",
+                    "pwd": "",
+                    "player_type": "html5",
+                    "stream_type": "common",
+                    "quality": "master",
+                    "mode": "landing",
+                    "from_api": "0",
+                    "is_revive": "false"
+                }
+            )
+            if resp.status_code != 200:
+                return {"streams": [], "isLive": False}
+            result = resp.json()
         except Exception:
-            anchor_name = bid
-
-        # 2. 获取开播状态和流地址
-        api_url = "https://live.sooplive.com/afreeca/player_live_api.php"
-        form_data = {
-            "bid": bid,
-            "bno": bno,
-            "type": "",
-            "pwd": "",
-            "player_type": "html5",
-            "stream_type": "common",
-            "quality": "master",
-            "mode": "landing",
-            "from_api": "0",
-            "is_revive": "false"
-        }
-        post_headers = {
-            "User-Agent": UA,
-            "Origin": "https://play.sooplive.com",
-            "Referer": url,
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-        }
-
-        resp = await request_with_proxy_group("POST", api_url, proxy_list=EXTERNAL_PROXY_URLS, headers=post_headers, data=form_data)
-        if resp.status_code != 200:
+            print(traceback.format_exc())
             return {"streams": [], "isLive": False}
 
-        result = resp.json()
         channel = result.get("CHANNEL", {})
         if channel.get("RESULT") != 1:
-            print(f"[SOOP DEBUG] 主播未开播, RESULT={channel.get('RESULT')}")
+            print(f"[SOOP DEBUG] 主播未开播")
             return {"streams": [], "isLive": False}
 
         rmd = channel.get("RMD")
         if not rmd:
             return {"streams": [], "isLive": False}
 
-        proxy_url = f"{request_base_url}/api/proxy?url={quote(rmd, safe='')}&referer=https://play.sooplive.com"
+        # 代理地址
+        proxy_url = f"https://live1-cxe9.onrender.com/api/proxy?url={quote(rmd, safe='')}&referer=https://play.sooplive.com"
         streams = [{"cdn": "SOOP-Source", "url": proxy_url, "type": "m3u8"}]
-
-        print(f"[SOOP DEBUG] 成功获取流: {rmd[:80]}...")
-
-        streams = [{"cdn": "SOOP-Source", "url": rmd, "type": "m3u8"}]
 
         return {
             "streams": streams,
-            "title": f"{anchor_name}-{bid}",
+            "title": f"{bid}-{bno}",
             "avatar": "",
             "isLive": True
         }
