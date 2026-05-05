@@ -431,7 +431,7 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析 ====================
+# ==================== SOOP 流解析（使用 patch 注入代理） ====================
 async def parse_soop(url):
     try:
         parts = url.rstrip("/").split("/")
@@ -439,16 +439,31 @@ async def parse_soop(url):
             return {"streams": [], "isLive": False}
         channel_id = parts[-2]
         room_id = parts[-1]
-        channel = f"{channel_id}/{room_id}"
 
+        # 从你的外网代理列表中随机选一个
         proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS else None
-        soop = SoopLiveStream()
-        stream_data = await soop.fetch_web_stream_data(url, process_data=True, proxy=proxy)
-        if not stream_data or not stream_data.get("is_live"):
-            return {"streams": [], "isLive": False}
 
-        stream_obj = await soop.fetch_stream_url(stream_data, "OD", proxy=proxy)
-        raw = json.loads(stream_obj.to_json())
+        async def _fetch():
+            soop = SoopLiveStream()
+            stream_data = await soop.fetch_web_stream_data(url, process_data=True)
+            if not stream_data or not stream_data.get("is_live"):
+                return None, None
+            stream_obj = await soop.fetch_stream_url(stream_data, "OD")
+            raw = json.loads(stream_obj.to_json())
+            return stream_data, raw
+
+        if proxy:
+            original_init = httpx.AsyncClient.__init__
+            def patched_init(self, *args, **kwargs):
+                kwargs['proxy'] = proxy
+                original_init(self, *args, **kwargs)
+            with patch.object(httpx.AsyncClient, '__init__', patched_init):
+                stream_data, raw = await _fetch()
+        else:
+            stream_data, raw = await _fetch()
+
+        if not stream_data or not raw:
+            return {"streams": [], "isLive": False}
 
         streams = []
         m3u8_url = raw.get("m3u8_url", "")
@@ -477,17 +492,6 @@ async def parse_soop(url):
     except Exception as e:
         print(f"[SOOP] 解析异常: {e}")
         return {"streams": [], "isLive": False}
-
-
-def get_douyin_signature(md5_str: str) -> str:
-    try:
-        with open("sign.js", "r", encoding="utf-8") as f:
-            js_code = f.read()
-        ctx = execjs.compile(js_code)
-        return ctx.call("get_sign", md5_str)
-    except Exception as e:
-        print(f"[签名] 生成失败: {e}")
-        return ""
 
 
 
