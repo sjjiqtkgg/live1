@@ -17,7 +17,7 @@ from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs, quote
 from protobuf import douyin
 
-# SOOP 支持（streamget 内置）
+# SOOP 支持
 from streamget.platforms.soop.live_stream import SoopLiveStream
 
 try:
@@ -33,7 +33,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
 
-# ==================== 国内代理列表（虎牙、斗鱼、抖音等使用） ====================
+# ==================== 国内代理列表 ====================
 PROXY_LIST_STR = os.getenv("PROXY_LIST", "")
 PROXY_URLS = []
 if PROXY_LIST_STR:
@@ -44,7 +44,7 @@ else:
     print("[代理] 未设置国内代理，直连")
     PROXY_URLS = [None]
 
-# ==================== 外网代理列表（Twitch、SOOP、YouTube等使用） ====================
+# ==================== 外网代理列表 ====================
 EXTERNAL_PROXY_LIST_STR = os.getenv("EXTERNAL_PROXY_LIST", "")
 EXTERNAL_PROXY_URLS = []
 if EXTERNAL_PROXY_LIST_STR:
@@ -56,7 +56,7 @@ else:
 
 
 async def request_with_retry(method: str, url: str, **kwargs):
-    """国内平台使用的请求函数，自动遍历国内代理列表"""
+    """国内平台使用的请求函数"""
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     for idx, proxy in enumerate(PROXY_URLS):
@@ -73,7 +73,7 @@ async def request_with_retry(method: str, url: str, **kwargs):
 
 
 async def request_with_proxy_group(method: str, url: str, proxy_list: list, **kwargs):
-    """通用分组请求函数，根据传入的代理列表自动重试"""
+    """分组请求函数"""
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     for idx, proxy in enumerate(proxy_list):
@@ -91,11 +91,10 @@ async def request_with_proxy_group(method: str, url: str, proxy_list: list, **kw
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
-    # 允许的域名白名单（新增 sooplive 相关）
     ALLOWED = [
         "douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn",
         "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net",
-        "sooplive.com", "sooplive.net", "sooplivecdn.com"   # 可根据实际 CDN 调整
+        "sooplive.com", "sooplive.net", "sooplivecdn.com"
     ]
     if not any(d in url for d in ALLOWED):
         raise HTTPException(403, "domain not allowed")
@@ -105,7 +104,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    # 根据域名选择代理组（新增 sooplive 相关域名）
     EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "sooplive.net", "sooplivecdn.com"]
     use_external = any(domain in url for domain in EXTERNAL_DOMAINS)
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
@@ -433,7 +431,7 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（走外网代理） ====================
+# ==================== SOOP 流解析 ====================
 async def parse_soop(url):
     try:
         parts = url.rstrip("/").split("/")
@@ -443,20 +441,15 @@ async def parse_soop(url):
         room_id = parts[-1]
         channel = f"{channel_id}/{room_id}"
 
-        # 不使用 async with，直接实例化
-        soop = SoopLiveStream()
-
-        # 获取原始数据（传入 proxy 参数，如果配置了外网代理）
         proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS else None
+        soop = SoopLiveStream()
         stream_data = await soop.fetch_web_stream_data(url, process_data=True, proxy=proxy)
         if not stream_data or not stream_data.get("is_live"):
             return {"streams": [], "isLive": False}
 
-        # 获取流地址
         stream_obj = await soop.fetch_stream_url(stream_data, "OD", proxy=proxy)
         raw = json.loads(stream_obj.to_json())
 
-        # 构建 streams
         streams = []
         m3u8_url = raw.get("m3u8_url", "")
         if m3u8_url:
@@ -486,12 +479,22 @@ async def parse_soop(url):
         return {"streams": [], "isLive": False}
 
 
-from douyin_barrage import DouyinBarrageCollector
+def get_douyin_signature(md5_str: str) -> str:
+    try:
+        with open("sign.js", "r", encoding="utf-8") as f:
+            js_code = f.read()
+        ctx = execjs.compile(js_code)
+        return ctx.call("get_sign", md5_str)
+    except Exception as e:
+        print(f"[签名] 生成失败: {e}")
+        return ""
+
 
 
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
+    from douyin_barrage import DouyinBarrageCollector  # 修复循环导入，在这里导入
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
 
     ttwid = ""
