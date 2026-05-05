@@ -17,8 +17,8 @@ from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs
 from protobuf import douyin
 
-# ===== Twitch 支持（streamget 库） =====
-from streamget.platforms.twitch import Twitch   # 注意：类名是 Twitch，不是 TwitchLiveStream
+# ===== 正确的 Twitch 导入方式 =====
+from streamget.platforms.twitch.live_stream import TwitchLiveStream
 
 try:
     from python_socks.sync import Proxy
@@ -34,11 +34,14 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Sa
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
 
 # ==================== 代理加载 ====================
-PROXY_LIST_STR = os.getenv("PROXY_LIST", "socks5://123:123@175.178.251.18:1080")
-PROXY_LIST_STR = PROXY_LIST_STR.strip().strip('"').strip("'")
-PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
-print(f"[代理] 共加载 {len(PROXY_URLS)} 个代理: {PROXY_URLS}")
-if not PROXY_URLS:
+PROXY_LIST_STR = os.getenv("PROXY_LIST", "")
+PROXY_URLS = []
+if PROXY_LIST_STR:
+    PROXY_LIST_STR = PROXY_LIST_STR.strip().strip('"').strip("'")
+    PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
+    print(f"[代理] 共加载 {len(PROXY_URLS)} 个代理: {PROXY_URLS}")
+else:
+    print("[代理] 未设置代理，将使用直连模式")
     PROXY_URLS = [None]
 
 
@@ -288,49 +291,38 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析（使用 streamget 库） ====================
+# ==================== Twitch 流解析（使用最新 StreamGet） ====================
 async def parse_twitch(url):
-    """使用 streamget 自带的 Twitch 类解析直播流"""
+    """使用 StreamGet 的 TwitchLiveStream 解析直播流"""
     try:
         channel_name = url.rstrip("/").split("/")[-1].split("?")[0]
-        twitch = Twitch()   # 关键：正确的类名
+        twitch = TwitchLiveStream()
 
-        # 1. 获取原始数据（包含直播状态、清晰度列表、token 等）
+        # 1. 获取原始数据
         stream_data = await twitch.fetch_web_stream_data(url, process_data=True)
-        if not stream_data.get("is_live"):
+        if not stream_data or not stream_data.get("is_live"):
             return {"streams": [], "isLive": False}
 
-        # 2. 从原始数据中读取多清晰度流列表（streamget 0.2.x 以上版本支持）
-        play_list = stream_data.get("play_url_list", [])
-        streams = []
-        if play_list:
-            for item in play_list:
-                u = item.get("url")
-                name = item.get("name", "source")
-                if u:
-                    streams.append({
-                        "cdn": f"Twitch-{name}",
-                        "url": u,
-                        "type": "m3u8"
-                    })
-        else:
-            # 后备方案：只拿最高画质 m3u8
-            stream_obj = await twitch.fetch_stream_url(stream_data, "OD")
-            raw = json.loads(stream_obj.to_json())
-            m3u8_url = raw.get("m3u8_url", "")
-            if m3u8_url:
-                streams.append({
-                    "cdn": "Twitch-source",
-                    "url": m3u8_url,
-                    "type": "m3u8"
-                })
+        # 2. 获取 StreamData 对象并转为 dict
+        stream_obj = await twitch.fetch_stream_url(stream_data, "OD")
+        raw = json.loads(stream_obj.to_json())
 
-        if not streams:
+        # 3. 获取主 m3u8 地址
+        m3u8_url = raw.get("m3u8_url", "")
+        if not m3u8_url:
             return {"streams": [], "isLive": False}
 
-        # 3. 提取主播信息
-        anchor_name = stream_data.get("anchor_name") or channel_name
-        avatar = stream_data.get("avatar") or ""
+        # 4. 构建 streams（默认提供 source 和 audio）
+        streams = [{"cdn": "Twitch-source", "url": m3u8_url, "type": "m3u8"}]
+        play_url_list = stream_data.get('play_url_list', [])
+        for item in play_url_list:
+            if item.get('is_audio_only'):
+                streams.append({"cdn": "Twitch-Audio", "url": item['url'], "type": "m3u8"})
+                break
+
+        # 5. 提取主播信息
+        anchor_name = raw.get("anchor_name", channel_name)
+        avatar = raw.get("avatar", "")
 
         return {
             "streams": streams,
@@ -411,7 +403,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         task.cancel()
 
 
-# ==================== Twitch 弹幕 WebSocket（原生 websocket-client） ====================
+# ==================== Twitch 弹幕 WebSocket ====================
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     await websocket.accept()
@@ -430,7 +422,7 @@ async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
             nick = match.group(1)
             content = match.group(2)
             asyncio.run_coroutine_threadsafe(
-                message_queue.put({"nick": nick, "content": content}),
+                message_queue.put({"type": "chat", "nick": nick, "content": content}),
                 loop
             )
 
