@@ -18,8 +18,9 @@ from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs, quote
 from protobuf import douyin
 
-# SOOP 支持
+# 平台支持
 from streamget.platforms.soop.live_stream import SoopLiveStream
+from streamget.platforms.pandalive.live_stream import PandaLiveStream
 
 try:
     from python_socks.sync import Proxy
@@ -93,7 +94,8 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     ALLOWED = [
         "douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn",
         "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net",
-        "sooplive.com", "sooplive.net", "sooplivecdn.com", "livestream-manager.sooplive.com"
+        "sooplive.com", "sooplive.net", "sooplivecdn.com", "livestream-manager.sooplive.com",
+        "pandalive.co.kr"
     ]
     if not any(d in url for d in ALLOWED):
         raise HTTPException(403, "domain not allowed")
@@ -103,7 +105,10 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "livestream-manager.sooplive.com"]
+    EXTERNAL_DOMAINS = [
+        "twitch.tv", "ttvnw.net", "sooplive.com", "livestream-manager.sooplive.com",
+        "pandalive.co.kr"
+    ]
     use_external = any(domain in url for domain in EXTERNAL_DOMAINS)
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
 
@@ -430,71 +435,57 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（返回代理地址，避免二次代理） ====================
+# ==================== SOOP 流解析（保留，但暂不完善） ====================
 async def parse_soop(url):
+    """SOOP解析（已放弃优化，如果以后修复将更新此函数）"""
+    return {"streams": [], "isLive": False}
+
+
+# ==================== PandaTV 流解析（使用代理） ====================
+async def parse_panda(url):
     try:
-        parts = url.rstrip("/").split("/")
-        if len(parts) >= 5:
-            bid = parts[-2]
-            bno = parts[-1]
-        elif len(parts) == 4:
-            bid = parts[-1]
-            bno = ""
-        else:
-            return {"streams": [], "isLive": False}
-
         proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
-        print(f"[SOOP DEBUG] 使用代理: {proxy}, bid={bid}, bno={bno}")
+        print(f"[PandaTV] 使用代理: {proxy}")
 
-        # 直接请求 player_live_api
-        resp = await request_with_proxy_group(
-            "POST",
-            "https://live.sooplive.com/afreeca/player_live_api.php",
-            proxy_list=EXTERNAL_PROXY_URLS,
-            headers={
-                "User-Agent": UA,
-                "Origin": "https://play.sooplive.com",
-                "Referer": url,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-            },
-            data={
-                "bid": bid,
-                "bno": bno,
-                "type": "",
-                "pwd": "",
-                "player_type": "html5",
-                "stream_type": "common",
-                "quality": "master",
-                "mode": "landing",
-                "from_api": "0",
-                "is_revive": "false"
-            }
-        )
-        if resp.status_code != 200:
+        panda = PandaLiveStream(proxy_addr=proxy)
+        stream_data = await panda.fetch_web_stream_data(url, process_data=True)
+
+        if not stream_data or not stream_data.get("is_live"):
             return {"streams": [], "isLive": False}
 
-        result = resp.json()
-        channel = result.get("CHANNEL", {})
-        if channel.get("RESULT") != 1:
-            print(f"[SOOP DEBUG] 主播未开播")
+        stream_obj = await panda.fetch_stream_url(stream_data, "OD")
+        raw = json.loads(stream_obj.to_json())
+
+        streams = []
+        m3u8_url = raw.get("m3u8_url", "")
+        if m3u8_url:
+            # 包装成后端代理地址
+            self_api_base = os.getenv("RENDER_EXTERNAL_URL", "https://live1-cxe9.onrender.com")
+            proxy_url = f"{self_api_base}/api/proxy?url={quote(m3u8_url, safe='')}&referer=https://www.pandalive.co.kr"
+            streams.append({"cdn": "PandaTV-Source", "url": proxy_url, "type": "m3u8"})
+
+        play_url_list = stream_data.get("play_url_list", [])
+        for item in play_url_list:
+            url_str = item.get("url")
+            name = item.get("name", "unknown")
+            if url_str and url_str != m3u8_url:
+                proxy_url = f"{self_api_base}/api/proxy?url={quote(url_str, safe='')}&referer=https://www.pandalive.co.kr"
+                streams.append({"cdn": f"PandaTV-{name}", "url": proxy_url, "type": "m3u8"})
+
+        if not streams:
             return {"streams": [], "isLive": False}
 
-        rmd = channel.get("RMD")
-        if not rmd:
-            return {"streams": [], "isLive": False}
-
-        # 返回代理地址，避免前端二次代理
-        proxy_url = f"https://live1-cxe9.onrender.com/api/proxy?url={quote(rmd, safe='')}&referer=https://play.sooplive.com"
-        streams = [{"cdn": "SOOP-Source", "url": proxy_url, "type": "m3u8"}]
+        anchor_name = raw.get("anchor_name", "PandaTV主播")
+        avatar = raw.get("avatar", "")
 
         return {
             "streams": streams,
-            "title": f"{bid}-{bno}",
-            "avatar": "",
+            "title": anchor_name,
+            "avatar": avatar,
             "isLive": True
         }
     except Exception as e:
-        print(f"[SOOP] 解析异常: {e}")
+        print(f"[PandaTV] 解析异常: {e}")
         traceback.print_exc()
         return {"streams": [], "isLive": False}
 
@@ -653,6 +644,8 @@ async def api_parse(url: str = Query(...)):
             return await parse_twitch(url)
         if "sooplive.com" in url:
             return await parse_soop(url)
+        if "pandalive.co.kr" in url:
+            return await parse_panda(url)
         raise HTTPException(400, "不支持的平台")
     except HTTPException:
         raise
