@@ -431,7 +431,7 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（使用 patch 注入代理） ====================
+# ==================== SOOP 流解析（调试版，打印原始数据） ====================
 async def parse_soop(url):
     try:
         parts = url.rstrip("/").split("/")
@@ -440,30 +440,17 @@ async def parse_soop(url):
         channel_id = parts[-2]
         room_id = parts[-1]
 
-        # 从你的外网代理列表中随机选一个
-        proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS else None
+        # 先不用代理，裸跑一次看看结构
+        soop = SoopLiveStream()
+        stream_data = await soop.fetch_web_stream_data(url, process_data=True)
+        print(f"[SOOP DEBUG] stream_data: {stream_data}")
 
-        async def _fetch():
-            soop = SoopLiveStream()
-            stream_data = await soop.fetch_web_stream_data(url, process_data=True)
-            if not stream_data or not stream_data.get("is_live"):
-                return None, None
-            stream_obj = await soop.fetch_stream_url(stream_data, "OD")
-            raw = json.loads(stream_obj.to_json())
-            return stream_data, raw
-
-        if proxy:
-            original_init = httpx.AsyncClient.__init__
-            def patched_init(self, *args, **kwargs):
-                kwargs['proxy'] = proxy
-                original_init(self, *args, **kwargs)
-            with patch.object(httpx.AsyncClient, '__init__', patched_init):
-                stream_data, raw = await _fetch()
-        else:
-            stream_data, raw = await _fetch()
-
-        if not stream_data or not raw:
+        if not stream_data or not stream_data.get("is_live"):
             return {"streams": [], "isLive": False}
+
+        stream_obj = await soop.fetch_stream_url(stream_data, "OD")
+        raw = json.loads(stream_obj.to_json())
+        print(f"[SOOP DEBUG] raw: {raw}")
 
         streams = []
         m3u8_url = raw.get("m3u8_url", "")
@@ -492,7 +479,6 @@ async def parse_soop(url):
     except Exception as e:
         print(f"[SOOP] 解析异常: {e}")
         return {"streams": [], "isLive": False}
-
 
 
 @app.websocket("/ws/douyin/{room_id}")
