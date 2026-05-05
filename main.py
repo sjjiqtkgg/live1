@@ -432,44 +432,59 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（带完整 traceback） ====================
+# ==================== SOOP 流解析 ====================
 async def parse_soop(url):
     try:
+        # Extract channel_id and room_id from URL
         parts = url.rstrip("/").split("/")
         if len(parts) < 5:
             return {"streams": [], "isLive": False}
         channel_id = parts[-2]
-        room_id = parts[-1]
+        bj_id = parts[-1]  # SOOP uses bj_id
 
-        print(f"[SOOP DEBUG] 开始请求，URL: {url}")
-        soop = SoopLiveStream()
-        stream_data = await soop.fetch_web_stream_data(url, process_data=True)
-        print(f"[SOOP DEBUG] stream_data 获取成功: {stream_data}")
-
-        if not stream_data or not stream_data.get("is_live"):
+        # ---- Step 1: Get Channel Info and Live Status ----
+        api_headers = {
+            "User-Agent": UA,
+            "Referer": url,
+            "Accept": "application/json"
+        }
+        info_url = f"https://api.sooplive.com/v2/channel/info/{channel_id}?bj_id={bj_id}"
+        resp = await request_with_proxy_group("GET", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=api_headers)
+        if resp.status_code != 200:
             return {"streams": [], "isLive": False}
-
-        stream_obj = await soop.fetch_stream_url(stream_data, "OD")
-        raw = json.loads(stream_obj.to_json())
-        print(f"[SOOP DEBUG] raw: {raw}")
-
+        data = resp.json()
+        
+        # Extract live status and anchor name
+        live_status = data.get("data", {}).get("stream", {}).get("live_status")
+        if live_status != "LIVE":
+            return {"streams": [], "isLive": False}
+        anchor_name = data.get("data", {}).get("channel", {}).get("channel_name", channel_id)
+        avatar = data.get("data", {}).get("channel", {}).get("profile_img", "")
+        
+        # ---- Step 2: Get Stream URLs ----
+        stream_url_api = f"https://live.sooplive.co.kr/afreeca/player.php"
+        stream_params = {
+            "bj_id": bj_id,
+            "type": "live",
+            "quality": "original"
+        }
+        stream_headers = {
+            "User-Agent": UA,
+            "Referer": url
+        }
+        stream_resp = await request_with_proxy_group("GET", stream_url_api, proxy_list=EXTERNAL_PROXY_URLS, headers=stream_headers, params=stream_params)
+        if stream_resp.status_code != 200:
+            return {"streams": [], "isLive": False}
+        stream_data = stream_resp.json()
+        
         streams = []
-        m3u8_url = raw.get("m3u8_url", "")
-        if m3u8_url:
-            streams.append({"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"})
-
-        play_url_list = stream_data.get("play_url_list", [])
-        for item in play_url_list:
-            url_str = item.get("url")
-            name = item.get("name", "unknown")
-            if url_str and url_str != m3u8_url:
-                streams.append({"cdn": f"SOOP-{name}", "url": url_str, "type": "m3u8"})
+        # Usually the response contains multiple qualities
+        for quality_name, quality_url in stream_data.get("stream", {}).items():
+            if quality_url.startswith("http"):
+                streams.append({"cdn": f"SOOP-{quality_name}", "url": quality_url, "type": "m3u8"})
 
         if not streams:
             return {"streams": [], "isLive": False}
-
-        anchor_name = raw.get("anchor_name", channel_id)
-        avatar = raw.get("avatar", "")
 
         return {
             "streams": streams,
