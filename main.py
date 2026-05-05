@@ -59,7 +59,7 @@ async def request_with_retry(method: str, url: str, **kwargs):
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
-    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com", "douyinpic.com", "huyaimg.com", "twitch.tv", "twitchsvc.net", "jtvnw.net"]
+    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com", "douyinpic.com", "huyaimg.com", "twitch.tv", "twitchsvc.net", "jtvnw.net", "sooplive.co.kr", "sooplive.com", "afreecatv.com"]
     if not any(d in url for d in ALLOWED):
         raise HTTPException(403, "domain not allowed")
     body = await request.body() if request.method == "POST" else None
@@ -370,19 +370,38 @@ async def parse_twitch(url):
             streams.append({"cdn": "HLS", "url": raw["m3u8_url"], "type": "m3u8"})
         if not streams:
             return {"streams": [], "isLive": False}
-        return {
-            "streams": streams,
-            "title": raw.get("anchor_name", channel),
-            "avatar": raw.get("avatar", ""),
-            "channel": channel,
-            "isLive": True
-        }
+        return {"streams": streams, "title": raw.get("anchor_name", channel),
+                "avatar": raw.get("avatar", ""), "channel": channel, "isLive": True}
     except Exception as e:
         print(f"[Twitch] 解析异常: {e}")
         return {"streams": [], "isLive": False}
 
 
-# ==================== 抖音签名接口（供前端直连用）====================
+# ==================== SOOP ====================
+async def parse_soop(url):
+    try:
+        from streamget import SoopLiveStream
+        live = SoopLiveStream()
+        data = await live.fetch_web_stream_data(url, process_data=True)
+        if not data.get("is_live"):
+            return {"streams": [], "isLive": False}
+        stream_obj = await live.fetch_stream_url(data, "OD")
+        raw = json.loads(stream_obj.to_json())
+        streams = []
+        if raw.get("flv_url"):
+            streams.append({"cdn": "FLV", "url": raw["flv_url"], "type": "flv"})
+        if raw.get("m3u8_url"):
+            streams.append({"cdn": "HLS", "url": raw["m3u8_url"], "type": "m3u8"})
+        if not streams:
+            return {"streams": [], "isLive": False}
+        return {"streams": streams, "title": raw.get("anchor_name", "SOOP主播"),
+                "avatar": raw.get("avatar", ""), "isLive": True}
+    except Exception as e:
+        print(f"[SOOP] 解析异常: {e}")
+        return {"streams": [], "isLive": False}
+
+
+# ==================== 抖音签名（前端直连用）====================
 @app.get("/api/douyin/sign")
 async def douyin_sign(room_id: str = Query(...)):
     user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
@@ -408,8 +427,7 @@ async def douyin_sign(room_id: str = Query(...)):
     param_str = ','.join(f"{p}={wss_maps.get(p, '')}" for p in params_order)
     md5_str = hashlib.md5(param_str.encode()).hexdigest()
     signature = get_douyin_signature(md5_str)
-    ws_url = f"{base_ws_url}&signature={signature}"
-    return {"wsUrl": ws_url}
+    return {"wsUrl": f"{base_ws_url}&signature={signature}"}
 
 
 @app.get("/api/parse")
@@ -425,6 +443,8 @@ async def api_parse(url: str = Query(...)):
             return await parse_douyin(url)
         if "twitch.tv" in url:
             return await parse_twitch(url)
+        if "sooplive.co.kr" in url or "sooplive.com" in url or "afreecatv.com" in url:
+            return await parse_soop(url)
         raise HTTPException(400, "不支持的平台")
     except HTTPException:
         raise
