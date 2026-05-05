@@ -288,7 +288,7 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析（优先 REST API，GQL 后备） ====================
+# ==================== Twitch 流解析（稳定 GraphQL 后备，REST 已移除） ====================
 async def parse_twitch(url):
     try:
         match = re.search(r"twitch\.tv/([^/?]+)", url)
@@ -299,89 +299,56 @@ async def parse_twitch(url):
         client_id = "kimne78kx3ncx6brgo4mv6wki5h1ko"
         headers = {
             "Client-ID": client_id,
-            "User-Agent": UA,
-            "Accept": "application/json"
+            "Content-Type": "application/json",
+            "User-Agent": UA
         }
 
         token = None
         sig = None
 
-        # ---- 方案一：REST API（可靠性更高） ----
-        async with httpx.AsyncClient(timeout=15) as client:
-            rest_url = f"https://api.twitch.tv/api/channels/{channel}/access_token?client_id={client_id}"
-            resp = await client.get(rest_url, headers=headers)
-            print(f"[Twitch REST] 状态码: {resp.status_code}")
-            print(f"[Twitch REST] 响应文本(前300字符): {resp.text[:300]}")
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    token = data.get("token")
-                    sig = data.get("sig")
-                    if token and sig:
-                        print("[Twitch REST] 成功获取 token")
-                except Exception:
-                    pass
-
-        # ---- 方案二：如果 REST 失败，尝试 GraphQL（已修复变量问题） ----
-        if not token:
-            print("[Twitch] REST 未获取到 token，尝试 GraphQL 后备")
-            gql_url = "https://gql.twitch.tv/gql"
-            gql_headers = {
-                "Client-ID": client_id,
-                "Content-Type": "application/json",
-                "User-Agent": UA
+        # GraphQL 完整查询（修复后，无需冗余变量）
+        gql_url = "https://gql.twitch.tv/gql"
+        payload = [{
+            "operationName": "PlaybackAccessToken",
+            "variables": {
+                "login": channel,
+                "playerType": "site"
+            },
+            "query": """
+            query PlaybackAccessToken($login: String!, $playerType: String!) {
+              streamPlaybackAccessToken(channelName: $login, params: {
+                platform: "web",
+                playerType: $playerType,
+                playerBackend: "mediaplayer"
+              }) {
+                value
+                signature
+              }
             }
+            """
+        }]
 
-            # 修复后的完整查询：不再使用 isLive/isVod/vodID，仅使用 login 和 playerType
-            full_payload = [{
-                "operationName": "PlaybackAccessToken",
-                "variables": {
-                    "login": channel,
-                    "playerType": "site"
-                },
-                "query": """
-                query PlaybackAccessToken($login: String!, $playerType: String!) {
-                  streamPlaybackAccessToken(channelName: $login, params: {
-                    platform: "web",
-                    playerType: $playerType,
-                    playerBackend: "mediaplayer"
-                  }) {
-                    value
-                    signature
-                  }
-                }
-                """
-            }]
-
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(gql_url, json=full_payload, headers=gql_headers)
-                print(f"[Twitch GQL 后备] 状态码: {resp.status_code}")
-                print(f"[Twitch GQL 后备] 响应文本(前300字符): {resp.text[:300]}")
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                        if isinstance(data, list) and len(data) > 0:
-                            d = data[0]
-                            if "data" in d:
-                                token_data = d["data"].get("streamPlaybackAccessToken")
-                                if token_data:
-                                    token = token_data.get("value")
-                                    sig = token_data.get("signature")
-                    except Exception:
-                        pass
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(gql_url, json=payload, headers=headers)
+            if resp.status_code != 200:
+                return {"streams": [], "isLive": False}
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                token_data = data[0].get("data", {}).get("streamPlaybackAccessToken")
+                if token_data:
+                    token = token_data.get("value")
+                    sig = token_data.get("signature")
 
         if not token or not sig:
-            print("[Twitch] 最终未获取到 token 或 sig")
             return {"streams": [], "isLive": False}
 
-        # ---- 拼接 usher 地址（token 必须编码） ----
         encoded_token = quote(token, safe='')
         m3u8_url = (
             f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8"
             f"?sig={sig}&token={encoded_token}&allow_source=true&allow_audio_only=true"
         )
 
-        # ---- 验证 usher 是否包含有效视频流 ----
+        # 验证 usher 返回有效内容
         async with httpx.AsyncClient(timeout=15) as client:
             usher_resp = await client.get(m3u8_url, headers={
                 "User-Agent": UA,
