@@ -432,59 +432,54 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析 ====================
+# ==================== SOOP 流解析（独立请求版） ====================
 async def parse_soop(url):
     try:
-        # Extract channel_id and room_id from URL
+        # 从 URL 中提取主播 ID (bj_id)
         parts = url.rstrip("/").split("/")
         if len(parts) < 5:
             return {"streams": [], "isLive": False}
-        channel_id = parts[-2]
-        bj_id = parts[-1]  # SOOP uses bj_id
+        bj_id = parts[-1]  # 在 SOOP 中房间 ID 就是 bj_id
 
-        # ---- Step 1: Get Channel Info and Live Status ----
-        api_headers = {
+        headers = {
             "User-Agent": UA,
-            "Referer": url,
+            "Referer": "https://play.sooplive.com",
             "Accept": "application/json"
         }
-        info_url = f"https://api.sooplive.com/v2/channel/info/{channel_id}?bj_id={bj_id}"
-        resp = await request_with_proxy_group("GET", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=api_headers)
+
+        # 这是 SOOP 用来获取直播房间信息的 API
+        info_url = f"https://live.sooplive.co.kr/afreeca/player_live_api.php"
+        params = {"bj_id": bj_id}
+
+        print(f"[SOOP DEBUG] 请求信息 API: {info_url}, 参数: {params}")
+
+        # 使用外网代理组发送请求
+        resp = await request_with_proxy_group("GET", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, params=params)
+
+        print(f"[SOOP DEBUG] 响应状态码: {resp.status_code}")
+        print(f"[SOOP DEBUG] 响应内容(前500字符): {resp.text[:500]}")
+
         if resp.status_code != 200:
             return {"streams": [], "isLive": False}
-        data = resp.json()
-        
-        # Extract live status and anchor name
-        live_status = data.get("data", {}).get("stream", {}).get("live_status")
-        if live_status != "LIVE":
-            return {"streams": [], "isLive": False}
-        anchor_name = data.get("data", {}).get("channel", {}).get("channel_name", channel_id)
-        avatar = data.get("data", {}).get("channel", {}).get("profile_img", "")
-        
-        # ---- Step 2: Get Stream URLs ----
-        stream_url_api = f"https://live.sooplive.co.kr/afreeca/player.php"
-        stream_params = {
-            "bj_id": bj_id,
-            "type": "live",
-            "quality": "original"
-        }
-        stream_headers = {
-            "User-Agent": UA,
-            "Referer": url
-        }
-        stream_resp = await request_with_proxy_group("GET", stream_url_api, proxy_list=EXTERNAL_PROXY_URLS, headers=stream_headers, params=stream_params)
-        if stream_resp.status_code != 200:
-            return {"streams": [], "isLive": False}
-        stream_data = stream_resp.json()
-        
-        streams = []
-        # Usually the response contains multiple qualities
-        for quality_name, quality_url in stream_data.get("stream", {}).items():
-            if quality_url.startswith("http"):
-                streams.append({"cdn": f"SOOP-{quality_name}", "url": quality_url, "type": "m3u8"})
 
-        if not streams:
+        data = resp.json()
+        # SOOP 的接口返回格式通常是 {"CHANNEL": {...}, "RESULT": ...}
+        channel_data = data.get("CHANNEL", {})
+        if channel_data.get("RESULT") != 1:
+            # 主播不在线或房间不存在
             return {"streams": [], "isLive": False}
+
+        anchor_name = channel_data.get("BJNICK", bj_id)
+        avatar = channel_data.get("BJPROFILEIMG", "")
+        rmd = channel_data.get("RMD", "")  # 这个字段通常包含流地址
+
+        if not rmd:
+            return {"streams": [], "isLive": False}
+
+        # 构建流地址，通常返回的 RMD 是m3u8的播放地址
+        streams = [{"cdn": "SOOP-Source", "url": rmd, "type": "m3u8"}]
+
+        print(f"[SOOP DEBUG] 主播: {anchor_name}, 流地址: {rmd}")
 
         return {
             "streams": streams,
