@@ -17,10 +17,6 @@ from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs
 from protobuf import douyin
 
-# 新增：Twitch 支持
-from streamget.platforms.twitch import TwitchLiveStream
-from twitch_chat_irc import TwitchChatIRC  # 需要安装: pip install twitch-chat-irc
-
 try:
     from python_socks.sync import Proxy
     SOCKS_SUPPORT = True
@@ -289,42 +285,80 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析 ====================
-async def parse_twitch(url):
-    """使用 streamget 解析 Twitch 直播流"""
+# ==================== Twitch 流解析（纯 httpx 实现，不依赖 streamget） ====================
+TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1j"
+
+async def parse_twitch(url: str) -> dict:
     try:
-        channel_name = url.rstrip("/").split("/")[-1].split("?")[0]
-        twitch = TwitchLiveStream()
-        data = await twitch.fetch_web_stream_data(url, process_data=True)
-        if not data.get("is_live"):
+        channel = url.rstrip("/").split("/")[-1].split("?")[0]
+        headers = {"Client-ID": TWITCH_CLIENT_ID, "User-Agent": UA}
+
+        # 获取 access token 和 sig
+        gql_url = "https://gql.twitch.tv/gql"
+        operation = {
+            "operationName": "PlaybackAccessToken",
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712"
+                }
+            },
+            "variables": {
+                "isLive": True,
+                "login": channel,
+                "isVod": False,
+                "vodID": "",
+                "playerType": "site"
+            }
+        }
+        resp = await request_with_retry("POST", gql_url, json=operation, headers=headers)
+        if resp.status_code != 200:
             return {"streams": [], "isLive": False}
-        # 优先使用 play_url_list 里的多种清晰度
-        play_list = data.get('play_url_list', [])
+        data = resp.json()
+        token_data = data.get("data", {}).get("streamPlaybackAccessToken")
+        if not token_data:
+            return {"streams": [], "isLive": False}
+        token = token_data["value"]
+        sig = token_data["signature"]
+
+        # 拼接 usher 地址获取 m3u8
+        from urllib.parse import quote
+        encoded_token = quote(token, safe='')
+        usher_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?token={encoded_token}&sig={sig}&allow_source=true&allow_audio_only=true"
+        usher_resp = await request_with_retry("GET", usher_url, headers={
+            "User-Agent": UA,
+            "Referer": "https://player.twitch.tv"
+        })
+        if usher_resp.status_code != 200:
+            return {"streams": [], "isLive": False}
+
+        # 解析 m3u8 获取不同清晰度
+        m3u8_list = usher_resp.text
+        lines = m3u8_list.splitlines()
         streams = []
-        if play_list:
-            for item in play_list:
-                u = item.get('url')
-                name = item.get('name', 'source')
-                if u:
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF"):
+                name = "source"
+                if "RESOLUTION=" in line:
+                    res = line.split("RESOLUTION=")[1].split(",")[0]
+                    name = res.replace("x", "p")
+                if 'VIDEO="audio_only"' in line:
+                    name = "audio"
+                stream_url = lines[i+1].strip() if i+1 < len(lines) else None
+                if stream_url and not stream_url.startswith("#"):
                     streams.append({
                         "cdn": f"Twitch-{name}",
-                        "url": u,
+                        "url": stream_url,
                         "type": "m3u8"
                     })
-        else:
-            # 后备方案，只拿主 m3u8_url
-            stream_obj = await twitch.fetch_stream_url(data, "OD")
-            raw = json.loads(stream_obj.to_json())
-            streams = build_streams("", raw.get("m3u8_url", ""))
         if not streams:
             return {"streams": [], "isLive": False}
-        anchor_name = data.get("anchor_name") or channel_name
-        avatar = data.get("avatar") or ""
+
         return {
             "streams": streams,
-            "title": anchor_name,
-            "avatar": avatar,
-            "channelName": channel_name,
+            "title": channel,
+            "avatar": "",
+            "channelName": channel,
             "isLive": True
         }
     except Exception as e:
@@ -343,7 +377,7 @@ def get_douyin_signature(md5_str: str) -> str:
         return ""
 
 
-# 导入新模块（放在函数定义之后，避免循环导入）
+# 导入抖音弹幕模块
 from douyin_barrage import DouyinBarrageCollector
 
 
@@ -399,7 +433,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         task.cancel()
 
 
-# ==================== Twitch 弹幕 WebSocket ====================
+# ==================== Twitch 弹幕 WebSocket（原生 websocket-client） ====================
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     await websocket.accept()
@@ -409,27 +443,39 @@ async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     message_queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
 
-    def on_twitch_message(msg):
-        """TwitchChatIRC 回调，发送标准 dict 到队列"""
-        try:
-            nick = msg.author
-            text = msg.text
+    def on_message(ws, msg):
+        if msg.startswith("PING"):
+            ws.send("PONG :tmi.twitch.tv")
+            return
+        match = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
+        if match:
+            nick = match.group(1)
+            content = match.group(2)
             asyncio.run_coroutine_threadsafe(
-                message_queue.put({"nick": nick, "content": text}),
+                message_queue.put({"nick": nick, "content": content}),
                 loop
             )
-        except Exception:
-            pass
 
-    # 启动 IRC 客户端（匿名）
-    irc = TwitchChatIRC(username=None)  # None 表示匿名连接
-    irc.listen(channel_name.lower(), on_message=on_twitch_message)
+    def on_error(ws, error):
+        print(f"[Twitch IRC] 错误: {error}")
+
+    def on_close(ws, close_status_code, close_msg):
+        print("[Twitch IRC] 连接关闭")
 
     def run_irc():
-        try:
-            irc.start()  # 阻塞直到停止
-        except Exception as e:
-            print(f"[Twitch IRC] 异常: {e}")
+        ws = websocket.WebSocketApp(
+            "wss://irc-ws.chat.twitch.tv:443",
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
+        )
+        ws.on_open = lambda ws: (
+            ws.send("CAP REQ :twitch.tv/tags twitch.tv/commands"),
+            ws.send("PASS SCHMOOPIIE"),
+            ws.send("NICK justinfan12345"),
+            ws.send(f"JOIN #{channel_name.lower()}")
+        )
+        ws.run_forever()
 
     task = loop.run_in_executor(None, run_irc)
 
@@ -450,10 +496,9 @@ async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
             if data == "ping":
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
-        print(f"[WS] 前端断开 Twitch 弹幕: {channel_name}")
+        print(f"[WS] 前端断开 Twitch: {channel_name}")
     finally:
         stop_event.set()
-        irc.stop()
         send_task.cancel()
         try:
             await send_task
