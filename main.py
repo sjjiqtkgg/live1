@@ -288,7 +288,7 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析（稳定 GraphQL 后备，REST 已移除） ====================
+# ==================== Twitch 流解析（稳定 GraphQL） ====================
 async def parse_twitch(url):
     try:
         match = re.search(r"twitch\.tv/([^/?]+)", url)
@@ -303,10 +303,6 @@ async def parse_twitch(url):
             "User-Agent": UA
         }
 
-        token = None
-        sig = None
-
-        # GraphQL 完整查询（修复后，无需冗余变量）
         gql_url = "https://gql.twitch.tv/gql"
         payload = [{
             "operationName": "PlaybackAccessToken",
@@ -333,6 +329,8 @@ async def parse_twitch(url):
             if resp.status_code != 200:
                 return {"streams": [], "isLive": False}
             data = resp.json()
+            token = None
+            sig = None
             if isinstance(data, list) and len(data) > 0:
                 token_data = data[0].get("data", {}).get("streamPlaybackAccessToken")
                 if token_data:
@@ -348,7 +346,6 @@ async def parse_twitch(url):
             f"?sig={sig}&token={encoded_token}&allow_source=true&allow_audio_only=true"
         )
 
-        # 验证 usher 返回有效内容
         async with httpx.AsyncClient(timeout=15) as client:
             usher_resp = await client.get(m3u8_url, headers={
                 "User-Agent": UA,
@@ -382,7 +379,6 @@ def get_douyin_signature(md5_str: str) -> str:
         return ""
 
 
-# 导入抖音弹幕模块
 from douyin_barrage import DouyinBarrageCollector
 
 
@@ -438,7 +434,6 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         task.cancel()
 
 
-# ==================== Twitch 弹幕 WebSocket ====================
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     await websocket.accept()
