@@ -92,10 +92,11 @@ async def request_with_proxy_group(method: str, url: str, proxy_list: list, **kw
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
+    # 注意：已新增 SOOP 相关的 CDN 域名
     ALLOWED = [
         "douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn",
         "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net",
-        "sooplive.com", "sooplive.net", "sooplivecdn.com"
+        "sooplive.com", "sooplive.net", "sooplivecdn.com", "livestream-manager.sooplive.com"
     ]
     if not any(d in url for d in ALLOWED):
         raise HTTPException(403, "domain not allowed")
@@ -105,7 +106,8 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "sooplive.net", "sooplivecdn.com"]
+    # 外网域名分流（新增 SOOP 相关）
+    EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "livestream-manager.sooplive.com"]
     use_external = any(domain in url for domain in EXTERNAL_DOMAINS)
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
 
@@ -432,30 +434,24 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（修正参数 bid / bno） ====================
+# ==================== SOOP 流解析（最终稳定版） ====================
 async def parse_soop(url):
     try:
-        # 正确提取：bid 是主播用户 ID，bno 是房间号
         parts = url.rstrip("/").split("/")
         if len(parts) >= 5:
-            bid = parts[-2]
-            bno = parts[-1]
+            bid = parts[-2]      # 主播ID
+            bno = parts[-1]      # 房间号
         elif len(parts) == 4:
             bid = parts[-1]
             bno = ""
         else:
             return {"streams": [], "isLive": False}
 
-        # 外网代理（若已配置则使用）
         proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
         print(f"[SOOP DEBUG] 使用代理: {proxy}, bid={bid}, bno={bno}")
 
         # 1. 获取主播昵称
-        headers = {
-            "User-Agent": UA,
-            "Referer": "https://play.sooplive.com",
-            "Accept": "application/json"
-        }
+        headers = {"User-Agent": UA, "Referer": "https://play.sooplive.com", "Accept": "application/json"}
         try:
             info_url = f"https://st.sooplive.com/api/get_station_status.php?szBjId={bid}"
             info_resp = await request_with_proxy_group("GET", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers)
@@ -467,7 +463,7 @@ async def parse_soop(url):
         except Exception:
             anchor_name = bid
 
-        # 2. 用 player_live_api 获取开播状态和流地址（参数必须传 bid 和 bno）
+        # 2. 获取开播状态和流地址
         api_url = "https://live.sooplive.com/afreeca/player_live_api.php"
         form_data = {
             "bid": bid,
@@ -498,7 +494,7 @@ async def parse_soop(url):
             print(f"[SOOP DEBUG] 主播未开播, RESULT={channel.get('RESULT')}")
             return {"streams": [], "isLive": False}
 
-        rmd = channel.get("RMD")   # 流地址（m3u8）
+        rmd = channel.get("RMD")
         if not rmd:
             return {"streams": [], "isLive": False}
 
@@ -517,6 +513,7 @@ async def parse_soop(url):
         traceback.print_exc()
         return {"streams": [], "isLive": False}
 
+
 def get_douyin_signature(md5_str: str) -> str:
     try:
         with open("sign.js", "r", encoding="utf-8") as f:
@@ -531,7 +528,7 @@ def get_douyin_signature(md5_str: str) -> str:
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
-    from douyin_barrage import DouyinBarrageCollector  # 修复循环导入，在这里导入
+    from douyin_barrage import DouyinBarrageCollector
     print(f"[WS] 前端连接抖音弹幕: {room_id}")
 
     ttwid = ""
