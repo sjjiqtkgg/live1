@@ -432,10 +432,9 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（最终修正版） ====================
+# ==================== SOOP 流解析（根据实际返回值调整） ====================
 async def parse_soop(url):
     try:
-        # 提取 bj_id (兼容多种格式)
         parts = url.rstrip("/").split("/")
         if len(parts) < 4:
             return {"streams": [], "isLive": False}
@@ -446,56 +445,51 @@ async def parse_soop(url):
 
         soop = SoopLiveStream(proxy_addr=proxy)
 
-        # 1. 获取直播信息 (返回值不固定，暂时打印)
-        tk_result = await soop.get_sooplive_tk(url, '')
-        print(f"[SOOP DEBUG] get_sooplive_tk('') 返回: {tk_result}")
-
-        # 尝试解析返回值
-        if isinstance(tk_result, tuple):
-            if len(tk_result) == 4:
-                result_code, status, title, broad_no = tk_result
-            elif len(tk_result) == 2:
-                # 可能是 (result_code, broad_no)
-                result_code, broad_no = tk_result
-                status = None
-                title = None
-            else:
-                # 其他情况直接放弃
-                print(f"[SOOP DEBUG] 无法解析的返回值长度: {len(tk_result)}")
-                return {"streams": [], "isLive": False}
+        # 1. 获取主播基础信息 (昵称和ID)
+        user_info = await soop.get_sooplive_tk(url, '')
+        if isinstance(user_info, tuple) and len(user_info) == 2:
+            anchor_name, _ = user_info
         else:
-            # 返回不是元组，可能是个单一值
-            print(f"[SOOP DEBUG] get_sooplive_tk 返回类型: {type(tk_result)}")
-            return {"streams": [], "isLive": False}
-
-        if result_code != 1:
-            print(f"[SOOP DEBUG] 主播未开播, result_code={result_code}")
-            return {"streams": [], "isLive": False}
-
-        if not broad_no:
-            print("[SOOP DEBUG] broad_no 为空")
-            return {"streams": [], "isLive": False}
-
-        # 2. 获取 CDN 地址
-        view_url = await soop._get_sooplive_cdn_url(broad_no)
-        print(f"[SOOP DEBUG] CDN地址: {view_url[:60]}...")
-
-        # 3. 获取认证 key (rtype='aid')
-        aid = await soop.get_sooplive_tk(url, 'aid')
-        print(f"[SOOP DEBUG] aid: {aid[:10]}...")
-
-        # 4. 拼接 m3u8 地址
-        m3u8_url = view_url + '?aid=' + aid
-
-        # 5. 获取主播昵称
-        try:
-            anchor_name = await soop.get_sooplive_user_nick(bj_id)
-        except Exception:
             anchor_name = bj_id
 
-        print(f"[SOOP DEBUG] 最终流地址: {m3u8_url[:80]}...")
+        # 2. 独立请求 player_live_api 获取开播状态和流信息
+        api_url = f"https://live.sooplive.com/afreeca/player_live_api.php"
+        headers = {
+            "User-Agent": UA,
+            "Origin": "https://play.sooplive.com",
+            "Referer": url,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+        }
+        data = {
+            "bid": bj_id,
+            "bno": "",
+            "type": "",
+            "pwd": "",
+            "player_type": "html5",
+            "stream_type": "common",
+            "quality": "master",
+            "mode": "landing",
+            "from_api": "0",
+            "is_revive": "false"
+        }
 
-        streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
+        resp = await request_with_proxy_group("POST", api_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data)
+        if resp.status_code != 200:
+            return {"streams": [], "isLive": False}
+
+        result = resp.json()
+        channel_data = result.get("CHANNEL", {})
+        if channel_data.get("RESULT") != 1:
+            print(f"[SOOP DEBUG] 主播未开播")
+            return {"streams": [], "isLive": False}
+
+        rmd = channel_data.get("RMD")
+        if not rmd:
+            return {"streams": [], "isLive": False}
+
+        print(f"[SOOP DEBUG] 成功获取流: {rmd[:80]}...")
+
+        streams = [{"cdn": "SOOP-Source", "url": rmd, "type": "m3u8"}]
 
         return {
             "streams": streams,
