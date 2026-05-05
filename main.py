@@ -432,64 +432,75 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（利用 streamget 的 proxy_addr） ====================
+# ==================== SOOP 流解析（直接调用API版本） ====================
 async def parse_soop(url):
     try:
+        # 提取 bj_id
         parts = url.rstrip("/").split("/")
         if len(parts) < 5:
             return {"streams": [], "isLive": False}
-        channel_id = parts[-2]
-        room_id = parts[-1]
+        bj_id = parts[-1]
 
-        # 从外网代理列表中随机选一个可用的代理
-        proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS else None
-        print(f"[SOOP DEBUG] 使用代理: {proxy}, 开始解析 {url}")
+        print(f"[SOOP DEBUG] 正在解析 bj_id: {bj_id}")
 
-        # 关键：把代理传给 SoopLiveStream 实例
-        soop = SoopLiveStream(proxy_addr=proxy)
+        # 1. 准备请求播放API
+        api_url = f"https://live.sooplive.com/afreeca/player_live_api.php"
+        headers = {
+            "User-Agent": UA,
+            "Origin": "https://play.sooplive.com",
+            "Referer": url,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+        }
+        data = {
+            "bid": bj_id,
+            "bno": "",
+            "type": "",
+            "pwd": "",
+            "player_type": "html5",
+            "stream_type": "common",
+            "quality": "master",
+            "mode": "landing",
+            "from_api": "0",
+            "is_revive": "false"
+        }
 
-        # 获取原始直播数据
-        stream_data = await soop.fetch_web_stream_data(url, process_data=True)
-        print(f"[SOOP DEBUG] stream_data: {stream_data}")
-
-        if not stream_data or not stream_data.get("is_live"):
+        # 2. 使用外网代理组发送请求
+        resp = await request_with_proxy_group("POST", api_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data)
+        if resp.status_code != 200:
             return {"streams": [], "isLive": False}
 
-        # 获取流地址对象并转换为字典
-        stream_obj = await soop.fetch_stream_url(stream_data, "OD")
-        raw = json.loads(stream_obj.to_json())
-        print(f"[SOOP DEBUG] raw: {raw}")
-
-        # 构建清晰度列表
-        streams = []
-        m3u8_url = raw.get("m3u8_url", "")
-        if m3u8_url:
-            streams.append({"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"})
-
-        play_url_list = stream_data.get("play_url_list", [])
-        for item in play_url_list:
-            url_str = item.get("url")
-            name = item.get("name", "unknown")
-            if url_str and url_str != m3u8_url:
-                streams.append({"cdn": f"SOOP-{name}", "url": url_str, "type": "m3u8"})
-
-        if not streams:
+        # 3. 解析返回结果
+        try:
+            result = resp.json()
+        except:
             return {"streams": [], "isLive": False}
 
-        anchor_name = raw.get("anchor_name", channel_id)
-        avatar = raw.get("avatar", "")
+        channel_data = result.get("CHANNEL", {})
+        if channel_data.get("RESULT") != 1:
+            print(f"[SOOP DEBUG] 主播未开播: {channel_data.get('RESULT')}")
+            return {"streams": [], "isLive": False}
+
+        # 4. 提取信息
+        anchor_name = channel_data.get("BJNICK") or channel_data.get("TITLE") or bj_id
+        rmd = channel_data.get("RMD")  # 直播流地址
+
+        if not rmd:
+            return {"streams": [], "isLive": False}
+
+        # 5. 构建流列表
+        streams = [{"cdn": "SOOP-Source", "url": rmd, "type": "m3u8"}]
+        print(f"[SOOP DEBUG] 成功获取流: {rmd[:80]}...")
 
         return {
             "streams": streams,
             "title": anchor_name,
-            "avatar": avatar,
+            "avatar": "",
             "isLive": True
         }
     except Exception as e:
         print(f"[SOOP] 解析异常: {e}")
         traceback.print_exc()
         return {"streams": [], "isLive": False}
-
 
 def get_douyin_signature(md5_str: str) -> str:
     try:
