@@ -18,9 +18,8 @@ from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs, quote
 from protobuf import douyin
 
-# 平台支持
+# 仅保留 SOOP 支持（如不需要可删除）
 from streamget.platforms.soop.live_stream import SoopLiveStream
-from streamget.platforms.pandalive.live_stream import PandaLiveStream
 
 try:
     from python_socks.sync import Proxy
@@ -435,53 +434,60 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（保留，但暂不完善） ====================
+# ==================== SOOP 解析（暂时留空或删除） ====================
 async def parse_soop(url):
-    """SOOP解析（已放弃优化，如果以后修复将更新此函数）"""
     return {"streams": [], "isLive": False}
 
 
-# ==================== PandaTV 流解析（使用代理） ====================
+# ==================== PandaTV 流解析（纯自实现，不依赖 streamget） ====================
 async def parse_panda(url):
     try:
+        # 提取用户 ID，例如 https://www.pandalive.co.kr/live/xxxx
+        user_id = url.split('?')[0].rstrip('/').split('/')[-1]
         proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
-        print(f"[PandaTV] 使用代理: {proxy}")
+        print(f"[PandaTV] 使用代理: {proxy}, 用户ID: {user_id}")
 
-        panda = PandaLiveStream(proxy_addr=proxy)
-        stream_data = await panda.fetch_web_stream_data(url, process_data=True)
+        headers = {
+            'origin': 'https://www.pandalive.co.kr',
+            'referer': 'https://www.pandalive.co.kr/',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+        }
 
-        if not stream_data or not stream_data.get("is_live"):
+        # 第一步：获取主播信息
+        info_url = 'https://api.pandalive.co.kr/v1/member/bj'
+        data = {'userId': user_id, 'info': 'media fanGrade'}
+        resp = await request_with_proxy_group("POST", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data)
+        if resp.status_code != 200:
+            return {"streams": [], "isLive": False}
+        info_json = resp.json()
+        if 'bjInfo' not in info_json:
+            return {"streams": [], "isLive": False}
+        anchor_name = info_json['bjInfo']['nick']
+        is_live = 'media' in info_json
+
+        if not is_live:
             return {"streams": [], "isLive": False}
 
-        stream_obj = await panda.fetch_stream_url(stream_data, "OD")
-        raw = json.loads(stream_obj.to_json())
-
-        streams = []
-        m3u8_url = raw.get("m3u8_url", "")
-        if m3u8_url:
-            # 包装成后端代理地址
-            self_api_base = os.getenv("RENDER_EXTERNAL_URL", "https://live1-cxe9.onrender.com")
-            proxy_url = f"{self_api_base}/api/proxy?url={quote(m3u8_url, safe='')}&referer=https://www.pandalive.co.kr"
-            streams.append({"cdn": "PandaTV-Source", "url": proxy_url, "type": "m3u8"})
-
-        play_url_list = stream_data.get("play_url_list", [])
-        for item in play_url_list:
-            url_str = item.get("url")
-            name = item.get("name", "unknown")
-            if url_str and url_str != m3u8_url:
-                proxy_url = f"{self_api_base}/api/proxy?url={quote(url_str, safe='')}&referer=https://www.pandalive.co.kr"
-                streams.append({"cdn": f"PandaTV-{name}", "url": proxy_url, "type": "m3u8"})
-
-        if not streams:
+        # 第二步：获取直播流地址
+        play_url = 'https://api.pandalive.co.kr/v1/live/play'
+        data2 = {'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''}
+        resp2 = await request_with_proxy_group("POST", play_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data2)
+        if resp2.status_code != 200:
             return {"streams": [], "isLive": False}
+        play_json = resp2.json()
+        if 'PlayList' not in play_json or 'hls' not in play_json['PlayList']:
+            return {"streams": [], "isLive": False}
+        real_m3u8 = play_json['PlayList']['hls'][0]['url']  # 真实流地址
 
-        anchor_name = raw.get("anchor_name", "PandaTV主播")
-        avatar = raw.get("avatar", "")
+        # 包装成后端代理地址
+        self_api_base = os.getenv("RENDER_EXTERNAL_URL", "https://live1-cxe9.onrender.com")
+        proxy_url = f"{self_api_base}/api/proxy?url={quote(real_m3u8, safe='')}&referer=https://www.pandalive.co.kr"
+        streams = [{"cdn": "PandaTV-Source", "url": proxy_url, "type": "m3u8"}]
 
         return {
             "streams": streams,
-            "title": anchor_name,
-            "avatar": avatar,
+            "title": f"{anchor_name}-{user_id}",
+            "avatar": "",
             "isLive": True
         }
     except Exception as e:
