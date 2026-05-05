@@ -436,7 +436,6 @@ async def parse_twitch(url):
 # ==================== SOOP 流解析（走外网代理） ====================
 async def parse_soop(url):
     try:
-        # URL 格式：https://play.sooplive.com/主播ID/房间ID
         parts = url.rstrip("/").split("/")
         if len(parts) < 5:
             return {"streams": [], "isLive": False}
@@ -444,20 +443,20 @@ async def parse_soop(url):
         room_id = parts[-1]
         channel = f"{channel_id}/{room_id}"
 
-        # 使用外网代理（如果已配置）
+        # 不使用 async with，直接实例化
+        soop = SoopLiveStream()
+
+        # 获取原始数据（传入 proxy 参数，如果配置了外网代理）
         proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS else None
-        client_kwargs = {}
-        if proxy and proxy != "None":
-            client_kwargs["proxy"] = proxy
+        stream_data = await soop.fetch_web_stream_data(url, process_data=True, proxy=proxy)
+        if not stream_data or not stream_data.get("is_live"):
+            return {"streams": [], "isLive": False}
 
-        async with SoopLiveStream(**client_kwargs) as soop:
-            stream_data = await soop.fetch_web_stream_data(url, process_data=True)
-            if not stream_data or not stream_data.get("is_live"):
-                return {"streams": [], "isLive": False}
+        # 获取流地址
+        stream_obj = await soop.fetch_stream_url(stream_data, "OD", proxy=proxy)
+        raw = json.loads(stream_obj.to_json())
 
-            stream_obj = await soop.fetch_stream_url(stream_data, "OD")
-            raw = json.loads(stream_obj.to_json())
-
+        # 构建 streams
         streams = []
         m3u8_url = raw.get("m3u8_url", "")
         if m3u8_url:
@@ -485,17 +484,6 @@ async def parse_soop(url):
     except Exception as e:
         print(f"[SOOP] 解析异常: {e}")
         return {"streams": [], "isLive": False}
-
-
-def get_douyin_signature(md5_str: str) -> str:
-    try:
-        with open("sign.js", "r", encoding="utf-8") as f:
-            js_code = f.read()
-        ctx = execjs.compile(js_code)
-        return ctx.call("get_sign", md5_str)
-    except Exception as e:
-        print(f"[签名] 生成失败: {e}")
-        return ""
 
 
 from douyin_barrage import DouyinBarrageCollector
