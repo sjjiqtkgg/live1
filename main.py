@@ -17,6 +17,9 @@ from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs
 from protobuf import douyin
 
+# ===== Twitch 支持（streamget 库） =====
+from streamget.platforms.twitch import Twitch   # 注意：类名是 Twitch，不是 TwitchLiveStream
+
 try:
     from python_socks.sync import Proxy
     SOCKS_SUPPORT = True
@@ -285,80 +288,55 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析（纯 httpx 实现，不依赖 streamget） ====================
-TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1j"
-
-async def parse_twitch(url: str) -> dict:
+# ==================== Twitch 流解析（使用 streamget 库） ====================
+async def parse_twitch(url):
+    """使用 streamget 自带的 Twitch 类解析直播流"""
     try:
-        channel = url.rstrip("/").split("/")[-1].split("?")[0]
-        headers = {"Client-ID": TWITCH_CLIENT_ID, "User-Agent": UA}
+        channel_name = url.rstrip("/").split("/")[-1].split("?")[0]
+        twitch = Twitch()   # 关键：正确的类名
 
-        # 获取 access token 和 sig
-        gql_url = "https://gql.twitch.tv/gql"
-        operation = {
-            "operationName": "PlaybackAccessToken",
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712"
-                }
-            },
-            "variables": {
-                "isLive": True,
-                "login": channel,
-                "isVod": False,
-                "vodID": "",
-                "playerType": "site"
-            }
-        }
-        resp = await request_with_retry("POST", gql_url, json=operation, headers=headers)
-        if resp.status_code != 200:
-            return {"streams": [], "isLive": False}
-        data = resp.json()
-        token_data = data.get("data", {}).get("streamPlaybackAccessToken")
-        if not token_data:
-            return {"streams": [], "isLive": False}
-        token = token_data["value"]
-        sig = token_data["signature"]
-
-        # 拼接 usher 地址获取 m3u8
-        from urllib.parse import quote
-        encoded_token = quote(token, safe='')
-        usher_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?token={encoded_token}&sig={sig}&allow_source=true&allow_audio_only=true"
-        usher_resp = await request_with_retry("GET", usher_url, headers={
-            "User-Agent": UA,
-            "Referer": "https://player.twitch.tv"
-        })
-        if usher_resp.status_code != 200:
+        # 1. 获取原始数据（包含直播状态、清晰度列表、token 等）
+        stream_data = await twitch.fetch_web_stream_data(url, process_data=True)
+        if not stream_data.get("is_live"):
             return {"streams": [], "isLive": False}
 
-        # 解析 m3u8 获取不同清晰度
-        m3u8_list = usher_resp.text
-        lines = m3u8_list.splitlines()
+        # 2. 从原始数据中读取多清晰度流列表（streamget 0.2.x 以上版本支持）
+        play_list = stream_data.get("play_url_list", [])
         streams = []
-        for i, line in enumerate(lines):
-            if line.startswith("#EXT-X-STREAM-INF"):
-                name = "source"
-                if "RESOLUTION=" in line:
-                    res = line.split("RESOLUTION=")[1].split(",")[0]
-                    name = res.replace("x", "p")
-                if 'VIDEO="audio_only"' in line:
-                    name = "audio"
-                stream_url = lines[i+1].strip() if i+1 < len(lines) else None
-                if stream_url and not stream_url.startswith("#"):
+        if play_list:
+            for item in play_list:
+                u = item.get("url")
+                name = item.get("name", "source")
+                if u:
                     streams.append({
                         "cdn": f"Twitch-{name}",
-                        "url": stream_url,
+                        "url": u,
                         "type": "m3u8"
                     })
+        else:
+            # 后备方案：只拿最高画质 m3u8
+            stream_obj = await twitch.fetch_stream_url(stream_data, "OD")
+            raw = json.loads(stream_obj.to_json())
+            m3u8_url = raw.get("m3u8_url", "")
+            if m3u8_url:
+                streams.append({
+                    "cdn": "Twitch-source",
+                    "url": m3u8_url,
+                    "type": "m3u8"
+                })
+
         if not streams:
             return {"streams": [], "isLive": False}
 
+        # 3. 提取主播信息
+        anchor_name = stream_data.get("anchor_name") or channel_name
+        avatar = stream_data.get("avatar") or ""
+
         return {
             "streams": streams,
-            "title": channel,
-            "avatar": "",
-            "channelName": channel,
+            "title": anchor_name,
+            "avatar": avatar,
+            "channelName": channel_name,
             "isLive": True
         }
     except Exception as e:
