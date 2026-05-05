@@ -14,11 +14,8 @@ import ssl
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from urllib.parse import unquote, urlparse, parse_qs
+from urllib.parse import unquote, urlparse, parse_qs, quote
 from protobuf import douyin
-
-# ===== 正确的 Twitch 导入方式 =====
-from streamget.platforms.twitch.live_stream import TwitchLiveStream
 
 try:
     from python_socks.sync import Proxy
@@ -41,7 +38,7 @@ if PROXY_LIST_STR:
     PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
     print(f"[代理] 共加载 {len(PROXY_URLS)} 个代理: {PROXY_URLS}")
 else:
-    print("[代理] 未设置代理，将使用直连模式")
+    print("[代理] 未设置代理，所有请求将直连")
     PROXY_URLS = [None]
 
 
@@ -65,7 +62,7 @@ async def request_with_retry(method: str, url: str, **kwargs):
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
-    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com", "twitch.tv"]
+    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net"]
     if not any(d in url for d in ALLOWED):
         raise HTTPException(403, "domain not allowed")
     body = await request.body() if request.method == "POST" else None
@@ -291,44 +288,72 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析（使用最新 StreamGet） ====================
+# ==================== Twitch 流解析（直连，不走代理） ====================
 async def parse_twitch(url):
-    """使用 StreamGet 的 TwitchLiveStream 解析直播流"""
     try:
-        channel_name = url.rstrip("/").split("/")[-1].split("?")[0]
-        twitch = TwitchLiveStream()
-
-        # 1. 获取原始数据
-        stream_data = await twitch.fetch_web_stream_data(url, process_data=True)
-        if not stream_data or not stream_data.get("is_live"):
+        # 提取频道名
+        match = re.search(r"twitch\.tv/([^/?]+)", url)
+        if not match:
             return {"streams": [], "isLive": False}
+        channel = match.group(1)
 
-        # 2. 获取 StreamData 对象并转为 dict
-        stream_obj = await twitch.fetch_stream_url(stream_data, "OD")
-        raw = json.loads(stream_obj.to_json())
+        # GraphQL 获取 token 和 sig
+        gql_url = "https://gql.twitch.tv/gql"
+        headers = {
+            "Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko",
+            "Content-Type": "application/json"
+        }
+        payload = [{
+            "operationName": "PlaybackAccessToken",
+            "variables": {
+                "isLive": True,
+                "login": channel,
+                "isVod": False,
+                "vodID": "",
+                "playerType": "site"
+            },
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "0828119dedc4cce5b4c7c2e6c3b1d3e8d8e2e3d5c7a6b8f9d1e2c3b4a5f6e7d8"
+                }
+            }
+        }]
 
-        # 3. 获取主 m3u8 地址
-        m3u8_url = raw.get("m3u8_url", "")
-        if not m3u8_url:
-            return {"streams": [], "isLive": False}
+        # 直连，不使用代理
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(gql_url, json=payload, headers=headers)
+            data = resp.json()
+            token_data = data[0]["data"]["streamPlaybackAccessToken"]
+            token = token_data["value"]
+            sig = token_data["signature"]
 
-        # 4. 构建 streams（默认提供 source 和 audio）
-        streams = [{"cdn": "Twitch-source", "url": m3u8_url, "type": "m3u8"}]
-        play_url_list = stream_data.get('play_url_list', [])
-        for item in play_url_list:
-            if item.get('is_audio_only'):
-                streams.append({"cdn": "Twitch-Audio", "url": item['url'], "type": "m3u8"})
-                break
+        # token 必须 URL 编码
+        encoded_token = quote(token, safe='')
+        m3u8_url = (
+            f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8"
+            f"?sig={sig}&token={encoded_token}&allow_source=true&allow_audio_only=true"
+        )
 
-        # 5. 提取主播信息
-        anchor_name = raw.get("anchor_name", channel_name)
-        avatar = raw.get("avatar", "")
+        # 获取 m3u8 并检查是否包含有效流
+        async with httpx.AsyncClient(timeout=15) as client:
+            usher_resp = await client.get(m3u8_url, headers={
+                "User-Agent": UA,
+                "Referer": "https://player.twitch.tv"
+            })
+            if usher_resp.status_code != 200:
+                return {"streams": [], "isLive": False}
+            m3u8_text = usher_resp.text
+            if "#EXT-X-STREAM-INF" not in m3u8_text:
+                # 频道未开播或返回空列表
+                return {"streams": [], "isLive": False}
+
+        streams = [{"cdn": "Twitch", "url": m3u8_url, "type": "m3u8"}]
 
         return {
             "streams": streams,
-            "title": anchor_name,
-            "avatar": avatar,
-            "channelName": channel_name,
+            "title": channel,
+            "avatar": "",
             "isLive": True
         }
     except Exception as e:
@@ -403,7 +428,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         task.cancel()
 
 
-# ==================== Twitch 弹幕 WebSocket ====================
+# ==================== Twitch 弹幕 WebSocket（暂时留空，可后续添加） ====================
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     await websocket.accept()
