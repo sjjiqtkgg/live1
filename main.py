@@ -288,7 +288,7 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析（稳定 GraphQL） ====================
+# ==================== Twitch 流解析（多清晰度 + 稳定 GraphQL） ====================
 async def parse_twitch(url):
     try:
         match = re.search(r"twitch\.tv/([^/?]+)", url)
@@ -356,11 +356,47 @@ async def parse_twitch(url):
             if "#EXT-X-STREAM-INF" not in usher_resp.text:
                 return {"streams": [], "isLive": False}
 
-        streams = [{"cdn": "Twitch", "url": m3u8_url, "type": "m3u8"}]
+        # 解析 m3u8 获取不同清晰度流
+        streams = []
+        lines = usher_resp.text.splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF"):
+                # 提取分辨率信息
+                name = "source"
+                if "RESOLUTION=" in line:
+                    res = line.split("RESOLUTION=")[1].split(",")[0].replace("x", "p")
+                    name = res
+                # 下一行是流地址
+                if i + 1 < len(lines):
+                    sub_url = lines[i + 1].strip()
+                    # 如果是相对路径，补全
+                    if not sub_url.startswith("http"):
+                        from urllib.parse import urljoin
+                        sub_url = urljoin(m3u8_url, sub_url)
+                    streams.append({
+                        "cdn": f"Twitch-{name}",
+                        "url": sub_url,
+                        "type": "m3u8"
+                    })
+
+        # 按分辨率倒序排序，最高画质在前
+        def sort_key(s):
+            n = s["cdn"].split("-")[-1]
+            if n == "source": return 99999
+            if "p" in n:
+                try: return int(n.replace("p",""))
+                except: return 0
+            return 0
+        streams.sort(key=sort_key, reverse=True)
+
+        if not streams:
+            return {"streams": [], "isLive": False}
+
         return {
             "streams": streams,
             "title": channel,
             "avatar": "",
+            "channelName": channel,
             "isLive": True
         }
     except Exception as e:
