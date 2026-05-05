@@ -432,28 +432,25 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（使用 SoopLiveStream 的内部方法） ====================
+# ==================== SOOP 流解析（修正参数，直接使用内部方法） ====================
 async def parse_soop(url):
     try:
-        # 提取 bj_id
+        # 提取 bj_id (兼容多种URL格式)
         parts = url.rstrip("/").split("/")
-        if len(parts) < 5:
+        if len(parts) < 3:
             return {"streams": [], "isLive": False}
-        bj_id = parts[-1]
+        # 通常格式为 play.sooplive.com/频道名/bj_id 或 play.sooplive.com/bj_id
+        bj_id = parts[-1] if len(parts) >= 4 else parts[-1]
 
-        # 从外网代理列表中随机选一个
-        proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS else None
+        # 暂时直连，先确保功能正常
+        proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
         print(f"[SOOP DEBUG] 使用代理: {proxy}, 开始解析 bj_id: {bj_id}")
 
-        # 1. 创建实例，并传入代理
         soop = SoopLiveStream(proxy_addr=proxy)
 
-        # 2. 获取直播间密码（如果有的话）
-        room_password = re.search(r"pwd=([^&]+)", url)
-        room_password = room_password.group(1) if room_password else ""
-
-        # 3. 调用 get_sooplive_tk 获取直播状态和 broad_no
-        result_code, status, title, broad_no = await soop.get_sooplive_tk(url)
+        # 1. 获取直播状态 (rtype 必须显式传入空字符串)
+        result_code, status, title, broad_no = await soop.get_sooplive_tk(url, '')
+        print(f"[SOOP DEBUG] result_code={result_code}, status={status}, title={title}, broad_no={broad_no}")
 
         if result_code != 1:
             print(f"[SOOP DEBUG] 主播未开播, result_code={result_code}")
@@ -462,19 +459,22 @@ async def parse_soop(url):
         if not broad_no:
             return {"streams": [], "isLive": False}
 
-        # 4. 获取 CDN 地址
+        # 2. 获取 CDN 地址
         view_url = await soop._get_sooplive_cdn_url(broad_no)
+        print(f"[SOOP DEBUG] 获取CDN成功: {view_url[:50]}...")
 
-        # 5. 获取认证 key (aid)
-        authentication_key = await soop.get_sooplive_tk(url, rtype='aid')
+        # 3. 获取认证 key (rtype='aid')
+        authentication_key = await soop.get_sooplive_tk(url, 'aid')
+        print(f"[SOOP DEBUG] 获取AID成功: {authentication_key[:10]}...")
 
-        # 6. 拼接最终的 m3u8 地址
+        # 4. 拼接完整 m3u8 地址
         m3u8_url = view_url + '?aid=' + authentication_key
 
-        # 7. 获取主播昵称
-        anchor_name = await soop.get_sooplive_user_nick(bj_id)
-        if not anchor_name:
-            anchor_name = title if title else bj_id
+        # 5. 获取主播昵称
+        try:
+            anchor_name = await soop.get_sooplive_user_nick(bj_id)
+        except:
+            anchor_name = title or bj_id
 
         print(f"[SOOP DEBUG] 流地址: {m3u8_url[:80]}...")
 
