@@ -11,6 +11,7 @@ import random
 import execjs
 import websocket
 import ssl
+import traceback
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -431,7 +432,7 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（调试版，打印原始数据） ====================
+# ==================== SOOP 流解析（带完整 traceback） ====================
 async def parse_soop(url):
     try:
         parts = url.rstrip("/").split("/")
@@ -440,10 +441,10 @@ async def parse_soop(url):
         channel_id = parts[-2]
         room_id = parts[-1]
 
-        # 先不用代理，裸跑一次看看结构
+        print(f"[SOOP DEBUG] 开始请求，URL: {url}")
         soop = SoopLiveStream()
         stream_data = await soop.fetch_web_stream_data(url, process_data=True)
-        print(f"[SOOP DEBUG] stream_data: {stream_data}")
+        print(f"[SOOP DEBUG] stream_data 获取成功: {stream_data}")
 
         if not stream_data or not stream_data.get("is_live"):
             return {"streams": [], "isLive": False}
@@ -478,7 +479,19 @@ async def parse_soop(url):
         }
     except Exception as e:
         print(f"[SOOP] 解析异常: {e}")
+        traceback.print_exc()
         return {"streams": [], "isLive": False}
+
+
+def get_douyin_signature(md5_str: str) -> str:
+    try:
+        with open("sign.js", "r", encoding="utf-8") as f:
+            js_code = f.read()
+        ctx = execjs.compile(js_code)
+        return ctx.call("get_sign", md5_str)
+    except Exception as e:
+        print(f"[签名] 生成失败: {e}")
+        return ""
 
 
 @app.websocket("/ws/douyin/{room_id}")
