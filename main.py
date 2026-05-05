@@ -30,19 +30,30 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
 
-# ==================== 代理加载 ====================
+# ==================== 国内代理列表（虎牙、斗鱼、抖音等使用） ====================
 PROXY_LIST_STR = os.getenv("PROXY_LIST", "")
 PROXY_URLS = []
 if PROXY_LIST_STR:
     PROXY_LIST_STR = PROXY_LIST_STR.strip().strip('"').strip("'")
     PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
-    print(f"[代理] 共加载 {len(PROXY_URLS)} 个代理: {PROXY_URLS}")
+    print(f"[代理] 国内代理 {len(PROXY_URLS)} 个: {PROXY_URLS}")
 else:
-    print("[代理] 未设置代理，所有请求将直连")
+    print("[代理] 未设置国内代理，直连")
     PROXY_URLS = [None]
+
+# ==================== 外网代理列表（Twitch、YouTube等使用） ====================
+EXTERNAL_PROXY_LIST_STR = os.getenv("EXTERNAL_PROXY_LIST", "")
+EXTERNAL_PROXY_URLS = []
+if EXTERNAL_PROXY_LIST_STR:
+    EXTERNAL_PROXY_URLS = [p.strip() for p in EXTERNAL_PROXY_LIST_STR.split(",") if p.strip()]
+    print(f"[代理] 外网代理 {len(EXTERNAL_PROXY_URLS)} 个: {EXTERNAL_PROXY_URLS}")
+else:
+    print("[代理] 未设置外网代理，外网平台将直连")
+    EXTERNAL_PROXY_URLS = [None]
 
 
 async def request_with_retry(method: str, url: str, **kwargs):
+    """国内平台使用的请求函数，自动遍历国内代理列表"""
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     for idx, proxy in enumerate(PROXY_URLS):
@@ -50,26 +61,49 @@ async def request_with_retry(method: str, url: str, **kwargs):
             print(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
             async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
                 resp = await client.request(method, url, **kwargs)
-                print(f"[请求重试] 代理 {proxy or '直连'} 成功")
+                print(f"[请求重试] 成功")
                 return resp
         except Exception as e:
             last_error = e
-            error_type = type(e).__name__
-            error_msg = str(e) or "无具体信息"
-            print(f"[请求重试] 代理 {proxy or '直连'} 失败: {error_type}: {error_msg}，尝试下一个...")
+            print(f"[请求重试] 失败: {e}")
+    raise last_error or Exception("所有代理均失败")
+
+
+async def request_with_proxy_group(method: str, url: str, proxy_list: list, **kwargs):
+    """通用分组请求函数，根据传入的代理列表自动重试"""
+    last_error = None
+    timeout = kwargs.pop("timeout", 15)
+    for idx, proxy in enumerate(proxy_list):
+        try:
+            print(f"[分组请求] 尝试代理 [{idx+1}/{len(proxy_list)}]: {proxy or '直连'}")
+            async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
+                resp = await client.request(method, url, **kwargs)
+                print(f"[分组请求] 成功")
+                return resp
+        except Exception as e:
+            last_error = e
+            print(f"[分组请求] 失败: {e}")
     raise last_error or Exception("所有代理均失败")
 
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
+    # 允许的域名白名单
     ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net"]
     if not any(d in url for d in ALLOWED):
         raise HTTPException(403, "domain not allowed")
+    
     body = await request.body() if request.method == "POST" else None
     headers = {"User-Agent": ua or UA, "Referer": referer or "", "Cookie": cookie}
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    resp = await request_with_retry(request.method, url, headers=headers, content=body)
+    
+    # 根据域名选择代理组
+    EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net"]   # 以后添加外网平台域名即可
+    use_external = any(domain in url for domain in EXTERNAL_DOMAINS)
+    proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
+    
+    resp = await request_with_proxy_group(request.method, url, proxy_list=proxy_list, headers=headers, content=body)
     out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": resp.headers.get("content-type", "application/json")}
     return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
 
@@ -288,7 +322,7 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析（多清晰度 + 稳定 GraphQL） ====================
+# ==================== Twitch 流解析（走外网代理，多清晰度） ====================
 async def parse_twitch(url):
     try:
         match = re.search(r"twitch\.tv/([^/?]+)", url)
@@ -324,18 +358,18 @@ async def parse_twitch(url):
             """
         }]
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(gql_url, json=payload, headers=headers)
-            if resp.status_code != 200:
-                return {"streams": [], "isLive": False}
-            data = resp.json()
-            token = None
-            sig = None
-            if isinstance(data, list) and len(data) > 0:
-                token_data = data[0].get("data", {}).get("streamPlaybackAccessToken")
-                if token_data:
-                    token = token_data.get("value")
-                    sig = token_data.get("signature")
+        # 使用外网代理组请求 GQL
+        resp = await request_with_proxy_group("POST", gql_url, proxy_list=EXTERNAL_PROXY_URLS, json=payload, headers=headers)
+        if resp.status_code != 200:
+            return {"streams": [], "isLive": False}
+        data = resp.json()
+        token = None
+        sig = None
+        if isinstance(data, list) and len(data) > 0:
+            token_data = data[0].get("data", {}).get("streamPlaybackAccessToken")
+            if token_data:
+                token = token_data.get("value")
+                sig = token_data.get("signature")
 
         if not token or not sig:
             return {"streams": [], "isLive": False}
@@ -346,30 +380,25 @@ async def parse_twitch(url):
             f"?sig={sig}&token={encoded_token}&allow_source=true&allow_audio_only=true"
         )
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            usher_resp = await client.get(m3u8_url, headers={
-                "User-Agent": UA,
-                "Referer": "https://player.twitch.tv"
-            })
-            if usher_resp.status_code != 200:
-                return {"streams": [], "isLive": False}
-            if "#EXT-X-STREAM-INF" not in usher_resp.text:
-                return {"streams": [], "isLive": False}
+        # 使用外网代理组请求 usher
+        usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=EXTERNAL_PROXY_URLS,
+                                                    headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"})
+        if usher_resp.status_code != 200:
+            return {"streams": [], "isLive": False}
+        if "#EXT-X-STREAM-INF" not in usher_resp.text:
+            return {"streams": [], "isLive": False}
 
-        # 解析 m3u8 获取不同清晰度流
+        # 解析多清晰度
         streams = []
         lines = usher_resp.text.splitlines()
         for i, line in enumerate(lines):
             if line.startswith("#EXT-X-STREAM-INF"):
-                # 提取分辨率信息
                 name = "source"
                 if "RESOLUTION=" in line:
                     res = line.split("RESOLUTION=")[1].split(",")[0].replace("x", "p")
                     name = res
-                # 下一行是流地址
                 if i + 1 < len(lines):
                     sub_url = lines[i + 1].strip()
-                    # 如果是相对路径，补全
                     if not sub_url.startswith("http"):
                         from urllib.parse import urljoin
                         sub_url = urljoin(m3u8_url, sub_url)
@@ -379,7 +408,6 @@ async def parse_twitch(url):
                         "type": "m3u8"
                     })
 
-        # 按分辨率倒序排序，最高画质在前
         def sort_key(s):
             n = s["cdn"].split("-")[-1]
             if n == "source": return 99999
