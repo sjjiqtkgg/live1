@@ -17,6 +17,9 @@ from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs, quote
 from protobuf import douyin
 
+# SOOP 支持（streamget 内置）
+from streamget.platforms.soop.live_stream import SoopLiveStream
+
 try:
     from python_socks.sync import Proxy
     SOCKS_SUPPORT = True
@@ -41,7 +44,7 @@ else:
     print("[代理] 未设置国内代理，直连")
     PROXY_URLS = [None]
 
-# ==================== 外网代理列表（Twitch、YouTube等使用） ====================
+# ==================== 外网代理列表（Twitch、SOOP、YouTube等使用） ====================
 EXTERNAL_PROXY_LIST_STR = os.getenv("EXTERNAL_PROXY_LIST", "")
 EXTERNAL_PROXY_URLS = []
 if EXTERNAL_PROXY_LIST_STR:
@@ -88,21 +91,25 @@ async def request_with_proxy_group(method: str, url: str, proxy_list: list, **kw
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
-    # 允许的域名白名单
-    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net"]
+    # 允许的域名白名单（新增 sooplive 相关）
+    ALLOWED = [
+        "douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn",
+        "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net",
+        "sooplive.com", "sooplive.net", "sooplivecdn.com"   # 可根据实际 CDN 调整
+    ]
     if not any(d in url for d in ALLOWED):
         raise HTTPException(403, "domain not allowed")
-    
+
     body = await request.body() if request.method == "POST" else None
     headers = {"User-Agent": ua or UA, "Referer": referer or "", "Cookie": cookie}
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    
-    # 根据域名选择代理组
-    EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net"]   # 以后添加外网平台域名即可
+
+    # 根据域名选择代理组（新增 sooplive 相关域名）
+    EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "sooplive.net", "sooplivecdn.com"]
     use_external = any(domain in url for domain in EXTERNAL_DOMAINS)
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
-    
+
     resp = await request_with_proxy_group(request.method, url, proxy_list=proxy_list, headers=headers, content=body)
     out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": resp.headers.get("content-type", "application/json")}
     return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
@@ -322,7 +329,7 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析（走外网代理，多清晰度） ====================
+# ==================== Twitch 流解析 ====================
 async def parse_twitch(url):
     try:
         match = re.search(r"twitch\.tv/([^/?]+)", url)
@@ -358,8 +365,8 @@ async def parse_twitch(url):
             """
         }]
 
-        # 使用外网代理组请求 GQL
-        resp = await request_with_proxy_group("POST", gql_url, proxy_list=EXTERNAL_PROXY_URLS, json=payload, headers=headers)
+        resp = await request_with_proxy_group("POST", gql_url, proxy_list=EXTERNAL_PROXY_URLS,
+                                             json=payload, headers=headers)
         if resp.status_code != 200:
             return {"streams": [], "isLive": False}
         data = resp.json()
@@ -380,15 +387,13 @@ async def parse_twitch(url):
             f"?sig={sig}&token={encoded_token}&allow_source=true&allow_audio_only=true"
         )
 
-        # 使用外网代理组请求 usher
         usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=EXTERNAL_PROXY_URLS,
-                                                    headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"})
+                                                     headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"})
         if usher_resp.status_code != 200:
             return {"streams": [], "isLive": False}
         if "#EXT-X-STREAM-INF" not in usher_resp.text:
             return {"streams": [], "isLive": False}
 
-        # 解析多清晰度
         streams = []
         lines = usher_resp.text.splitlines()
         for i, line in enumerate(lines):
@@ -402,11 +407,7 @@ async def parse_twitch(url):
                     if not sub_url.startswith("http"):
                         from urllib.parse import urljoin
                         sub_url = urljoin(m3u8_url, sub_url)
-                    streams.append({
-                        "cdn": f"Twitch-{name}",
-                        "url": sub_url,
-                        "type": "m3u8"
-                    })
+                    streams.append({"cdn": f"Twitch-{name}", "url": sub_url, "type": "m3u8"})
 
         def sort_key(s):
             n = s["cdn"].split("-")[-1]
@@ -429,6 +430,60 @@ async def parse_twitch(url):
         }
     except Exception as e:
         print(f"[Twitch] 解析异常: {e}")
+        return {"streams": [], "isLive": False}
+
+
+# ==================== SOOP 流解析（走外网代理） ====================
+async def parse_soop(url):
+    try:
+        # URL 格式：https://play.sooplive.com/主播ID/房间ID
+        parts = url.rstrip("/").split("/")
+        if len(parts) < 5:
+            return {"streams": [], "isLive": False}
+        channel_id = parts[-2]
+        room_id = parts[-1]
+        channel = f"{channel_id}/{room_id}"
+
+        # 使用外网代理（如果已配置）
+        proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS else None
+        client_kwargs = {}
+        if proxy and proxy != "None":
+            client_kwargs["proxy"] = proxy
+
+        async with SoopLiveStream(**client_kwargs) as soop:
+            stream_data = await soop.fetch_web_stream_data(url, process_data=True)
+            if not stream_data or not stream_data.get("is_live"):
+                return {"streams": [], "isLive": False}
+
+            stream_obj = await soop.fetch_stream_url(stream_data, "OD")
+            raw = json.loads(stream_obj.to_json())
+
+        streams = []
+        m3u8_url = raw.get("m3u8_url", "")
+        if m3u8_url:
+            streams.append({"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"})
+
+        play_url_list = stream_data.get("play_url_list", [])
+        for item in play_url_list:
+            url_str = item.get("url")
+            name = item.get("name", "unknown")
+            if url_str and url_str != m3u8_url:
+                streams.append({"cdn": f"SOOP-{name}", "url": url_str, "type": "m3u8"})
+
+        if not streams:
+            return {"streams": [], "isLive": False}
+
+        anchor_name = raw.get("anchor_name", channel_id)
+        avatar = raw.get("avatar", "")
+
+        return {
+            "streams": streams,
+            "title": anchor_name,
+            "avatar": avatar,
+            "isLive": True
+        }
+    except Exception as e:
+        print(f"[SOOP] 解析异常: {e}")
         return {"streams": [], "isLive": False}
 
 
@@ -508,21 +563,19 @@ async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     loop = asyncio.get_event_loop()
 
     def on_message(ws, msg):
-    if msg.startswith("PING"):
-        ws.send("PONG :tmi.twitch.tv")
-        return
-    # 👇 添加下面这两行
-    if msg.startswith("PONG"):
-        return
-    # 👆 添加结束
-    match = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
-    if match:
-        nick = match.group(1)
-        content = match.group(2)
-        asyncio.run_coroutine_threadsafe(
-            message_queue.put({"type": "chat", "nick": nick, "content": content}),
-            loop
-        )
+        if msg.startswith("PING"):
+            ws.send("PONG :tmi.twitch.tv")
+            return
+        if msg.startswith("PONG"):
+            return
+        match = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
+        if match:
+            nick = match.group(1)
+            content = match.group(2)
+            asyncio.run_coroutine_threadsafe(
+                message_queue.put({"type": "chat", "nick": nick, "content": content}),
+                loop
+            )
 
     def on_error(ws, error):
         print(f"[Twitch IRC] 错误: {error}")
@@ -588,6 +641,8 @@ async def api_parse(url: str = Query(...)):
             return await parse_douyin(url)
         if "twitch.tv" in url:
             return await parse_twitch(url)
+        if "sooplive.com" in url:
+            return await parse_soop(url)
         raise HTTPException(400, "不支持的平台")
     except HTTPException:
         raise
