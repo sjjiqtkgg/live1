@@ -288,22 +288,23 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== Twitch 流解析（直连，不走代理） ====================
+# ==================== Twitch 流解析（健壮版，直连） ====================
 async def parse_twitch(url):
     try:
-        # 提取频道名
         match = re.search(r"twitch\.tv/([^/?]+)", url)
         if not match:
             return {"streams": [], "isLive": False}
         channel = match.group(1)
 
-        # GraphQL 获取 token 和 sig
+        # ---- 第一步：获取 access token ----
         gql_url = "https://gql.twitch.tv/gql"
         headers = {
             "Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko",
             "Content-Type": "application/json"
         }
-        payload = [{
+
+        # 先尝试持久化查询（流量更小）
+        persistent_payload = [{
             "operationName": "PlaybackAccessToken",
             "variables": {
                 "isLive": True,
@@ -320,22 +321,75 @@ async def parse_twitch(url):
             }
         }]
 
-        # 直连，不使用代理
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(gql_url, json=payload, headers=headers)
-            data = resp.json()
-            token_data = data[0]["data"]["streamPlaybackAccessToken"]
-            token = token_data["value"]
-            sig = token_data["signature"]
+            resp = await client.post(gql_url, json=persistent_payload, headers=headers)
+            if resp.status_code != 200:
+                print(f"[Twitch] GQL 状态码异常: {resp.status_code}")
+                return {"streams": [], "isLive": False}
+            try:
+                data = resp.json()
+            except Exception:
+                print("[Twitch] GQL 返回非 JSON")
+                return {"streams": [], "isLive": False}
 
-        # token 必须 URL 编码
+            token = None
+            sig = None
+
+            # 尝试从持久化查询结果中解析
+            if isinstance(data, list) and len(data) > 0:
+                d = data[0]
+                if "errors" not in d and "data" in d:
+                    token_data = d["data"].get("streamPlaybackAccessToken")
+                    if token_data:
+                        token = token_data.get("value")
+                        sig = token_data.get("signature")
+
+            # 如果持久化查询失败，用完整 query 重试
+            if not token:
+                print("[Twitch] 持久化查询未返回 token，尝试完整 GraphQL 查询")
+                full_payload = [{
+                    "operationName": "PlaybackAccessToken",
+                    "variables": {
+                        "isLive": True,
+                        "login": channel,
+                        "isVod": False,
+                        "vodID": "",
+                        "playerType": "site"
+                    },
+                    "query": """
+                    query PlaybackAccessToken($login: String!, $isLive: Boolean!, $isVod: Boolean!, $vodID: ID!, $playerType: String!) {
+                      streamPlaybackAccessToken(channelName: $login, params: {
+                        platform: "web",
+                        playerType: $playerType,
+                        playerBackend: "mediaplayer"
+                      }) {
+                        value
+                        signature
+                      }
+                    }
+                    """
+                }]
+                resp = await client.post(gql_url, json=full_payload, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        token_data = data[0].get("data", {}).get("streamPlaybackAccessToken")
+                        if token_data:
+                            token = token_data.get("value")
+                            sig = token_data.get("signature")
+
+            if not token or not sig:
+                print("[Twitch] 未获取到 token 或 sig")
+                return {"streams": [], "isLive": False}
+
+        # ---- 第二步：拼接 usher 地址（token 必须编码） ----
         encoded_token = quote(token, safe='')
         m3u8_url = (
             f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8"
             f"?sig={sig}&token={encoded_token}&allow_source=true&allow_audio_only=true"
         )
 
-        # 获取 m3u8 并检查是否包含有效流
+        # ---- 第三步：验证 usher 返回是否包含有效流 ----
         async with httpx.AsyncClient(timeout=15) as client:
             usher_resp = await client.get(m3u8_url, headers={
                 "User-Agent": UA,
@@ -345,11 +399,10 @@ async def parse_twitch(url):
                 return {"streams": [], "isLive": False}
             m3u8_text = usher_resp.text
             if "#EXT-X-STREAM-INF" not in m3u8_text:
-                # 频道未开播或返回空列表
+                print("[Twitch] m3u8 中无有效视频流")
                 return {"streams": [], "isLive": False}
 
         streams = [{"cdn": "Twitch", "url": m3u8_url, "type": "m3u8"}]
-
         return {
             "streams": streams,
             "title": channel,
@@ -428,7 +481,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         task.cancel()
 
 
-# ==================== Twitch 弹幕 WebSocket（暂时留空，可后续添加） ====================
+# ==================== Twitch 弹幕 WebSocket ====================
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     await websocket.accept()
