@@ -59,7 +59,7 @@ async def request_with_retry(method: str, url: str, **kwargs):
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
-    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com"]
+    ALLOWED = ["douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn", "douyin.com", "live.bilibili.com", "douyinpic.com", "huyaimg.com", "twitch.tv", "twitchsvc.net", "jtvnw.net"]
     if not any(d in url for d in ALLOWED):
         raise HTTPException(403, "domain not allowed")
     body = await request.body() if request.method == "POST" else None
@@ -353,6 +353,65 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         task.cancel()
 
 
+
+# ==================== Twitch ====================
+async def parse_twitch(url):
+    try:
+        from streamget import TwitchLiveStream
+        channel = url.rstrip("/").split("/")[-1].split("?")[0]
+        live = TwitchLiveStream()
+        data = await live.fetch_web_stream_data(url, process_data=True)
+        if not data.get("is_live"):
+            return {"streams": [], "isLive": False}
+        stream_obj = await live.fetch_stream_url(data, "OD")
+        raw = json.loads(stream_obj.to_json())
+        streams = []
+        if raw.get("m3u8_url"):
+            streams.append({"cdn": "HLS", "url": raw["m3u8_url"], "type": "m3u8"})
+        if not streams:
+            return {"streams": [], "isLive": False}
+        return {
+            "streams": streams,
+            "title": raw.get("anchor_name", channel),
+            "avatar": raw.get("avatar", ""),
+            "channel": channel,
+            "isLive": True
+        }
+    except Exception as e:
+        print(f"[Twitch] 解析异常: {e}")
+        return {"streams": [], "isLive": False}
+
+
+# ==================== 抖音签名接口（供前端直连用）====================
+@app.get("/api/douyin/sign")
+async def douyin_sign(room_id: str = Query(...)):
+    user_unique_id = str(random.randint(1000000000000000000, 9999999999999999999))
+    base_ws_url = (
+        f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/"
+        f"?app_name=douyin_web&version_code=180800&webcast_sdk_version=1.0.14"
+        f"&update_version_code=1.0.14&compress=gzip&internal_ext=internal_src:dim"
+        f"|wss_push_room_id:{room_id}|wss_push_did:0|first_req_ms:{int(time.time()*1000)}"
+        f"|fetch_time:{int(time.time()*1000)}|seq:1|wss_info:0-0-0-0"
+        f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&debug=false"
+        f"&endpoint=live&support_wrds=1&im_path=/webcast/im/fetch/&user_unique_id={user_unique_id}"
+        f"&device_platform=web&cookie_enabled=true&screen_width=1920&screen_height=1080"
+        f"&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome"
+        f"&browser_version=120.0.0.0&browser_online=true&tz_name=Asia/Shanghai"
+        f"&identity=audience&room_id={room_id}&heartbeatDuration=0"
+    )
+    params_order = ("live_id", "aid", "version_code", "webcast_sdk_version",
+                    "room_id", "sub_room_id", "sub_channel_id", "did_rule",
+                    "user_unique_id", "device_platform", "device_type", "ac", "identity")
+    parsed = urlparse(base_ws_url)
+    qs_dict = parse_qs(parsed.query)
+    wss_maps = {k: v[0] if isinstance(v, list) else v for k, v in qs_dict.items()}
+    param_str = ','.join(f"{p}={wss_maps.get(p, '')}" for p in params_order)
+    md5_str = hashlib.md5(param_str.encode()).hexdigest()
+    signature = get_douyin_signature(md5_str)
+    ws_url = f"{base_ws_url}&signature={signature}"
+    return {"wsUrl": ws_url}
+
+
 @app.get("/api/parse")
 async def api_parse(url: str = Query(...)):
     try:
@@ -364,6 +423,8 @@ async def api_parse(url: str = Query(...)):
             return await parse_bilibili(url)
         if "douyin.com" in url:
             return await parse_douyin(url)
+        if "twitch.tv" in url:
+            return await parse_twitch(url)
         raise HTTPException(400, "不支持的平台")
     except HTTPException:
         raise
