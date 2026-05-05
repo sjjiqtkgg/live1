@@ -511,6 +511,8 @@ async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
         if msg.startswith("PING"):
             ws.send("PONG :tmi.twitch.tv")
             return
+        if msg.startswith("PONG"):
+            return
         match = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
         if match:
             nick = match.group(1)
