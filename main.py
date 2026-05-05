@@ -508,19 +508,21 @@ async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     loop = asyncio.get_event_loop()
 
     def on_message(ws, msg):
-        if msg.startswith("PING"):
-            ws.send("PONG :tmi.twitch.tv")
-            return
-        if msg.startswith("PONG"):
-            return
-        match = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
-        if match:
-            nick = match.group(1)
-            content = match.group(2)
-            asyncio.run_coroutine_threadsafe(
-                message_queue.put({"type": "chat", "nick": nick, "content": content}),
-                loop
-            )
+    if msg.startswith("PING"):
+        ws.send("PONG :tmi.twitch.tv")
+        return
+    # 👇 添加下面这两行
+    if msg.startswith("PONG"):
+        return
+    # 👆 添加结束
+    match = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
+    if match:
+        nick = match.group(1)
+        content = match.group(2)
+        asyncio.run_coroutine_threadsafe(
+            message_queue.put({"type": "chat", "nick": nick, "content": content}),
+            loop
+        )
 
     def on_error(ws, error):
         print(f"[Twitch IRC] 错误: {error}")
