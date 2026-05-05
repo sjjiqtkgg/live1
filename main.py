@@ -432,41 +432,46 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 流解析（纯自实现，不再使用 SoopLiveStream） ====================
+# ==================== SOOP 流解析（修正参数 bid / bno） ====================
 async def parse_soop(url):
     try:
+        # 正确提取：bid 是主播用户 ID，bno 是房间号
         parts = url.rstrip("/").split("/")
-        if len(parts) < 4:
+        if len(parts) >= 5:
+            bid = parts[-2]
+            bno = parts[-1]
+        elif len(parts) == 4:
+            bid = parts[-1]
+            bno = ""
+        else:
             return {"streams": [], "isLive": False}
-        bj_id = parts[-1]
 
-        # 外网代理
+        # 外网代理（若已配置则使用）
         proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
-        print(f"[SOOP DEBUG] 使用代理: {proxy}, 开始解析 bj_id: {bj_id}")
+        print(f"[SOOP DEBUG] 使用代理: {proxy}, bid={bid}, bno={bno}")
 
+        # 1. 获取主播昵称
         headers = {
             "User-Agent": UA,
             "Referer": "https://play.sooplive.com",
             "Accept": "application/json"
         }
-
-        # 1. 用 get_station_status 获取主播昵称
-        info_url = f"https://st.sooplive.com/api/get_station_status.php?szBjId={bj_id}"
         try:
+            info_url = f"https://st.sooplive.com/api/get_station_status.php?szBjId={bid}"
             info_resp = await request_with_proxy_group("GET", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers)
             if info_resp.status_code == 200:
                 info_data = info_resp.json()
-                anchor_name = info_data.get("DATA", {}).get("user_nick", bj_id)
+                anchor_name = info_data.get("DATA", {}).get("user_nick", bid)
             else:
-                anchor_name = bj_id
+                anchor_name = bid
         except Exception:
-            anchor_name = bj_id
+            anchor_name = bid
 
-        # 2. 用 player_live_api 获取开播状态和流地址
+        # 2. 用 player_live_api 获取开播状态和流地址（参数必须传 bid 和 bno）
         api_url = "https://live.sooplive.com/afreeca/player_live_api.php"
         form_data = {
-            "bid": bj_id,
-            "bno": "",
+            "bid": bid,
+            "bno": bno,
             "type": "",
             "pwd": "",
             "player_type": "html5",
@@ -490,10 +495,10 @@ async def parse_soop(url):
         result = resp.json()
         channel = result.get("CHANNEL", {})
         if channel.get("RESULT") != 1:
-            print(f"[SOOP DEBUG] 主播未开播")
+            print(f"[SOOP DEBUG] 主播未开播, RESULT={channel.get('RESULT')}")
             return {"streams": [], "isLive": False}
 
-        rmd = channel.get("RMD")   # 流地址
+        rmd = channel.get("RMD")   # 流地址（m3u8）
         if not rmd:
             return {"streams": [], "isLive": False}
 
@@ -503,7 +508,7 @@ async def parse_soop(url):
 
         return {
             "streams": streams,
-            "title": f"{anchor_name}-{bj_id}",
+            "title": f"{anchor_name}-{bid}",
             "avatar": "",
             "isLive": True
         }
