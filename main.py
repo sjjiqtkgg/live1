@@ -498,8 +498,8 @@ async def parse_soop(url):
         if not rmd:
             return {"streams": [], "isLive": False}
 
-        proxy_stream_url = f"/api/proxy?url={quote(rmd, safe='')}&referer=https://play.sooplive.com"
-        streams = [{"cdn": "SOOP-Source", "url": proxy_stream_url, "type": "m3u8"}]
+        proxy_url = f"{request_base_url}/api/proxy?url={quote(rmd, safe='')}&referer=https://play.sooplive.com"
+        streams = [{"cdn": "SOOP-Source", "url": proxy_url, "type": "m3u8"}]
 
         print(f"[SOOP DEBUG] 成功获取流: {rmd[:80]}...")
 
