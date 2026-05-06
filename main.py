@@ -3,23 +3,25 @@ import re
 import os
 import httpx
 import asyncio
+import websockets
 import threading
 import time
 import hashlib
 import base64
 import random
 import execjs
-import websocket
 import ssl
 import traceback
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs, quote
-from protobuf import douyin
 
 # 仅保留 SOOP 支持（如不需要可删除）
-from streamget.platforms.soop.live_stream import SoopLiveStream
+try:
+    from streamget.platforms.soop.live_stream import SoopLiveStream
+except ImportError:
+    SoopLiveStream = None
 
 try:
     from python_socks.sync import Proxy
@@ -442,7 +444,6 @@ async def parse_soop(url):
 # ==================== PandaTV 流解析（调试增强版） ====================
 async def parse_panda(url):
     try:
-        # 提取用户 ID
         user_id = url.split('?')[0].rstrip('/').split('/')[-1]
         proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
         print(f"[PandaTV] 开始解析, 代理={proxy}, 用户ID={user_id}")
@@ -453,7 +454,6 @@ async def parse_panda(url):
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
         }
 
-        # 第一步：获取主播信息
         info_url = 'https://api.pandalive.co.kr/v1/member/bj'
         data = {'userId': user_id, 'info': 'media fanGrade'}
         resp = await request_with_proxy_group("POST", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data)
@@ -473,7 +473,6 @@ async def parse_panda(url):
         if not is_live:
             return {"streams": [], "isLive": False}
 
-        # 第二步：获取直播流地址
         play_url = 'https://api.pandalive.co.kr/v1/live/play'
         data2 = {'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''}
         resp2 = await request_with_proxy_group("POST", play_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data2)
@@ -489,7 +488,6 @@ async def parse_panda(url):
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
         print(f"[PandaTV] 真实流地址: {real_m3u8[:80]}...")
 
-        # 第三步：包装成后端代理地址
         self_api_base = os.getenv("RENDER_EXTERNAL_URL", "https://live1-cxe9.onrender.com")
         proxy_url = f"{self_api_base}/api/proxy?url={quote(real_m3u8, safe='')}&referer=https://www.pandalive.co.kr"
         streams = [{"cdn": "PandaTV-Source", "url": proxy_url, "type": "m3u8"}]
@@ -517,21 +515,17 @@ def get_douyin_signature(md5_str: str) -> str:
         return ""
 
 
-@app.websocket("/ws/douyin/{room_id}")
-import asyncio
-import websockets
-from fastapi import WebSocket, WebSocketDisconnect
-
+# ==================== 抖音弹幕 WebSocket 代理（转发到本地 douyinLive 服务）====================
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
+    """WebSocket 代理：前端 ↔ douyinLive Go 服务"""
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕代理: room_id={room_id}")
 
-    # 连接到本地 Go 服务（douyinLive 默认端口 1088）
     go_ws_url = f"ws://localhost:1088/ws/{room_id}"
     try:
         async with websockets.connect(go_ws_url) as go_ws:
-            print(f"[WS] 已连接到 Go 服务: {go_ws_url}")
+            print(f"[WS] 已连接 Go 服务: {go_ws_url}")
 
             async def forward_to_go():
                 try:
@@ -556,12 +550,12 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
 
             # 双向转发
             await asyncio.gather(forward_to_go(), forward_to_frontend())
-
     except Exception as e:
         print(f"[WS] 无法连接 Go 服务: {e}")
         await websocket.close(code=1011)
 
 
+# ==================== Twitch 弹幕 WebSocket 代理 ====================
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     await websocket.accept()
