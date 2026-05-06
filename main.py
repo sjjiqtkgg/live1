@@ -173,7 +173,7 @@ async def parse_huya(url):
         if not streams:
             return {"streams": [], "isLive": False}
         profile = live.get("profileRoom", {})
-        anchor_name = profile.get("nick") or live.get("roomInfo", {}).get("nick") or "虎牙主播"
+        anchor_name = profile.get("nick") or live.get("roomInfo", {}).get("nick") or f"房间 {room_id}"
         avatar = profile.get("avatar", "")
         danmaku = await fetch_huya_danmaku_params(room_id)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
