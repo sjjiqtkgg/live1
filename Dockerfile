@@ -3,6 +3,7 @@ FROM ghcr.io/jwwsjlm/douyinlive:latest AS douyinlive
 
 # ---- Stage 2: 构建我们的 Python 服务 ----
 FROM python:3.11-slim
+ARG CACHE_BUST=3
 
 # 安装系统工具
 RUN apt-get update && apt-get install -y --no-install-recommends \
