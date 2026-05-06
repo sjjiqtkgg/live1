@@ -173,6 +173,7 @@ async def parse_huya(url):
         if not streams:
             return {"streams": [], "isLive": False}
         profile = live.get("profileRoom", {})
+        # ✅ 修复：取不到主播名时用房间号
         anchor_name = profile.get("nick") or live.get("roomInfo", {}).get("nick") or f"房间 {room_id}"
         avatar = profile.get("avatar", "")
         danmaku = await fetch_huya_danmaku_params(room_id)
@@ -479,4 +480,5 @@ def root(): return {"status": "ok", "message": "多平台直播解析 API"}
 async def health_check(): return {"status": "alive"}
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
