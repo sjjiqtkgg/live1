@@ -92,13 +92,18 @@ async def request_with_proxy_group(method: str, url: str, proxy_list: list, **kw
 
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
+    # 允许的域名后缀列表（使用 endswith 进行精确匹配，避免误伤）
     ALLOWED = [
-        "douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn",
-        "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net",
-        "sooplive.com", "sooplive.net", "sooplivecdn.com", "livestream-manager.sooplive.com",
-        "pandalive.co.kr"
+        ".douyu.com", ".huya.com", ".bilibili.com", ".bilivideo.com", ".douyucdn.cn",
+        ".douyin.com", ".live.bilibili.com", ".twitch.tv", ".ttvnw.net",
+        ".sooplive.com", ".sooplive.net", ".sooplivecdn.com",
+        ".pandalive.co.kr",
+        # 以下是 SOOP 和 PandaTV 可能的流媒体分发域名，统一使用 .sooplive 或 .pandalive 结尾
+        # 如果你的实际流地址是 https://xxx.mm.sooplive.com 这种，也会被 .sooplive.com 匹配
+        # 如果不放心，可以保留 in 判断作为备选，但 endswith 更安全
     ]
-    if not any(d in url for d in ALLOWED):
+    # 检查域名是否为允许的后缀
+    if not any(urlparse(url).hostname.endswith(domain) for domain in ALLOWED):
         raise HTTPException(403, "domain not allowed")
 
     body = await request.body() if request.method == "POST" else None
@@ -436,62 +441,79 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 
-# ==================== SOOP 解析（暂时留空或删除） ====================
+# ==================== SOOP 解析 ====================
 async def parse_soop(url):
-    return {"streams": [], "isLive": False}
+    try:
+        if SoopLiveStream is None:
+            return {"streams": [], "isLive": False}
+        live = SoopLiveStream()
+        data = await live.fetch_web_stream_data(url, process_data=True)
+        stream_obj = await live.fetch_stream_url(data, "OD")
+        raw = json.loads(stream_obj.to_json())
+        streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
+        return {
+            "streams": streams,
+            "title": raw.get("anchor_name", "SOOP主播"),
+            "avatar": raw.get("avatar", ""),
+            "isLive": raw.get("is_live", False)
+        }
+    except Exception as e:
+        print(f"[SOOP] 解析异常: {e}")
+        return {"streams": [], "isLive": False}
 
 
-# ==================== PandaTV 流解析（调试增强版） ====================
+# ==================== PandaTV 流解析（使用 streamget）====================
 async def parse_panda(url):
     try:
-        user_id = url.split('?')[0].rstrip('/').split('/')[-1]
-        proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
-        print(f"[PandaTV] 开始解析, 代理={proxy}, 用户ID={user_id}")
+        # 尝试使用 streamget 的 PandaTvLiveStream
+        from streamget.platforms.pandatv.live_stream import PandaTvLiveStream
+        live = PandaTvLiveStream()
+        data = await live.fetch_web_stream_data(url, process_data=True)
+        stream_obj = await live.fetch_stream_url(data, "OD")
+        raw = json.loads(stream_obj.to_json())
+        streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
+        return {
+            "streams": streams,
+            "title": raw.get("anchor_name", "PandaTV主播"),
+            "avatar": raw.get("avatar", ""),
+            "isLive": raw.get("is_live", False)
+        }
+    except Exception as e:
+        print(f"[PandaTV] streamget 解析失败: {e}，回退到手动 API 解析")
+        # 回退到原来的手动 API 解析
+        return await parse_panda_manual(url)
 
+
+async def parse_panda_manual(url):
+    try:
+        user_id = url.split('?')[0].rstrip('/').split('/')[-1]
         headers = {
             'origin': 'https://www.pandalive.co.kr',
             'referer': 'https://www.pandalive.co.kr/',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
         }
-
         info_url = 'https://api.pandalive.co.kr/v1/member/bj'
         data = {'userId': user_id, 'info': 'media fanGrade'}
         resp = await request_with_proxy_group("POST", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data)
-        print(f"[PandaTV] 第一步状态码: {resp.status_code}")
         if resp.status_code != 200:
-            print(f"[PandaTV] 第一步响应: {resp.text[:200]}")
             return {"streams": [], "isLive": False}
-
         info_json = resp.json()
         if 'bjInfo' not in info_json:
-            print(f"[PandaTV] 返回数据异常: {json.dumps(info_json, ensure_ascii=False)[:200]}")
             return {"streams": [], "isLive": False}
         anchor_name = info_json['bjInfo']['nick']
         is_live = 'media' in info_json
-        print(f"[PandaTV] 主播: {anchor_name}, 是否直播: {is_live}")
-
         if not is_live:
             return {"streams": [], "isLive": False}
-
         play_url = 'https://api.pandalive.co.kr/v1/live/play'
         data2 = {'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''}
         resp2 = await request_with_proxy_group("POST", play_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data2)
-        print(f"[PandaTV] 第二步状态码: {resp2.status_code}")
         if resp2.status_code != 200:
-            print(f"[PandaTV] 第二步响应: {resp2.text[:200]}")
             return {"streams": [], "isLive": False}
-
         play_json = resp2.json()
         if 'PlayList' not in play_json or 'hls' not in play_json['PlayList']:
-            print(f"[PandaTV] 播放列表异常: {json.dumps(play_json, ensure_ascii=False)[:200]}")
             return {"streams": [], "isLive": False}
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
-        print(f"[PandaTV] 真实流地址: {real_m3u8[:80]}...")
-
-        self_api_base = os.getenv("RENDER_EXTERNAL_URL", "https://live1-cxe9.onrender.com")
-        proxy_url = f"{self_api_base}/api/proxy?url={quote(real_m3u8, safe='')}&referer=https://www.pandalive.co.kr"
-        streams = [{"cdn": "PandaTV-Source", "url": proxy_url, "type": "m3u8"}]
-
+        streams = [{"cdn": "PandaTV-Source", "url": real_m3u8, "type": "m3u8"}]
         return {
             "streams": streams,
             "title": f"{anchor_name}-{user_id}",
@@ -499,7 +521,7 @@ async def parse_panda(url):
             "isLive": True
         }
     except Exception as e:
-        print(f"[PandaTV] 发生异常: {e}")
+        print(f"[PandaTV] 手动解析异常: {e}")
         traceback.print_exc()
         return {"streams": [], "isLive": False}
 
