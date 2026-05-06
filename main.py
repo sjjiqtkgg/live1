@@ -445,11 +445,15 @@ async def parse_twitch(url):
 async def parse_soop(url):
     try:
         if SoopLiveStream is None:
+            print("[SOOP] SoopLiveStream 未导入")
             return {"streams": [], "isLive": False}
         live = SoopLiveStream()
+        print(f"[SOOP] 开始获取 stream data, url={url}")
         data = await live.fetch_web_stream_data(url, process_data=True)
+        print(f"[SOOP] 获取到 data 类型: {type(data)}, 内容前200: {str(data)[:200]}")
         stream_obj = await live.fetch_stream_url(data, "OD")
         raw = json.loads(stream_obj.to_json())
+        print(f"[SOOP] 流信息: {json.dumps(raw, ensure_ascii=False)[:300]}")
         streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
         return {
             "streams": streams,
@@ -459,6 +463,8 @@ async def parse_soop(url):
         }
     except Exception as e:
         print(f"[SOOP] 解析异常: {e}")
+        import traceback
+        traceback.print_exc()
         return {"streams": [], "isLive": False}
 
 
