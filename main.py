@@ -2,8 +2,6 @@ import json
 import re
 import os
 import httpx
-import asyncio
-import websockets
 import threading
 import time
 import hashlib
@@ -366,70 +364,12 @@ async def api_parse(url: str = Query(...)):
     except HTTPException: raise
     except Exception as e: raise HTTPException(500, str(e))
 
-# ==================== 抖音弹幕代理（修复心跳） ====================
-@app.websocket("/ws/douyin/{room_id}")
-async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
-    await websocket.accept()
-    print(f"[WS] 前端连接抖音弹幕代理: room_id={room_id}")
-    go_ws_url = f"ws://localhost:1088/ws/{room_id}"
-    go_ws = None
-    heartbeat_task = None
-    try:
-        go_ws = await websockets.connect(go_ws_url)
-        print(f"[WS] 已连接 Go 服务")
-
-        async def heartbeat():
-            try:
-                while True:
-                    await asyncio.sleep(20)
-                    if go_ws is not None and go_ws.state.name == 'OPEN':
-                        await go_ws.send("ping")
-                        print("[WS] 发送心跳 ping")
-                    else:
-                        break
-            except Exception as e:
-                print(f"[WS] 心跳任务结束: {e}")
-
-        heartbeat_task = asyncio.create_task(heartbeat())
-
-        async def forward_to_go():
-            try:
-                while True:
-                    data = await websocket.receive_text()
-                    if go_ws is not None and go_ws.state.name == 'OPEN':
-                        await go_ws.send(data)
-                    else:
-                        break
-            except WebSocketDisconnect:
-                print("[WS] 前端断开")
-            except Exception as e:
-                print(f"[WS] forward_to_go error: {e}")
-
-        async def forward_to_frontend():
-            try:
-                while True:
-                    data = await go_ws.recv()
-                    if isinstance(data, bytes):
-                        data = data.decode("utf-8")
-                    await websocket.send_text(data)
-            except Exception as e:
-                print(f"[WS] forward_to_frontend error: {e}")
-
-        await asyncio.gather(forward_to_go(), forward_to_frontend(), heartbeat_task)
-    except Exception as e:
-        print(f"[WS] 无法连接 Go 服务: {e}")
-    finally:
-        if heartbeat_task and not heartbeat_task.done():
-            heartbeat_task.cancel()
-        if go_ws is not None:
-            await go_ws.close()
-        await websocket.close(code=1011)
-
 # ==================== Twitch 弹幕代理 ====================
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     await websocket.accept()
     print(f"[WS] 前端连接 Twitch 弹幕: {channel_name}")
+    import asyncio
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
