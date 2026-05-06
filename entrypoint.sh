@@ -1,14 +1,12 @@
 #!/bin/bash
 set -e
 
-echo "Starting douyinLive container..."
-# 在 Render 容器内运行官方镜像，并映射 1088 端口
-docker run -d --name douyinlive \
-    --restart unless-stopped \
-    -p 1088:1088 \
-    ghcr.io/jwwsjlm/douyinlive:latest
+echo "Starting douyinLive service..."
+# 后台启动 Go 弹幕服务，监听 1088 端口
+/usr/local/bin/douyinLive &
 
-sleep 3  # 等待服务启动
+# 等待服务完全启动（可适当延长）
+sleep 5
 
 echo "Starting FastAPI..."
 exec uvicorn main:app --host 0.0.0.0 --port 8000
