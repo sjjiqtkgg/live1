@@ -1,0 +1,7 @@
+port: "1088"
+unknown: false
+monitor:
+  poll_interval: "10s"
+  notify_interval: "15s"
+cookie:
+  douyin: ""
