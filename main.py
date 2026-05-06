@@ -566,6 +566,22 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         async with websockets.connect(go_ws_url) as go_ws:
             print(f"[WS] 已连接 Go 服务: {go_ws_url}")
 
+            # ===== 新增：独立心跳任务 =====
+            async def heartbeat():
+                """每隔20秒向Go服务发送ping，保持连接活跃"""
+                try:
+                    while True:
+                        await asyncio.sleep(20)
+                        if go_ws.open:
+                            await go_ws.send("ping")
+                            print("[WS] 发送心跳 ping")
+                except Exception as e:
+                    print(f"[WS] 心跳任务结束: {e}")
+
+            # 启动心跳任务
+            heartbeat_task = asyncio.create_task(heartbeat())
+            # ===== 新增结束 =====
+
             async def forward_to_go():
                 try:
                     while True:
@@ -587,8 +603,12 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                 except Exception as e:
                     print(f"[WS] forward_to_frontend error: {e}")
 
-            # 双向转发
-            await asyncio.gather(forward_to_go(), forward_to_frontend())
+            # 双向转发 + 心跳
+            await asyncio.gather(
+                forward_to_go(),
+                forward_to_frontend(),
+                heartbeat_task
+            )
     except Exception as e:
         print(f"[WS] 无法连接 Go 服务: {e}")
         await websocket.close(code=1011)
