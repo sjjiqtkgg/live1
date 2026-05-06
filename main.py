@@ -518,56 +518,48 @@ def get_douyin_signature(md5_str: str) -> str:
 
 
 @app.websocket("/ws/douyin/{room_id}")
+import asyncio
+import websockets
+from fastapi import WebSocket, WebSocketDisconnect
+
+@app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
-    from douyin_barrage import DouyinBarrageCollector
-    print(f"[WS] 前端连接抖音弹幕: {room_id}")
+    print(f"[WS] 前端连接抖音弹幕代理: room_id={room_id}")
 
-    ttwid = ""
+    # 连接到本地 Go 服务（douyinLive 默认端口 1088）
+    go_ws_url = f"ws://localhost:1088/ws/{room_id}"
     try:
-        resp = await request_with_retry("GET", f"https://live.douyin.com/{room_id}", headers={"User-Agent": UA})
-        ttwid = resp.cookies.get("ttwid", "")
-    except Exception:
-        pass
-    print(f"[ttwid] 使用: {ttwid[:10] if ttwid else '自动生成'}...")
+        async with websockets.connect(go_ws_url) as go_ws:
+            print(f"[WS] 已连接到 Go 服务: {go_ws_url}")
 
-    stop_event = threading.Event()
-    message_queue = asyncio.Queue()
+            async def forward_to_go():
+                try:
+                    while True:
+                        data = await websocket.receive_text()
+                        if go_ws.open:
+                            await go_ws.send(data)
+                except WebSocketDisconnect:
+                    print("[WS] 前端断开")
+                except Exception as e:
+                    print(f"[WS] forward_to_go error: {e}")
 
-    def callback(msg):
-        asyncio.run_coroutine_threadsafe(message_queue.put(msg), loop)
+            async def forward_to_frontend():
+                try:
+                    while True:
+                        data = await go_ws.recv()
+                        if isinstance(data, bytes):
+                            data = data.decode("utf-8")
+                        await websocket.send_text(data)
+                except Exception as e:
+                    print(f"[WS] forward_to_frontend error: {e}")
 
-    collector = DouyinBarrageCollector(room_id, ttwid, callback)
-    loop = asyncio.get_event_loop()
-    task = loop.run_in_executor(None, collector.start)
+            # 双向转发
+            await asyncio.gather(forward_to_go(), forward_to_frontend())
 
-    async def send_worker():
-        while not stop_event.is_set():
-            try:
-                msg = await asyncio.wait_for(message_queue.get(), timeout=1.0)
-                await websocket.send_json(msg)
-            except asyncio.TimeoutError:
-                continue
-            except Exception:
-                break
-
-    send_task = asyncio.create_task(send_worker())
-    try:
-        while True:
-            data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_text("pong")
-    except WebSocketDisconnect:
-        print(f"[WS] 前端断开抖音弹幕: {room_id}")
-    finally:
-        stop_event.set()
-        collector.stop_event.set()
-        send_task.cancel()
-        try:
-            await send_task
-        except:
-            pass
-        task.cancel()
+    except Exception as e:
+        print(f"[WS] 无法连接 Go 服务: {e}")
+        await websocket.close(code=1011)
 
 
 @app.websocket("/ws/twitch/{channel_name}")
