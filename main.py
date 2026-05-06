@@ -17,7 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs, quote
 
-# 仅保留 SOOP 支持（如不需要可删除）
 try:
     from streamget.platforms.soop.live_stream import SoopLiveStream
 except ImportError:
@@ -36,29 +35,16 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
 
-# ==================== 国内代理列表 ====================
+# ==================== 代理配置 ====================
 PROXY_LIST_STR = os.getenv("PROXY_LIST", "")
-PROXY_URLS = []
-if PROXY_LIST_STR:
-    PROXY_LIST_STR = PROXY_LIST_STR.strip().strip('"').strip("'")
-    PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()]
-    print(f"[代理] 国内代理 {len(PROXY_URLS)} 个: {PROXY_URLS}")
-else:
-    print("[代理] 未设置国内代理，直连")
-    PROXY_URLS = [None]
+PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()] if PROXY_LIST_STR else [None]
+print(f"[代理] 国内代理 {len(PROXY_URLS)} 个: {PROXY_URLS}")
 
-# ==================== 外网代理列表 ====================
 EXTERNAL_PROXY_LIST_STR = os.getenv("EXTERNAL_PROXY_LIST", "")
-EXTERNAL_PROXY_URLS = []
-if EXTERNAL_PROXY_LIST_STR:
-    EXTERNAL_PROXY_URLS = [p.strip() for p in EXTERNAL_PROXY_LIST_STR.split(",") if p.strip()]
-    print(f"[代理] 外网代理 {len(EXTERNAL_PROXY_URLS)} 个: {EXTERNAL_PROXY_URLS}")
-else:
-    print("[代理] 未设置外网代理，外网平台将直连")
-    EXTERNAL_PROXY_URLS = [None]
+EXTERNAL_PROXY_URLS = [p.strip() for p in EXTERNAL_PROXY_LIST_STR.split(",") if p.strip()] if EXTERNAL_PROXY_LIST_STR else [None]
+print(f"[代理] 外网代理 {len(EXTERNAL_PROXY_URLS)} 个: {EXTERNAL_PROXY_URLS}")
 
-
-async def request_with_retry(method: str, url: str, **kwargs):
+async def request_with_retry(method, url, **kwargs):
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     for idx, proxy in enumerate(PROXY_URLS):
@@ -66,15 +52,13 @@ async def request_with_retry(method: str, url: str, **kwargs):
             print(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
             async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
                 resp = await client.request(method, url, **kwargs)
-                print(f"[请求重试] 成功")
                 return resp
         except Exception as e:
             last_error = e
             print(f"[请求重试] 失败: {e}")
     raise last_error or Exception("所有代理均失败")
 
-
-async def request_with_proxy_group(method: str, url: str, proxy_list: list, **kwargs):
+async def request_with_proxy_group(method, url, proxy_list, **kwargs):
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     for idx, proxy in enumerate(proxy_list):
@@ -82,23 +66,21 @@ async def request_with_proxy_group(method: str, url: str, proxy_list: list, **kw
             print(f"[分组请求] 尝试代理 [{idx+1}/{len(proxy_list)}]: {proxy or '直连'}")
             async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
                 resp = await client.request(method, url, **kwargs)
-                print(f"[分组请求] 成功")
                 return resp
         except Exception as e:
             last_error = e
             print(f"[分组请求] 失败: {e}")
     raise last_error or Exception("所有代理均失败")
 
-
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
     ALLOWED = [
-        "douyu.com", "huya.com", "bilibili.com", "bilivideo.com", "douyucdn.cn",
-        "douyin.com", "live.bilibili.com", "twitch.tv", "ttvnw.net",
-        "sooplive.com", "sooplive.net", "sooplivecdn.com", "livestream-manager.sooplive.com",
-        "pandalive.co.kr"
+        ".douyu.com", ".huya.com", ".bilibili.com", ".bilivideo.com", ".douyucdn.cn",
+        ".douyin.com", ".live.bilibili.com", ".twitch.tv", ".ttvnw.net",
+        ".sooplive.com", ".sooplive.net", ".sooplivecdn.com",
+        ".pandalive.co.kr",
     ]
-    if not any(d in url for d in ALLOWED):
+    if not any(urlparse(url).hostname.endswith(domain) for domain in ALLOWED):
         raise HTTPException(403, "domain not allowed")
 
     body = await request.body() if request.method == "POST" else None
@@ -106,17 +88,13 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    EXTERNAL_DOMAINS = [
-        "twitch.tv", "ttvnw.net", "sooplive.com", "livestream-manager.sooplive.com",
-        "pandalive.co.kr"
-    ]
-    use_external = any(domain in url for domain in EXTERNAL_DOMAINS)
+    EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "livestream-manager.sooplive.com", "pandalive.co.kr"]
+    use_external = any(d in url for d in EXTERNAL_DOMAINS)
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
 
     resp = await request_with_proxy_group(request.method, url, proxy_list=proxy_list, headers=headers, content=body)
     out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": resp.headers.get("content-type", "application/json")}
     return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
-
 
 def build_streams(flv, m3u8):
     s = []
@@ -126,22 +104,20 @@ def build_streams(flv, m3u8):
         s.append({"cdn": "HLS", "url": m3u8, "type": "m3u8"})
     return s
 
-
 # ==================== 虎牙 ====================
 async def fetch_huya_danmaku_params(room_id):
     try:
         resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
-            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile", "Referer": "https://www.huya.com/"})
+            headers={"User-Agent": MOBILE_UA, "Referer": "https://www.huya.com/"})
         html = resp.text
-        ayyuid  = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
+        ayyuid = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
         top_sid = int((re.search(r'"lChannelId":(\d+)', html) or [None, 0])[1])
         sub_sid = int((re.search(r'"lSubChannelId":(\d+)', html) or [None, 0])[1])
         return {"platform": "huya", "ayyuid": ayyuid, "topSid": top_sid, "subSid": sub_sid}
     except Exception:
         return {}
 
-
-def huya_build_anticode(raw_anti: str, stream_name: str) -> str:
+def huya_build_anticode(raw_anti, stream_name):
     anti = raw_anti.replace("&amp;", "&")
     params = dict(p.split("=", 1) for p in anti.split("&") if "=" in p)
     fm = params.get("fm", "")
@@ -163,7 +139,6 @@ def huya_build_anticode(raw_anti: str, stream_name: str) -> str:
     params["u"] = "0"
     return "&".join(f"{k}={v}" for k, v in params.items())
 
-
 async def parse_huya(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -181,52 +156,30 @@ async def parse_huya(url):
         if not cdn_list:
             return {"streams": [], "isLive": False}
         cdn_list.sort(key=lambda s: CDN_ORDER.get(s.get("sCdnType", "ZZ"), 9))
-        streams = []
-        seen_cdns = set()
+        streams, seen = [], set()
         for s in cdn_list:
             cdn_type = s.get("sCdnType", "")
-            if cdn_type in seen_cdns:
-                continue
+            if cdn_type in seen: continue
             flv_url = s.get("sFlvUrl", "")
             stream_name = s.get("sStreamName", "")
             anti_code = s.get("sFlvAntiCode", "")
             suffix = s.get("sFlvUrlSuffix", "flv")
-            if not (flv_url and stream_name and anti_code):
-                continue
+            if not (flv_url and stream_name and anti_code): continue
             built = huya_build_anticode(anti_code, stream_name)
             full_url = f"{flv_url}/{stream_name}.{suffix}?{built}"
             label = CDN_NAMES.get(cdn_type, cdn_type or "CDN")
             streams.append({"cdn": label, "url": full_url.replace("http://", "https://"), "type": "flv"})
-            seen_cdns.add(cdn_type)
+            seen.add(cdn_type)
         if not streams:
             return {"streams": [], "isLive": False}
         profile = live.get("profileRoom", {})
-        room_info = live.get("roomInfo", {})
-        live_data = live.get("liveData", {})
-        anchor = live.get("anchor", {})
-        anchor_name = profile.get("nick") or room_info.get("nick") or live_data.get("nick") or anchor.get("nick")
-        if not anchor_name:
-            try:
-                mob_resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
-                    headers={"User-Agent": "Mozilla/5.0 (Linux; Android 11) Chrome/100 Mobile"})
-                mob_html = mob_resp.text
-                title_match = re.search(r'<title>(.*?)</title>', mob_html)
-                if title_match:
-                    anchor_name = title_match.group(1).split("_")[0].strip()
-                else:
-                    nick_match = re.search(r'"nick":"([^"]+)"', mob_html)
-                    if nick_match:
-                        anchor_name = nick_match.group(1)
-            except Exception:
-                pass
-        anchor_name = anchor_name or "虎牙主播"
-        avatar = profile.get("avatar") or room_info.get("avatar") or live_data.get("avatar") or anchor.get("avatar") or ""
+        anchor_name = profile.get("nick") or live.get("roomInfo", {}).get("nick") or "虎牙主播"
+        avatar = profile.get("avatar", "")
         danmaku = await fetch_huya_danmaku_params(room_id)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
     except Exception as e:
         print(f"[虎牙] 解析异常: {e}")
         return {"streams": [], "isLive": False}
-
 
 # ==================== 斗鱼 ====================
 async def parse_douyu(url):
@@ -236,26 +189,21 @@ async def parse_douyu(url):
         info_resp = await request_with_retry("GET", f"https://www.douyu.com/betard/{room_id}", headers=hdrs)
         info = info_resp.json()
         room = info.get("room")
-        if not room:
-            return {"streams": [], "isLive": False}
+        if not room: return {"streams": [], "isLive": False}
         if room.get("show_status") != 1 or room.get("videoLoop") == 1:
             return {"streams": [], "isLive": False}
         real_id = str(room["room_id"])
         enc_resp = await request_with_retry("GET", f"https://www.douyu.com/swf_api/homeH5Enc?rids={real_id}", headers=hdrs)
         enc = enc_resp.json()
         crptext = enc.get("data", {}).get(f"room{real_id}")
-        if not crptext:
-            return {"streams": [], "isLive": False}
+        if not crptext: return {"streams": [], "isLive": False}
         raw_av = room.get("room_icon") or room.get("avatar") or ""
-        if isinstance(raw_av, dict):
-            raw_av = raw_av.get("big") or raw_av.get("middle") or raw_av.get("small") or ""
+        if isinstance(raw_av, dict): raw_av = raw_av.get("big") or raw_av.get("middle") or raw_av.get("small") or ""
         return {"client": True, "crptext": crptext, "roomId": real_id,
-                "anchorName": room.get("nickname") or room.get("owner_name") or "斗鱼主播",
-                "avatar": raw_av, "isLive": True}
+                "anchorName": room.get("nickname") or "斗鱼主播", "avatar": raw_av, "isLive": True}
     except Exception as e:
         print(f"[斗鱼] 解析异常: {e}")
         return {"streams": [], "isLive": False}
-
 
 # ==================== B站 ====================
 async def parse_bilibili(url):
@@ -264,17 +212,14 @@ async def parse_bilibili(url):
         hdrs = {"User-Agent": UA, "Referer": "https://live.bilibili.com/"}
         room_resp = await request_with_retry("GET", f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={rid}", headers=hdrs)
         room_data = room_resp.json()
-        if room_data.get("code") != 0:
-            return {"streams": [], "isLive": False}
+        if room_data.get("code") != 0: return {"streams": [], "isLive": False}
         real_rid = room_data["data"]["room_id"]
-        if room_data["data"].get("live_status") != 1:
-            return {"streams": [], "isLive": False}
+        if room_data["data"].get("live_status") != 1: return {"streams": [], "isLive": False}
         play_resp = await request_with_retry("GET",
             f"https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id={real_rid}&protocol=0,1&format=0,1,2&codec=0,1&qn=10000&platform=web&ptype=8",
             headers=hdrs)
         play = play_resp.json()
-        if play.get("code") != 0:
-            return {"streams": [], "isLive": False}
+        if play.get("code") != 0: return {"streams": [], "isLive": False}
         playurl = play["data"].get("playurl_info", {}).get("playurl", {})
         streams, seen = [], set()
         for stream in playurl.get("stream", []):
@@ -288,24 +233,21 @@ async def parse_bilibili(url):
                             streams.append({"cdn": f"{fmt['format_name'].upper()}-{m.group(1) if m else 'cdn'}",
                                            "url": u, "type": "flv" if fmt["format_name"] == "flv" else "m3u8"})
         streams.sort(key=lambda x: 0 if x["type"] == "flv" else 1)
-        if not streams:
-            return {"streams": [], "isLive": False}
+        if not streams: return {"streams": [], "isLive": False}
         name, avatar = "B站主播", ""
         try:
             ir_resp = await request_with_retry("GET", f"https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id={real_rid}", headers=hdrs)
             ir = ir_resp.json()
             ri = ir.get("data", {}).get("room_info", {})
-            name = ri.get("uname") or ri.get("owner_name") or name
-            avatar = ri.get("face") or avatar
-        except Exception:
-            pass
+            name = ri.get("uname") or name
+            avatar = ri.get("face") or ""
+        except Exception: pass
         return {"streams": streams[:4], "title": name, "avatar": avatar, "isLive": True}
     except Exception as e:
         print(f"[B站] 解析异常: {e}")
         return {"streams": [], "isLive": False}
 
-
-# ==================== 抖音流解析 ====================
+# ==================== 抖音 ====================
 async def parse_douyin(url):
     try:
         from streamget import DouyinLiveStream
@@ -314,357 +256,227 @@ async def parse_douyin(url):
         stream_obj = await live.fetch_stream_url(data, "OD")
         raw = json.loads(stream_obj.to_json())
         streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
-        if not streams:
-            return {"streams": [], "isLive": False}
+        if not streams: return {"streams": [], "isLive": False}
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         if not room_id.isdigit():
             try:
                 resp = await request_with_retry("GET", url, headers={"User-Agent": UA})
                 match = re.search(r'"room_id":"(\d+)"', resp.text)
-                if match:
-                    room_id = match.group(1)
-            except Exception:
-                pass
+                if match: room_id = match.group(1)
+            except Exception: pass
         return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"),
                 "avatar": raw.get("avatar", ""), "roomId": room_id, "isLive": True}
     except Exception as e:
         print(f"[抖音] 解析异常: {e}")
         return {"streams": [], "isLive": False}
 
-
-# ==================== Twitch 流解析 ====================
+# ==================== Twitch ====================
 async def parse_twitch(url):
     try:
         match = re.search(r"twitch\.tv/([^/?]+)", url)
-        if not match:
-            return {"streams": [], "isLive": False}
+        if not match: return {"streams": [], "isLive": False}
         channel = match.group(1)
-
         client_id = "kimne78kx3ncx6brgo4mv6wki5h1ko"
-        headers = {
-            "Client-ID": client_id,
-            "Content-Type": "application/json",
-            "User-Agent": UA
-        }
-
+        headers = {"Client-ID": client_id, "Content-Type": "application/json", "User-Agent": UA}
         gql_url = "https://gql.twitch.tv/gql"
-        payload = [{
-            "operationName": "PlaybackAccessToken",
-            "variables": {
-                "login": channel,
-                "playerType": "site"
-            },
-            "query": """
-            query PlaybackAccessToken($login: String!, $playerType: String!) {
-              streamPlaybackAccessToken(channelName: $login, params: {
-                platform: "web",
-                playerType: $playerType,
-                playerBackend: "mediaplayer"
-              }) {
-                value
-                signature
-              }
-            }
-            """
-        }]
-
-        resp = await request_with_proxy_group("POST", gql_url, proxy_list=EXTERNAL_PROXY_URLS,
-                                             json=payload, headers=headers)
-        if resp.status_code != 200:
-            return {"streams": [], "isLive": False}
+        payload = [{"operationName": "PlaybackAccessToken", "variables": {"login": channel, "playerType": "site"},
+                     "query": "query PlaybackAccessToken($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: { platform: \"web\", playerType: $playerType, playerBackend: \"mediaplayer\" }) { value signature } }"}]
+        resp = await request_with_proxy_group("POST", gql_url, proxy_list=EXTERNAL_PROXY_URLS, json=payload, headers=headers)
+        if resp.status_code != 200: return {"streams": [], "isLive": False}
         data = resp.json()
-        token = None
-        sig = None
+        token = sig = None
         if isinstance(data, list) and len(data) > 0:
-            token_data = data[0].get("data", {}).get("streamPlaybackAccessToken")
-            if token_data:
-                token = token_data.get("value")
-                sig = token_data.get("signature")
-
-        if not token or not sig:
-            return {"streams": [], "isLive": False}
-
-        encoded_token = quote(token, safe='')
-        m3u8_url = (
-            f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8"
-            f"?sig={sig}&token={encoded_token}&allow_source=true&allow_audio_only=true"
-        )
-
+            t = data[0].get("data", {}).get("streamPlaybackAccessToken")
+            if t: token, sig = t.get("value"), t.get("signature")
+        if not token or not sig: return {"streams": [], "isLive": False}
+        m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true"
         usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=EXTERNAL_PROXY_URLS,
                                                      headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"})
-        if usher_resp.status_code != 200:
-            return {"streams": [], "isLive": False}
-        if "#EXT-X-STREAM-INF" not in usher_resp.text:
-            return {"streams": [], "isLive": False}
-
-        streams = []
-        lines = usher_resp.text.splitlines()
+        if usher_resp.status_code != 200: return {"streams": [], "isLive": False}
+        if "#EXT-X-STREAM-INF" not in usher_resp.text: return {"streams": [], "isLive": False}
+        streams, lines = [], usher_resp.text.splitlines()
         for i, line in enumerate(lines):
             if line.startswith("#EXT-X-STREAM-INF"):
                 name = "source"
-                if "RESOLUTION=" in line:
-                    res = line.split("RESOLUTION=")[1].split(",")[0].replace("x", "p")
-                    name = res
-                if i + 1 < len(lines):
-                    sub_url = lines[i + 1].strip()
-                    if not sub_url.startswith("http"):
-                        from urllib.parse import urljoin
-                        sub_url = urljoin(m3u8_url, sub_url)
+                if "RESOLUTION=" in line: name = line.split("RESOLUTION=")[1].split(",")[0].replace("x", "p")
+                if i+1 < len(lines):
+                    sub_url = lines[i+1].strip()
+                    if not sub_url.startswith("http"): sub_url = urljoin(m3u8_url, sub_url)
                     streams.append({"cdn": f"Twitch-{name}", "url": sub_url, "type": "m3u8"})
-
-        def sort_key(s):
-            n = s["cdn"].split("-")[-1]
-            if n == "source": return 99999
-            if "p" in n:
-                try: return int(n.replace("p",""))
-                except: return 0
-            return 0
-        streams.sort(key=sort_key, reverse=True)
-
-        if not streams:
-            return {"streams": [], "isLive": False}
-
-        return {
-            "streams": streams,
-            "title": channel,
-            "avatar": "",
-            "channelName": channel,
-            "isLive": True
-        }
+        streams.sort(key=lambda s: (0 if "source" in s["cdn"] else 1, s["cdn"]))
+        if not streams: return {"streams": [], "isLive": False}
+        return {"streams": streams, "title": channel, "avatar": "", "channelName": channel, "isLive": True}
     except Exception as e:
         print(f"[Twitch] 解析异常: {e}")
         return {"streams": [], "isLive": False}
 
-
-# ==================== SOOP 解析（暂时留空或删除） ====================
+# ==================== SOOP (暂时不可用) ====================
 async def parse_soop(url):
+    print(f"[SOOP] 当前 streamget 库不兼容，暂时无法解析: {url}")
     return {"streams": [], "isLive": False}
 
-
-# ==================== PandaTV 流解析（调试增强版） ====================
+# ==================== PandaTV ====================
 async def parse_panda(url):
     try:
-        user_id = url.split('?')[0].rstrip('/').split('/')[-1]
-        proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
-        print(f"[PandaTV] 开始解析, 代理={proxy}, 用户ID={user_id}")
-
-        headers = {
-            'origin': 'https://www.pandalive.co.kr',
-            'referer': 'https://www.pandalive.co.kr/',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-        }
-
-        info_url = 'https://api.pandalive.co.kr/v1/member/bj'
-        data = {'userId': user_id, 'info': 'media fanGrade'}
-        resp = await request_with_proxy_group("POST", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data)
-        print(f"[PandaTV] 第一步状态码: {resp.status_code}")
-        if resp.status_code != 200:
-            print(f"[PandaTV] 第一步响应: {resp.text[:200]}")
-            return {"streams": [], "isLive": False}
-
-        info_json = resp.json()
-        if 'bjInfo' not in info_json:
-            print(f"[PandaTV] 返回数据异常: {json.dumps(info_json, ensure_ascii=False)[:200]}")
-            return {"streams": [], "isLive": False}
-        anchor_name = info_json['bjInfo']['nick']
-        is_live = 'media' in info_json
-        print(f"[PandaTV] 主播: {anchor_name}, 是否直播: {is_live}")
-
-        if not is_live:
-            return {"streams": [], "isLive": False}
-
-        play_url = 'https://api.pandalive.co.kr/v1/live/play'
-        data2 = {'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''}
-        resp2 = await request_with_proxy_group("POST", play_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data=data2)
-        print(f"[PandaTV] 第二步状态码: {resp2.status_code}")
-        if resp2.status_code != 200:
-            print(f"[PandaTV] 第二步响应: {resp2.text[:200]}")
-            return {"streams": [], "isLive": False}
-
-        play_json = resp2.json()
-        if 'PlayList' not in play_json or 'hls' not in play_json['PlayList']:
-            print(f"[PandaTV] 播放列表异常: {json.dumps(play_json, ensure_ascii=False)[:200]}")
-            return {"streams": [], "isLive": False}
-        real_m3u8 = play_json['PlayList']['hls'][0]['url']
-        print(f"[PandaTV] 真实流地址: {real_m3u8[:80]}...")
-
-        self_api_base = os.getenv("RENDER_EXTERNAL_URL", "https://live1-cxe9.onrender.com")
-        proxy_url = f"{self_api_base}/api/proxy?url={quote(real_m3u8, safe='')}&referer=https://www.pandalive.co.kr"
-        streams = [{"cdn": "PandaTV-Source", "url": proxy_url, "type": "m3u8"}]
-
-        return {
-            "streams": streams,
-            "title": f"{anchor_name}-{user_id}",
-            "avatar": "",
-            "isLive": True
-        }
+        from streamget.platforms.pandatv.live_stream import PandaTvLiveStream
+        live = PandaTvLiveStream()
+        data = await live.fetch_web_stream_data(url, process_data=True)
+        stream_obj = await live.fetch_stream_url(data, "OD")
+        raw = json.loads(stream_obj.to_json())
+        streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
+        return {"streams": streams, "title": raw.get("anchor_name", "PandaTV主播"), "avatar": raw.get("avatar", ""), "isLive": raw.get("is_live", False)}
     except Exception as e:
-        print(f"[PandaTV] 发生异常: {e}")
-        traceback.print_exc()
+        print(f"[PandaTV] streamget 解析失败: {e}, 回退手动解析")
+        return await parse_panda_manual(url)
+
+async def parse_panda_manual(url):
+    try:
+        user_id = url.split('?')[0].rstrip('/').split('/')[-1]
+        headers = {'origin': 'https://www.pandalive.co.kr', 'referer': 'https://www.pandalive.co.kr/', 'user-agent': UA}
+        info_url = 'https://api.pandalive.co.kr/v1/member/bj'
+        resp = await request_with_proxy_group("POST", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data={'userId': user_id, 'info': 'media fanGrade'})
+        if resp.status_code != 200: return {"streams": [], "isLive": False}
+        info_json = resp.json()
+        if 'bjInfo' not in info_json: return {"streams": [], "isLive": False}
+        anchor_name = info_json['bjInfo']['nick']
+        if 'media' not in info_json: return {"streams": [], "isLive": False}
+        play_url = 'https://api.pandalive.co.kr/v1/live/play'
+        resp2 = await request_with_proxy_group("POST", play_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data={'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''})
+        if resp2.status_code != 200: return {"streams": [], "isLive": False}
+        play_json = resp2.json()
+        if 'PlayList' not in play_json or 'hls' not in play_json['PlayList']: return {"streams": [], "isLive": False}
+        real_m3u8 = play_json['PlayList']['hls'][0]['url']
+        streams = [{"cdn": "PandaTV-Source", "url": real_m3u8, "type": "m3u8"}]
+        return {"streams": streams, "title": f"{anchor_name}-{user_id}", "avatar": "", "isLive": True}
+    except Exception as e:
+        print(f"[PandaTV] 手动解析异常: {e}")
         return {"streams": [], "isLive": False}
 
-
-def get_douyin_signature(md5_str: str) -> str:
+@app.get("/api/parse")
+async def api_parse(url: str = Query(...)):
     try:
-        with open("sign.js", "r", encoding="utf-8") as f:
-            js_code = f.read()
-        ctx = execjs.compile(js_code)
-        return ctx.call("get_sign", md5_str)
-    except Exception as e:
-        print(f"[签名] 生成失败: {e}")
-        return ""
+        if "huya.com" in url: return await parse_huya(url)
+        if "douyu.com" in url: return await parse_douyu(url)
+        if "bilibili.com" in url: return await parse_bilibili(url)
+        if "douyin.com" in url: return await parse_douyin(url)
+        if "twitch.tv" in url: return await parse_twitch(url)
+        if "sooplive.com" in url: return await parse_soop(url)
+        if "pandalive.co.kr" in url: return await parse_panda(url)
+        raise HTTPException(400, "不支持的平台")
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(500, str(e))
 
-
-# ==================== 抖音弹幕 WebSocket 代理（转发到本地 douyinLive 服务）====================
+# ==================== 抖音弹幕代理（修复版） ====================
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
-    """WebSocket 代理：前端 ↔ douyinLive Go 服务"""
     await websocket.accept()
     print(f"[WS] 前端连接抖音弹幕代理: room_id={room_id}")
 
     go_ws_url = f"ws://localhost:1088/ws/{room_id}"
+    go_ws = None
+    client_task = None
+    go_task = None
+
     try:
-        async with websockets.connect(go_ws_url) as go_ws:
-            print(f"[WS] 已连接 Go 服务: {go_ws_url}")
+        go_ws = await websockets.connect(go_ws_url, ping_interval=None)
+        print(f"[WS] 已连接 Go 服务: {go_ws_url}")
 
-            async def forward_to_go():
-                try:
-                    while True:
-                        data = await websocket.receive_text()
-                        if go_ws.open:
-                            await go_ws.send(data)
-                except WebSocketDisconnect:
-                    print("[WS] 前端断开")
-                except Exception as e:
-                    print(f"[WS] forward_to_go error: {e}")
+        async def forward_to_go():
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    if data == 'ping':
+                        await websocket.send_text('pong')
+                        continue
+                    if go_ws and go_ws.state.name == 'OPEN':
+                        await go_ws.send(data)
+            except WebSocketDisconnect:
+                print("[WS] 前端断开")
+            except Exception as e:
+                print(f"[WS] forward_to_go error: {e}")
 
-            async def forward_to_frontend():
-                try:
-                    while True:
-                        data = await go_ws.recv()
-                        if isinstance(data, bytes):
-                            data = data.decode("utf-8")
-                        await websocket.send_text(data)
-                except Exception as e:
-                    print(f"[WS] forward_to_frontend error: {e}")
+        async def forward_to_frontend():
+            try:
+                while True:
+                    data = await go_ws.recv()
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8")
+                    await websocket.send_text(data)
+            except Exception as e:
+                print(f"[WS] forward_to_frontend error: {e}")
 
-            # 双向转发
-            await asyncio.gather(forward_to_go(), forward_to_frontend())
+        client_task = asyncio.create_task(forward_to_go())
+        go_task = asyncio.create_task(forward_to_frontend())
+
+        done, pending = await asyncio.wait(
+            [client_task, go_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     except Exception as e:
         print(f"[WS] 无法连接 Go 服务: {e}")
-        await websocket.close(code=1011)
+    finally:
+        if go_ws:
+            await go_ws.close()
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
-
-# ==================== Twitch 弹幕 WebSocket 代理 ====================
+# ==================== Twitch 弹幕代理 ====================
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
     await websocket.accept()
     print(f"[WS] 前端连接 Twitch 弹幕: {channel_name}")
-
     stop_event = threading.Event()
     message_queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
-
     def on_message(ws, msg):
-        if msg.startswith("PING"):
-            ws.send("PONG :tmi.twitch.tv")
-            return
-        if msg.startswith("PONG"):
-            return
+        if msg.startswith("PING"): ws.send("PONG :tmi.twitch.tv"); return
+        if msg.startswith("PONG"): return
         match = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
         if match:
-            nick = match.group(1)
-            content = match.group(2)
-            asyncio.run_coroutine_threadsafe(
-                message_queue.put({"type": "chat", "nick": nick, "content": content}),
-                loop
-            )
-
-    def on_error(ws, error):
-        print(f"[Twitch IRC] 错误: {error}")
-
-    def on_close(ws, close_status_code, close_msg):
-        print("[Twitch IRC] 连接关闭")
-
+            asyncio.run_coroutine_threadsafe(message_queue.put({"type": "chat", "nick": match.group(1), "content": match.group(2)}), loop)
+    def on_error(ws, error): print(f"[Twitch IRC] 错误: {error}")
+    def on_close(ws, code, msg): print("[Twitch IRC] 连接关闭")
     def run_irc():
-        ws = websocket.WebSocketApp(
-            "wss://irc-ws.chat.twitch.tv:443",
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
-        ws.on_open = lambda ws: (
-            ws.send("CAP REQ :twitch.tv/tags twitch.tv/commands"),
-            ws.send("PASS SCHMOOPIIE"),
-            ws.send("NICK justinfan12345"),
-            ws.send(f"JOIN #{channel_name.lower()}")
-        )
+        ws = websocket.WebSocketApp("wss://irc-ws.chat.twitch.tv:443", on_message=on_message, on_error=on_error, on_close=on_close)
+        ws.on_open = lambda ws: (ws.send("CAP REQ :twitch.tv/tags twitch.tv/commands"), ws.send("PASS SCHMOOPIIE"), ws.send("NICK justinfan12345"), ws.send(f"JOIN #{channel_name.lower()}"))
         ws.run_forever()
-
     task = loop.run_in_executor(None, run_irc)
-
     async def send_worker():
         while not stop_event.is_set():
             try:
                 msg = await asyncio.wait_for(message_queue.get(), timeout=1.0)
                 await websocket.send_json(msg)
-            except asyncio.TimeoutError:
-                continue
-            except Exception:
-                break
-
+            except asyncio.TimeoutError: continue
+            except Exception: break
     send_task = asyncio.create_task(send_worker())
     try:
         while True:
             data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_text("pong")
+            if data == "ping": await websocket.send_text("pong")
     except WebSocketDisconnect:
         print(f"[WS] 前端断开 Twitch: {channel_name}")
     finally:
         stop_event.set()
         send_task.cancel()
-        try:
-            await send_task
-        except:
-            pass
+        try: await send_task
+        except: pass
         task.cancel()
 
-
-@app.get("/api/parse")
-async def api_parse(url: str = Query(...)):
-    try:
-        if "huya.com" in url:
-            return await parse_huya(url)
-        if "douyu.com" in url:
-            return await parse_douyu(url)
-        if "bilibili.com" in url:
-            return await parse_bilibili(url)
-        if "douyin.com" in url:
-            return await parse_douyin(url)
-        if "twitch.tv" in url:
-            return await parse_twitch(url)
-        if "sooplive.com" in url:
-            return await parse_soop(url)
-        if "pandalive.co.kr" in url:
-            return await parse_panda(url)
-        raise HTTPException(400, "不支持的平台")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
 @app.get("/")
-def root():
-    return {"status": "ok", "message": "多平台直播解析 API"}
-
+def root(): return {"status": "ok", "message": "多平台直播解析 API"}
 
 @app.api_route("/health", methods=["GET", "HEAD"])
-async def health_check():
-    return {"status": "alive"}
-
+async def health_check(): return {"status": "alive"}
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
