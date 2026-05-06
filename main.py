@@ -447,19 +447,30 @@ async def parse_soop(url):
         if SoopLiveStream is None:
             print("[SOOP] SoopLiveStream 未导入")
             return {"streams": [], "isLive": False}
+
         live = SoopLiveStream()
-        print(f"[SOOP] 开始获取 stream data, url={url}")
-        data = await live.fetch_web_stream_data(url, process_data=True)
-        print(f"[SOOP] 获取到 data 类型: {type(data)}, 内容前200: {str(data)[:200]}")
+        print(f"[SOOP] 开始解析: {url}")
+
+        # 关键修改：process_data=False
+        data = await live.fetch_web_stream_data(url, process_data=False)
+
+        # 检查是否在直播
+        if not data or not data.get('is_live'):
+            print(f"[SOOP] 直播间未开播或解析失败, data={data}")
+            return {"streams": [], "isLive": False}
+
+        # 获取流地址
         stream_obj = await live.fetch_stream_url(data, "OD")
         raw = json.loads(stream_obj.to_json())
         print(f"[SOOP] 流信息: {json.dumps(raw, ensure_ascii=False)[:300]}")
+
         streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
+
         return {
             "streams": streams,
             "title": raw.get("anchor_name", "SOOP主播"),
             "avatar": raw.get("avatar", ""),
-            "isLive": raw.get("is_live", False)
+            "isLive": True
         }
     except Exception as e:
         print(f"[SOOP] 解析异常: {e}")
