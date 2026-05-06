@@ -16,7 +16,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 从官方镜像中复制 douyinLive 二进制
-# 【关键修正】文件路径是 /app/douyinLive，不是 /douyinLive
 COPY --from=douyinlive /app/douyinLive /usr/local/bin/douyinLive
 
 # 复制应用代码和启动脚本
@@ -24,5 +23,8 @@ COPY . .
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# 【关键新增】强制 Render 只识别 8000 端口
+ENV PORT=8000
 EXPOSE 8000
+
 CMD ["/entrypoint.sh"]
