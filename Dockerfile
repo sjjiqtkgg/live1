@@ -1,5 +1,5 @@
 # ---- Stage 1: Build douyinLive ----
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /src
 RUN git clone --depth=1 https://github.com/jwwsjlm/douyinLive.git .
