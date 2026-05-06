@@ -1,11 +1,9 @@
 fastapi
 uvicorn
-streamget>=4.0.9
 httpx[socks]
 websockets
+streamget>=4.0.9
 protobuf>=3.19.0
-requests
-betterproto>=2.0.0b6
 websocket-client>=1.6.0
 PyExecJS
 python-socks
