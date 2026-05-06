@@ -572,7 +572,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                 try:
                     while True:
                         await asyncio.sleep(20)
-                        if go_ws.open:
+                        if go_ws.state.name == 'OPEN':
                             await go_ws.send("ping")
                             print("[WS] 发送心跳 ping")
                 except Exception as e:
