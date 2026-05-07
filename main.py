@@ -381,11 +381,9 @@ async def parse_twitch(url):
 # ==================== SOOP ====================
 async def parse_soop(url):
     try:
-        # 从URL提取bj_id，例如 https://play.sooplive.com/aflpl/293821325
         parts = url.rstrip('/').split('/')
-        bj_id = parts[-1] if len(parts) >= 6 else parts[3]  # 兼容两种格式
+        bj_id = parts[-1] if len(parts) >= 6 else parts[3]  # 兼容两种URL格式
         if not bj_id.isdigit():
-            # 尝试从url参数或更宽松的解析
             bj_id = parts[-1].split('?')[0]
 
         headers_pc = {
@@ -423,15 +421,15 @@ async def parse_soop(url):
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
         result_code = channel.get('RESULT', -1)
-        if result_code not in [0, 1]:  # 0 或 1 表示直播中
+        if result_code not in [0, 1]:
             return {"streams": [], "isLive": False}
         broad_no = channel.get('BNO', '')
         title = channel.get('TITLE', 'SOOP直播')
         if not broad_no:
             return {"streams": [], "isLive": False}
 
-        # 3. 获取CDN view_url（修复时间戳）
-        ts = time.time()  # 使用当前时间戳
+        # 3. 动态时间戳获取CDN View URL
+        ts = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
             'use_cors': 'false',
@@ -448,7 +446,7 @@ async def parse_soop(url):
         if not view_url:
             return {"streams": [], "isLive": False}
 
-        # 4. 获取aid（鉴权key）
+        # 4. 获取 AID 鉴权
         aid_form = live_data_form.copy()
         aid_form['type'] = 'aid'
         aid_resp = await request_with_proxy_group("POST", live_api, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc, data=aid_form)
@@ -459,12 +457,8 @@ async def parse_soop(url):
         if not aid:
             return {"streams": [], "isLive": False}
 
-        # 5. 拼接最终m3u8
+        # 5. 拼接最终 m3u8
         m3u8_url = f'{view_url}?aid={aid}'
-        # 简单验证m3u8是否可访问（可选）
-        # hls_test = await request_with_proxy_group("HEAD", m3u8_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc)
-        # if hls_test.status_code != 200:
-        #     return {"streams": [], "isLive": False}
 
         streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
         return {"streams": streams, "title": f"{nickname}-{bj_id}", "avatar": "", "isLive": True}
