@@ -50,7 +50,7 @@ async def request_with_retry(method, url, **kwargs):
     for idx, proxy in enumerate(PROXY_URLS):
         try:
             print(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
-            async with httpx.AsyncClient(timeout=timeout, proxy=proxy, http2=True, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
                 resp = await client.request(method, url, **kwargs)
                 return resp
         except Exception as e:
@@ -64,7 +64,7 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
     for idx, proxy in enumerate(proxy_list):
         try:
             print(f"[分组请求] 尝试代理 [{idx+1}/{len(proxy_list)}]: {proxy or '直连'}")
-            async with httpx.AsyncClient(timeout=timeout, proxy=proxy, http2=True, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
                 resp = await client.request(method, url, **kwargs)
                 return resp
         except Exception as e:
@@ -84,43 +84,18 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         raise HTTPException(403, "domain not allowed")
 
     body = await request.body() if request.method == "POST" else None
-
-    # ✅ 补全浏览器请求头
-    headers = {
-        "User-Agent": ua or UA,
-        "Referer": referer or "",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "X-Requested-With": "XMLHttpRequest"
-    }
+    headers = {"User-Agent": ua or UA, "Referer": referer or ""}
     if cookie:
         headers["Cookie"] = cookie
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    # ✅ 修复：Origin 自动推导
+    # ✅ 修复：从 referer 自动推导 Origin 头，解决斗鱼 lapi 返回 403 的问题
     if referer:
         try:
             parsed = urlparse(referer)
             if parsed.scheme and parsed.netloc:
                 headers["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
-        except Exception:
-            pass
-
-    # ✅ 关键修复：斗鱼 lapi 接口自动注入 acf_did cookie
-    if "douyu.com/lapi/live/getH5Play" in url and body:
-        try:
-            body_str = body.decode()
-            for param in body_str.split("&"):
-                if param.startswith("did="):
-                    did_value = param.split("=", 1)[1]
-                    existing_cookie = headers.get("Cookie", "")
-                    new_cookie = f"acf_did={did_value}"
-                    if existing_cookie:
-                        headers["Cookie"] = existing_cookie + "; " + new_cookie
-                    else:
-                        headers["Cookie"] = new_cookie
-                    break
         except Exception:
             pass
 
@@ -132,7 +107,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": resp.headers.get("content-type", "application/json")}
     return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
 
-# ==================== 以下所有解析函数保持不变，无需修改 ====================
 def build_streams(flv, m3u8):
     s = []
     if flv and flv.startswith("http"):
@@ -210,6 +184,7 @@ async def parse_huya(url):
         if not streams:
             return {"streams": [], "isLive": False}
 
+        # ✅ 修复：尝试更多字段路径获取主播名，避免回落到"虎牙主播"默认值导致标题显示房间号
         profile = live.get("profileRoom", {})
         room_info = live.get("roomInfo", {})
         live_data = live.get("liveData", {})
@@ -223,6 +198,7 @@ async def parse_huya(url):
             room_info.get("sNick") or
             ""
         )
+        # 最后兜底：从移动端页面抓主播名
         if not anchor_name:
             try:
                 mob_resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
@@ -448,6 +424,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
             try:
                 while True:
                     data = await websocket.receive_text()
+                    # ✅ 拦截 ping，本地回复，不转发给 Go 服务（Go 不识别文本 ping 会断连）
                     if data == 'ping':
                         await websocket.send_text('pong')
                         continue
