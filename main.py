@@ -90,8 +90,18 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "livestream-manager.sooplive.com", "pandalive.co.kr"]
-    use_external = any(d in url for d in EXTERNAL_DOMAINS)
+    # Twitch 实际 HLS 分片域名是 twitchsvc.net，需列入外网域名
+    EXTERNAL_DOMAINS = [
+        "twitch.tv", "ttvnw.net", "twitchsvc.net",
+        "sooplive.com", "livestream-manager.sooplive.com",
+        "pandalive.co.kr",
+    ]
+    # URL 域名匹配；或 referer 来自已知外网服务（兜底：分片在 CDN 上时靠 referer 判断）
+    EXTERNAL_REFERERS = ["twitch.tv", "player.twitch.tv", "sooplive.com", "pandalive.co.kr"]
+    use_external = (
+        any(d in url for d in EXTERNAL_DOMAINS) or
+        any(d in (referer or "") for d in EXTERNAL_REFERERS)
+    )
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
 
     resp = await request_with_proxy_group(request.method, url, proxy_list=proxy_list, headers=headers, content=body)
