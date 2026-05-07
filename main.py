@@ -382,9 +382,9 @@ async def parse_twitch(url):
 async def parse_soop(url):
     try:
         parts = url.rstrip('/').split('/')
-        bj_id = parts[-1] if len(parts) >= 6 else parts[3]  # 兼容两种URL格式
-        if not bj_id.isdigit():
-            bj_id = parts[-1].split('?')[0]
+        # play.sooplive.com/{username} 或 play.sooplive.com/{username}/{broadcast_no}
+        # bj_id 始终是主播用户名，固定在 parts[3]，不能用 isdigit() 覆盖为直播号
+        bj_id = parts[3].split('?')[0] if len(parts) > 3 else parts[-1].split('?')[0]
 
         headers_pc = {
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
@@ -406,7 +406,7 @@ async def parse_soop(url):
         live_data_form = {
             'bid': bj_id,
             'bno': '',
-            'type': 'live',
+            'type': '',
             'pwd': '',
             'player_type': 'html5',
             'stream_type': 'common',
