@@ -90,15 +90,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    # ✅ 修复：从 referer 自动推导 Origin 头，解决斗鱼 lapi 返回 403 的问题
-    if referer:
-        try:
-            parsed = urlparse(referer)
-            if parsed.scheme and parsed.netloc:
-                headers["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
-        except Exception:
-            pass
-
     EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "livestream-manager.sooplive.com", "pandalive.co.kr"]
     use_external = any(d in url for d in EXTERNAL_DOMAINS)
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
