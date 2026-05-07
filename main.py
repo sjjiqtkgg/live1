@@ -381,23 +381,94 @@ async def parse_twitch(url):
 # ==================== SOOP ====================
 async def parse_soop(url):
     try:
-        if SoopLiveStream is None:
-            print("[SOOP] 未安装 streamget 或平台模块不可用")
+        # 从URL提取bj_id，例如 https://play.sooplive.com/aflpl/293821325
+        parts = url.rstrip('/').split('/')
+        bj_id = parts[-1] if len(parts) >= 6 else parts[3]  # 兼容两种格式
+        if not bj_id.isdigit():
+            # 尝试从url参数或更宽松的解析
+            bj_id = parts[-1].split('?')[0]
+
+        headers_pc = {
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+            'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'origin': 'https://play.sooplive.com',
+            'referer': 'https://play.sooplive.com',
+        }
+
+        # 1. 获取主播昵称
+        nick_api = f'https://st.sooplive.com/api/get_station_status.php?szBjId={bj_id}'
+        nick_resp = await request_with_proxy_group("GET", nick_api, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc)
+        if nick_resp.status_code != 200:
             return {"streams": [], "isLive": False}
-        # 使用外部代理列表随机一个
-        proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
-        soop = SoopLiveStream(proxy_addr=proxy)
-        data = await soop.fetch_web_stream_data(url, process_data=True)
-        if not data.get('is_live'):
+        nick_data = nick_resp.json()
+        nickname = nick_data.get('DATA', {}).get('user_nick', f'BJ-{bj_id}')
+
+        # 2. 获取直播状态、broad_no、title
+        live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
+        live_data_form = {
+            'bid': bj_id,
+            'bno': '',
+            'type': 'live',
+            'pwd': '',
+            'player_type': 'html5',
+            'stream_type': 'common',
+            'quality': 'master',
+            'mode': 'landing',
+            'from_api': '0',
+            'is_revive': 'false',
+        }
+        live_resp = await request_with_proxy_group("POST", live_api, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc, data=live_data_form)
+        if live_resp.status_code != 200:
             return {"streams": [], "isLive": False}
-        m3u8_url = data.get('m3u8_url')
-        if not m3u8_url:
+        live_json = live_resp.json()
+        channel = live_json.get('CHANNEL', {})
+        result_code = channel.get('RESULT', -1)
+        if result_code not in [0, 1]:  # 0 或 1 表示直播中
             return {"streams": [], "isLive": False}
-        streams = [{"cdn": "SOOP-source", "url": m3u8_url, "type": "m3u8"}]
-        play_list = data.get('play_url_list', [])
-        for idx, purl in enumerate(play_list):
-            streams.append({"cdn": f"SOOP-{idx+1}", "url": purl, "type": "m3u8"})
-        return {"streams": streams, "title": data.get("title", "SOOP主播"), "avatar": "", "isLive": True}
+        broad_no = channel.get('BNO', '')
+        title = channel.get('TITLE', 'SOOP直播')
+        if not broad_no:
+            return {"streams": [], "isLive": False}
+
+        # 3. 获取CDN view_url（修复时间戳）
+        ts = time.time()  # 使用当前时间戳
+        cdn_params = {
+            'return_type': 'gcp_cdn',
+            'use_cors': 'false',
+            'cors_origin_url': 'play.sooplive.com',
+            'broad_key': f'{broad_no}-common-master-hls',
+            'time': str(ts),
+        }
+        cdn_url = 'http://livestream-manager.sooplive.com/broad_stream_assign.html'
+        cdn_resp = await request_with_proxy_group("GET", cdn_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc, params=cdn_params)
+        if cdn_resp.status_code != 200:
+            return {"streams": [], "isLive": False}
+        cdn_json = cdn_resp.json()
+        view_url = cdn_json.get('view_url')
+        if not view_url:
+            return {"streams": [], "isLive": False}
+
+        # 4. 获取aid（鉴权key）
+        aid_form = live_data_form.copy()
+        aid_form['type'] = 'aid'
+        aid_resp = await request_with_proxy_group("POST", live_api, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc, data=aid_form)
+        if aid_resp.status_code != 200:
+            return {"streams": [], "isLive": False}
+        aid_json = aid_resp.json()
+        aid = aid_json.get('CHANNEL', {}).get('AID', '')
+        if not aid:
+            return {"streams": [], "isLive": False}
+
+        # 5. 拼接最终m3u8
+        m3u8_url = f'{view_url}?aid={aid}'
+        # 简单验证m3u8是否可访问（可选）
+        # hls_test = await request_with_proxy_group("HEAD", m3u8_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc)
+        # if hls_test.status_code != 200:
+        #     return {"streams": [], "isLive": False}
+
+        streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
+        return {"streams": streams, "title": f"{nickname}-{bj_id}", "avatar": "", "isLive": True}
+
     except Exception as e:
         print(f"[SOOP] 解析异常: {e}")
         return {"streams": [], "isLive": False}
