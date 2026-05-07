@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+httpx[socks]
+websockets
+streamget>=4.0.9
+protobuf>=3.19.0
+websocket-client>=1.6.0
+PyExecJS
+python-socks
