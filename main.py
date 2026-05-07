@@ -84,9 +84,20 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         raise HTTPException(403, "domain not allowed")
 
     body = await request.body() if request.method == "POST" else None
-    headers = {"User-Agent": ua or UA, "Referer": referer or "", "Cookie": cookie}
+    headers = {"User-Agent": ua or UA, "Referer": referer or ""}
+    if cookie:
+        headers["Cookie"] = cookie
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+    # ✅ 修复：从 referer 自动推导 Origin 头，解决斗鱼 lapi 返回 403 的问题
+    if referer:
+        try:
+            parsed = urlparse(referer)
+            if parsed.scheme and parsed.netloc:
+                headers["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            pass
 
     EXTERNAL_DOMAINS = ["twitch.tv", "ttvnw.net", "sooplive.com", "livestream-manager.sooplive.com", "pandalive.co.kr"]
     use_external = any(d in url for d in EXTERNAL_DOMAINS)
@@ -172,9 +183,35 @@ async def parse_huya(url):
             seen.add(cdn_type)
         if not streams:
             return {"streams": [], "isLive": False}
+
+        # ✅ 修复：尝试更多字段路径获取主播名，避免回落到"虎牙主播"默认值导致标题显示房间号
         profile = live.get("profileRoom", {})
-        anchor_name = profile.get("nick") or live.get("roomInfo", {}).get("nick") or "虎牙主播"
-        avatar = profile.get("avatar", "")
+        room_info = live.get("roomInfo", {})
+        live_data = live.get("liveData", {})
+        anchor = live.get("anchor", {})
+        anchor_name = (
+            profile.get("nick") or
+            room_info.get("nick") or
+            live_data.get("nick") or
+            anchor.get("nick") or
+            profile.get("sNick") or
+            room_info.get("sNick") or
+            ""
+        )
+        # 最后兜底：从移动端页面抓主播名
+        if not anchor_name:
+            try:
+                mob_resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
+                    headers={"User-Agent": MOBILE_UA, "Referer": "https://www.huya.com/"})
+                mob_html = mob_resp.text
+                m = re.search(r'"nick":"([^"]+)"', mob_html) or re.search(r'<title>([^_<]+)', mob_html)
+                if m:
+                    anchor_name = m.group(1).strip()
+            except Exception:
+                pass
+        anchor_name = anchor_name or "虎牙主播"
+
+        avatar = profile.get("avatar", "") or anchor.get("avatar", "")
         danmaku = await fetch_huya_danmaku_params(room_id)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
     except Exception as e:
@@ -301,7 +338,9 @@ async def parse_twitch(url):
                 if "RESOLUTION=" in line: name = line.split("RESOLUTION=")[1].split(",")[0].replace("x", "p")
                 if i+1 < len(lines):
                     sub_url = lines[i+1].strip()
-                    if not sub_url.startswith("http"): sub_url = urljoin(m3u8_url, sub_url)
+                    if not sub_url.startswith("http"):
+                        from urllib.parse import urljoin
+                        sub_url = urljoin(m3u8_url, sub_url)
                     streams.append({"cdn": f"Twitch-{name}", "url": sub_url, "type": "m3u8"})
         streams.sort(key=lambda s: (0 if "source" in s["cdn"] else 1, s["cdn"]))
         if not streams: return {"streams": [], "isLive": False}
@@ -385,6 +424,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
             try:
                 while True:
                     data = await websocket.receive_text()
+                    # ✅ 拦截 ping，本地回复，不转发给 Go 服务（Go 不识别文本 ping 会断连）
                     if data == 'ping':
                         await websocket.send_text('pong')
                         continue
@@ -424,7 +464,10 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         print(f"[WS] 无法连接 Go 服务: {e}")
     finally:
         if go_ws:
-            await go_ws.close()
+            try:
+                await go_ws.close()
+            except Exception:
+                pass
         try:
             await websocket.close(code=1011)
         except Exception:
@@ -479,4 +522,5 @@ def root(): return {"status": "ok", "message": "多平台直播解析 API"}
 async def health_check(): return {"status": "alive"}
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
