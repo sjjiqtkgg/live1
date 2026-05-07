@@ -9,7 +9,6 @@ import time
 import hashlib
 import base64
 import random
-import execjs
 import ssl
 import traceback
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
@@ -90,7 +89,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    # 外网域名与 Referer 判定
     EXTERNAL_DOMAINS = [
         "twitch.tv", "ttvnw.net", "twitchsvc.net",
         "sooplive.com", "livestream-manager.sooplive.com",
@@ -213,19 +211,14 @@ async def parse_huya(url):
 # ==================== 斗鱼（新接口） ====================
 async def parse_douyu(url):
     try:
-        # 提取 room_id
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         hdrs = {"User-Agent": UA, "Referer": f"https://www.douyu.com/{room_id}"}
-
-        # 1. 获取房间信息
         info_resp = await request_with_retry("GET", f"https://www.douyu.com/betard/{room_id}", headers=hdrs)
         info = info_resp.json()
         room = info.get("room")
         if not room or room.get("show_status") != 1 or room.get("videoLoop") == 1:
             return {"streams": [], "isLive": False}
         real_id = str(room["room_id"])
-
-        # 2. 新接口：获取白名单加密参数
         did = "10000000000000000000000000001501"
         enc_resp = await request_with_retry("GET", f"https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did={did}",
                                             headers={"User-Agent": UA})
@@ -233,16 +226,12 @@ async def parse_douyu(url):
         if enc_data.get("error") != 0:
             return {"streams": [], "isLive": False}
         white = enc_data["data"]
-
-        # 3. 计算 auth 签名
         ts = int(time.time())
         secret = white['rand_str']
         for _ in range(white['enc_time']):
             secret = hashlib.md5((secret + white['key']).encode()).hexdigest()
         suffix = f"{real_id}{ts}" if not white.get('is_special', False) else ""
         auth = hashlib.md5((secret + white['key'] + suffix).encode()).hexdigest()
-
-        # 4. 请求拉流
         params = {
             'rate': '0',
             'ver': '219032101',
@@ -262,26 +251,20 @@ async def parse_douyu(url):
         stream_data = stream_resp.json()
         if stream_data.get("error") != 0:
             return {"streams": [], "isLive": False}
-
         info_stream = stream_data["data"]
-        flv_url = f"{info_stream['rtmp_url']}/{info_stream['rtmp_live']}" if info_stream.get('rtmp_url') and info_stream.get(
-            'rtmp_live') else None
+        flv_url = f"{info_stream['rtmp_url']}/{info_stream['rtmp_live']}" if info_stream.get('rtmp_url') and info_stream.get('rtmp_live') else None
         hls_url = info_stream.get('hls_url')
-
         streams = []
         if flv_url:
             streams.append({"cdn": "FLV", "url": flv_url, "type": "flv"})
         if hls_url and hls_url.startswith("http"):
             streams.append({"cdn": "HLS", "url": hls_url, "type": "m3u8"})
-
         if not streams:
             return {"streams": [], "isLive": False}
-
         name = room.get("nickname") or "斗鱼主播"
         avatar = room.get("room_icon", "")
         if isinstance(avatar, dict):
             avatar = avatar.get("big") or avatar.get("middle") or ""
-
         return {"streams": streams, "title": name, "avatar": avatar, "isLive": True}
     except Exception as e:
         print(f"[斗鱼] 解析异常: {e}")
@@ -333,12 +316,13 @@ async def parse_bilibili(url):
 async def parse_douyin(url):
     try:
         from streamget import DouyinLiveStream
-        live = DouyinLiveStream()
+        live = DouyinLiveStream()  # 不使用代理，默认直连
         data = await live.fetch_web_stream_data(url, process_data=True)
         stream_obj = await live.fetch_stream_url(data, "OD")
         raw = json.loads(stream_obj.to_json())
         streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
-        if not streams: return {"streams": [], "isLive": False}
+        if not streams:
+            return {"streams": [], "isLive": False}
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         if not room_id.isdigit():
             try:
@@ -396,8 +380,27 @@ async def parse_twitch(url):
 
 # ==================== SOOP ====================
 async def parse_soop(url):
-    print(f"[SOOP] 当前 streamget 库不兼容，暂时无法解析: {url}")
-    return {"streams": [], "isLive": False}
+    try:
+        if SoopLiveStream is None:
+            print("[SOOP] 未安装 streamget 或平台模块不可用")
+            return {"streams": [], "isLive": False}
+        # 使用外部代理列表随机一个
+        proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS != [None] else None
+        soop = SoopLiveStream(proxy_addr=proxy)
+        data = await soop.fetch_web_stream_data(url, process_data=True)
+        if not data.get('is_live'):
+            return {"streams": [], "isLive": False}
+        m3u8_url = data.get('m3u8_url')
+        if not m3u8_url:
+            return {"streams": [], "isLive": False}
+        streams = [{"cdn": "SOOP-source", "url": m3u8_url, "type": "m3u8"}]
+        play_list = data.get('play_url_list', [])
+        for idx, purl in enumerate(play_list):
+            streams.append({"cdn": f"SOOP-{idx+1}", "url": purl, "type": "m3u8"})
+        return {"streams": streams, "title": data.get("title", "SOOP主播"), "avatar": "", "isLive": True}
+    except Exception as e:
+        print(f"[SOOP] 解析异常: {e}")
+        return {"streams": [], "isLive": False}
 
 # ==================== PandaTV ====================
 async def parse_panda(url):
@@ -567,4 +570,5 @@ async def health_check(): return {"status": "alive"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
