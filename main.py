@@ -90,13 +90,12 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    # Twitch 实际 HLS 分片域名是 twitchsvc.net，需列入外网域名
+    # 外网域名与 Referer 判定
     EXTERNAL_DOMAINS = [
         "twitch.tv", "ttvnw.net", "twitchsvc.net",
         "sooplive.com", "livestream-manager.sooplive.com",
         "pandalive.co.kr",
     ]
-    # URL 域名匹配；或 referer 来自已知外网服务（兜底：分片在 CDN 上时靠 referer 判断）
     EXTERNAL_REFERERS = ["twitch.tv", "player.twitch.tv", "sooplive.com", "pandalive.co.kr"]
     use_external = (
         any(d in url for d in EXTERNAL_DOMAINS) or
@@ -185,21 +184,14 @@ async def parse_huya(url):
         if not streams:
             return {"streams": [], "isLive": False}
 
-        # ✅ 修复：尝试更多字段路径获取主播名，避免回落到"虎牙主播"默认值导致标题显示房间号
         profile = live.get("profileRoom", {})
         room_info = live.get("roomInfo", {})
         live_data = live.get("liveData", {})
         anchor = live.get("anchor", {})
         anchor_name = (
-            profile.get("nick") or
-            room_info.get("nick") or
-            live_data.get("nick") or
-            anchor.get("nick") or
-            profile.get("sNick") or
-            room_info.get("sNick") or
-            ""
+            profile.get("nick") or room_info.get("nick") or live_data.get("nick") or anchor.get("nick") or
+            profile.get("sNick") or room_info.get("sNick") or ""
         )
-        # 最后兜底：从移动端页面抓主播名
         if not anchor_name:
             try:
                 mob_resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
@@ -211,7 +203,6 @@ async def parse_huya(url):
             except Exception:
                 pass
         anchor_name = anchor_name or "虎牙主播"
-
         avatar = profile.get("avatar", "") or anchor.get("avatar", "")
         danmaku = await fetch_huya_danmaku_params(room_id)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
@@ -219,26 +210,79 @@ async def parse_huya(url):
         print(f"[虎牙] 解析异常: {e}")
         return {"streams": [], "isLive": False}
 
-# ==================== 斗鱼 ====================
+# ==================== 斗鱼（新接口） ====================
 async def parse_douyu(url):
     try:
+        # 提取 room_id
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         hdrs = {"User-Agent": UA, "Referer": f"https://www.douyu.com/{room_id}"}
+
+        # 1. 获取房间信息
         info_resp = await request_with_retry("GET", f"https://www.douyu.com/betard/{room_id}", headers=hdrs)
         info = info_resp.json()
         room = info.get("room")
-        if not room: return {"streams": [], "isLive": False}
-        if room.get("show_status") != 1 or room.get("videoLoop") == 1:
+        if not room or room.get("show_status") != 1 or room.get("videoLoop") == 1:
             return {"streams": [], "isLive": False}
         real_id = str(room["room_id"])
-        enc_resp = await request_with_retry("GET", f"https://www.douyu.com/swf_api/homeH5Enc?rids={real_id}", headers=hdrs)
-        enc = enc_resp.json()
-        crptext = enc.get("data", {}).get(f"room{real_id}")
-        if not crptext: return {"streams": [], "isLive": False}
-        raw_av = room.get("room_icon") or room.get("avatar") or ""
-        if isinstance(raw_av, dict): raw_av = raw_av.get("big") or raw_av.get("middle") or raw_av.get("small") or ""
-        return {"client": True, "crptext": crptext, "roomId": real_id,
-                "anchorName": room.get("nickname") or "斗鱼主播", "avatar": raw_av, "isLive": True}
+
+        # 2. 新接口：获取白名单加密参数
+        did = "10000000000000000000000000001501"
+        enc_resp = await request_with_retry("GET", f"https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did={did}",
+                                            headers={"User-Agent": UA})
+        enc_data = enc_resp.json()
+        if enc_data.get("error") != 0:
+            return {"streams": [], "isLive": False}
+        white = enc_data["data"]
+
+        # 3. 计算 auth 签名
+        ts = int(time.time())
+        secret = white['rand_str']
+        for _ in range(white['enc_time']):
+            secret = hashlib.md5((secret + white['key']).encode()).hexdigest()
+        suffix = f"{real_id}{ts}" if not white.get('is_special', False) else ""
+        auth = hashlib.md5((secret + white['key'] + suffix).encode()).hexdigest()
+
+        # 4. 请求拉流
+        params = {
+            'rate': '0',
+            'ver': '219032101',
+            'iar': '0',
+            'ive': '0',
+            'rid': real_id,
+            'hevc': '0',
+            'fa': '0',
+            'sov': '0',
+            'enc_data': white['enc_data'],
+            'tt': str(ts),
+            'did': did,
+            'auth': auth,
+        }
+        stream_resp = await request_with_retry("POST", f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
+                                               headers=hdrs, data=params)
+        stream_data = stream_resp.json()
+        if stream_data.get("error") != 0:
+            return {"streams": [], "isLive": False}
+
+        info_stream = stream_data["data"]
+        flv_url = f"{info_stream['rtmp_url']}/{info_stream['rtmp_live']}" if info_stream.get('rtmp_url') and info_stream.get(
+            'rtmp_live') else None
+        hls_url = info_stream.get('hls_url')
+
+        streams = []
+        if flv_url:
+            streams.append({"cdn": "FLV", "url": flv_url, "type": "flv"})
+        if hls_url and hls_url.startswith("http"):
+            streams.append({"cdn": "HLS", "url": hls_url, "type": "m3u8"})
+
+        if not streams:
+            return {"streams": [], "isLive": False}
+
+        name = room.get("nickname") or "斗鱼主播"
+        avatar = room.get("room_icon", "")
+        if isinstance(avatar, dict):
+            avatar = avatar.get("big") or avatar.get("middle") or ""
+
+        return {"streams": streams, "title": name, "avatar": avatar, "isLive": True}
     except Exception as e:
         print(f"[斗鱼] 解析异常: {e}")
         return {"streams": [], "isLive": False}
@@ -350,7 +394,7 @@ async def parse_twitch(url):
         print(f"[Twitch] 解析异常: {e}")
         return {"streams": [], "isLive": False}
 
-# ==================== SOOP (暂时不可用) ====================
+# ==================== SOOP ====================
 async def parse_soop(url):
     print(f"[SOOP] 当前 streamget 库不兼容，暂时无法解析: {url}")
     return {"streams": [], "isLive": False}
@@ -406,7 +450,7 @@ async def api_parse(url: str = Query(...)):
     except HTTPException: raise
     except Exception as e: raise HTTPException(500, str(e))
 
-# ==================== 抖音弹幕代理（修复版） ====================
+# ==================== 抖音弹幕代理 ====================
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
@@ -425,7 +469,6 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
             try:
                 while True:
                     data = await websocket.receive_text()
-                    # ✅ 拦截 ping，本地回复，不转发给 Go 服务（Go 不识别文本 ping 会断连）
                     if data == 'ping':
                         await websocket.send_text('pong')
                         continue
