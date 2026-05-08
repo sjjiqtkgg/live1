@@ -114,7 +114,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         cdn_origin = f"{parsed_cdn.scheme}://{parsed_cdn.netloc}"
         # 用完整绝对 URL 避免 hls.js 相对路径解析错误
         proxy_base = str(request.base_url).rstrip("/") + "/api/proxy"
-        eff_referer = referer or "https://play.sooplive.com"
+        eff_referer = referer or ("https://www.pandalive.co.kr/" if "pandalive" in url else "https://play.sooplive.com")
         lines = resp.text.splitlines()
         rewritten = []
         for line in lines:
@@ -548,17 +548,7 @@ async def parse_soop(url):
 
 # ==================== PandaTV ====================
 async def parse_panda(url):
-    try:
-        from streamget.platforms.pandatv.live_stream import PandaTvLiveStream
-        live = PandaTvLiveStream()
-        data = await live.fetch_web_stream_data(url, process_data=True)
-        stream_obj = await live.fetch_stream_url(data, "OD")
-        raw = json.loads(stream_obj.to_json())
-        streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
-        return {"streams": streams, "title": raw.get("anchor_name", "PandaTV主播"), "avatar": raw.get("avatar", ""), "isLive": raw.get("is_live", False)}
-    except Exception as e:
-        print(f"[PandaTV] streamget 解析失败: {e}, 回退手动解析")
-        return await parse_panda_manual(url)
+    return await parse_panda_manual(url)
 
 async def parse_panda_manual(url):
     try:
