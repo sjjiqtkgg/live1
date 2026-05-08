@@ -604,61 +604,46 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     print(f"[WS] 前端连接抖音弹幕代理: room_id={room_id}")
 
     go_ws_url = f"ws://localhost:1088/ws/{room_id}"
-    go_ws = None
-    client_task = None
-    go_task = None
-
     try:
-        go_ws = await websockets.connect(go_ws_url, ping_interval=None)
-        print(f"[WS] 已连接 Go 服务: {go_ws_url}")
+        async with websockets.connect(go_ws_url, ping_interval=None) as go_ws:
+            print(f"[WS] 已连接 Go 服务: {go_ws_url}")
 
-        async def forward_to_go():
-            try:
-                while True:
-                    data = await websocket.receive_text()
-                    if data == 'ping':
-                        await websocket.send_text('pong')
-                        continue
-                    if go_ws and go_ws.state.name == 'OPEN':
-                        await go_ws.send(data)
-            except WebSocketDisconnect:
-                print("[WS] 前端断开")
-            except Exception as e:
-                print(f"[WS] forward_to_go error: {e}")
+            async def forward_to_go():
+                try:
+                    while True:
+                        data = await websocket.receive_text()
+                        if data == 'ping':
+                            # 向 Go 发送 WebSocket ping 帧保持连接活跃
+                            try:
+                                await go_ws.ping()
+                            except Exception:
+                                pass
+                            await websocket.send_text('pong')
+                            continue
+                        if go_ws.open:
+                            await go_ws.send(data)
+                except WebSocketDisconnect:
+                    print("[WS] 前端断开")
+                except Exception as e:
+                    print(f"[WS] forward_to_go error: {e}")
 
-        async def forward_to_frontend():
-            try:
-                while True:
-                    data = await go_ws.recv()
-                    if isinstance(data, bytes):
-                        data = data.decode("utf-8")
-                    await websocket.send_text(data)
-            except Exception as e:
-                print(f"[WS] forward_to_frontend error: {e}")
+            async def forward_to_frontend():
+                try:
+                    while True:
+                        data = await go_ws.recv()
+                        if isinstance(data, bytes):
+                            data = data.decode("utf-8")
+                        await websocket.send_text(data)
+                except Exception as e:
+                    print(f"[WS] forward_to_frontend error: {e}")
 
-        client_task = asyncio.create_task(forward_to_go())
-        go_task = asyncio.create_task(forward_to_frontend())
-
-        done, pending = await asyncio.wait(
-            [client_task, go_task],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
+            await asyncio.gather(
+                forward_to_go(),
+                forward_to_frontend(),
+                return_exceptions=True
+            )
     except Exception as e:
         print(f"[WS] 无法连接 Go 服务: {e}")
-    finally:
-        if go_ws:
-            try:
-                await go_ws.close()
-            except Exception:
-                pass
         try:
             await websocket.close(code=1011)
         except Exception:
