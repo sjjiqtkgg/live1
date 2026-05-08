@@ -114,7 +114,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         cdn_origin = f"{parsed_cdn.scheme}://{parsed_cdn.netloc}"
         # 用完整绝对 URL 避免 hls.js 相对路径解析错误
         proxy_base = str(request.base_url).rstrip("/") + "/api/proxy"
-        eff_referer = referer or ("https://www.pandalive.co.kr/" if "pandalive" in url else "https://play.sooplive.com")
+        eff_referer = referer or "https://play.sooplive.com"
         lines = resp.text.splitlines()
         rewritten = []
         for line in lines:
@@ -553,38 +553,78 @@ async def parse_panda(url):
 async def parse_panda_manual(url):
     try:
         user_id = url.split('?')[0].rstrip('/').split('/')[-1]
-        headers = {'origin': 'https://www.pandalive.co.kr', 'referer': 'https://www.pandalive.co.kr/', 'user-agent': UA}
+        print(f"[PandaTV] 开始解析 user_id={user_id}")
+
+        headers = {
+            'origin': 'https://www.pandalive.co.kr',
+            'referer': 'https://www.pandalive.co.kr/',
+            'user-agent': UA,
+            'content-type': 'application/x-www-form-urlencoded',
+        }
+
+        # ① 获取主播信息 & 直播状态
         info_url = 'https://api.pandalive.co.kr/v1/member/bj'
-        resp = await request_with_proxy_group("POST", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data={'userId': user_id, 'info': 'media fanGrade'})
-        if resp.status_code != 200: return {"streams": [], "isLive": False}
+        resp = await request_with_proxy_group(
+            "POST", info_url, proxy_list=EXTERNAL_PROXY_URLS,
+            headers=headers, data={'userId': user_id, 'info': 'media fanGrade'})
+        print(f"[PandaTV] /member/bj status={resp.status_code}")
+        if resp.status_code != 200:
+            print(f"[PandaTV] /member/bj 非200，body={resp.text[:200]}")
+            return {"streams": [], "isLive": False}
+
         info_json = resp.json()
-        if 'bjInfo' not in info_json: return {"streams": [], "isLive": False}
+        if 'bjInfo' not in info_json:
+            print(f"[PandaTV] 无 bjInfo，keys={list(info_json.keys())}")
+            return {"streams": [], "isLive": False}
+
         anchor_name = info_json['bjInfo']['nick']
-        if 'media' not in info_json: return {"streams": [], "isLive": False}
+        print(f"[PandaTV] 主播={anchor_name}, media存在={'media' in info_json}")
+
+        if 'media' not in info_json:
+            print(f"[PandaTV] 未检测到直播（media字段缺失），判定为未开播")
+            return {"streams": [], "isLive": False}
+
+        # ② 获取播放地址
         play_url = 'https://api.pandalive.co.kr/v1/live/play'
-        resp2 = await request_with_proxy_group("POST", play_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data={'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''})
-        if resp2.status_code != 200: return {"streams": [], "isLive": False}
+        resp2 = await request_with_proxy_group(
+            "POST", play_url, proxy_list=EXTERNAL_PROXY_URLS,
+            headers=headers,
+            data={'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''})
+        print(f"[PandaTV] /live/play status={resp2.status_code}")
+        if resp2.status_code != 200:
+            print(f"[PandaTV] /live/play 非200，body={resp2.text[:200]}")
+            return {"streams": [], "isLive": False}
+
         play_json = resp2.json()
 
-        # 错误处理
         if 'errorData' in play_json:
             code = play_json['errorData'].get('code', '')
+            msg  = play_json.get('message', '')
+            print(f"[PandaTV] API errorData: code={code} msg={msg}")
             if code == 'needAdult':
-                print(f"[PandaTV] 直播间需要成年登录")
-            else:
-                print(f"[PandaTV] API错误: {code} {play_json.get('message','')}")
+                print("[PandaTV] 直播间需要成年认证登录")
             return {"streams": [], "isLive": False}
 
-        if 'PlayList' not in play_json or 'hls' not in play_json['PlayList']:
+        if 'PlayList' not in play_json:
+            print(f"[PandaTV] play_json 无 PlayList，keys={list(play_json.keys())}")
             return {"streams": [], "isLive": False}
 
-        real_m3u8 = play_json['PlayList']['hls'][0]['url']
+        hls_list = play_json['PlayList'].get('hls', [])
+        print(f"[PandaTV] hls条目数={len(hls_list)}")
+        if not hls_list:
+            print(f"[PandaTV] PlayList.hls 为空，PlayList keys={list(play_json['PlayList'].keys())}")
+            return {"streams": [], "isLive": False}
 
-        # 请求 master m3u8，解析多画质子流
+        real_m3u8 = hls_list[0]['url']
+        print(f"[PandaTV] master m3u8={real_m3u8}")
+
+        # ③ 解析多画质子流
         streams = []
         try:
-            master_resp = await request_with_proxy_group("GET", real_m3u8, proxy_list=EXTERNAL_PROXY_URLS,
-                                                         headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/"})
+            master_resp = await request_with_proxy_group(
+                "GET", real_m3u8, proxy_list=EXTERNAL_PROXY_URLS,
+                headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/"})
+            print(f"[PandaTV] master m3u8 status={master_resp.status_code}")
             if master_resp.status_code == 200:
                 lines = master_resp.text.splitlines()
                 for i, line in enumerate(lines):
@@ -600,22 +640,33 @@ async def parse_panda_manual(url):
                                 name = f"{kbps}k"
                         if i + 1 < len(lines):
                             sub_url = lines[i + 1].strip()
-                            if not sub_url:
+                            if not sub_url or sub_url.startswith('#'):
                                 continue
                             if not sub_url.startswith("http"):
                                 sub_url = urljoin(real_m3u8, sub_url)
                             streams.append({"cdn": f"PandaTV-{name}", "url": sub_url, "type": "m3u8"})
-                if streams:
-                    streams.sort(key=lambda s: float(s['cdn'].replace('PandaTV-','').replace('p','').replace('k','000')), reverse=True)
+                print(f"[PandaTV] 解析到 {len(streams)} 个子流")
+                # 排序：仅对纯数字画质排序，Source 统一排最后
+                def sort_key(s):
+                    label = s['cdn'].replace('PandaTV-', '')
+                    try:
+                        return -float(label.replace('p', '').replace('k', '000'))
+                    except ValueError:
+                        return 1  # "Source" 等非数字排最后
+                streams.sort(key=sort_key)
         except Exception as e:
-            print(f"[PandaTV] 解析多画质失败，回退到单一源: {e}")
+            print(f"[PandaTV] 解析多画质失败，回退单一源: {e}")
 
         if not streams:
+            print(f"[PandaTV] 子流为空，使用 master m3u8 直接播放")
             streams = [{"cdn": "PandaTV-Source", "url": real_m3u8, "type": "m3u8"}]
 
+        print(f"[PandaTV] 最终流列表: {[s['cdn'] for s in streams]}")
         return {"streams": streams, "title": f"{anchor_name}-{user_id}", "avatar": "", "isLive": True}
+
     except Exception as e:
         print(f"[PandaTV] 手动解析异常: {e}")
+        import traceback; traceback.print_exc()
         return {"streams": [], "isLive": False}
 
 @app.get("/api/parse")
