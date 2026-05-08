@@ -575,9 +575,54 @@ async def parse_panda_manual(url):
         resp2 = await request_with_proxy_group("POST", play_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data={'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''})
         if resp2.status_code != 200: return {"streams": [], "isLive": False}
         play_json = resp2.json()
-        if 'PlayList' not in play_json or 'hls' not in play_json['PlayList']: return {"streams": [], "isLive": False}
+
+        # 错误处理
+        if 'errorData' in play_json:
+            code = play_json['errorData'].get('code', '')
+            if code == 'needAdult':
+                print(f"[PandaTV] 直播间需要成年登录")
+            else:
+                print(f"[PandaTV] API错误: {code} {play_json.get('message','')}")
+            return {"streams": [], "isLive": False}
+
+        if 'PlayList' not in play_json or 'hls' not in play_json['PlayList']:
+            return {"streams": [], "isLive": False}
+
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
-        streams = [{"cdn": "PandaTV-Source", "url": real_m3u8, "type": "m3u8"}]
+
+        # 请求 master m3u8，解析多画质子流
+        streams = []
+        try:
+            master_resp = await request_with_proxy_group("GET", real_m3u8, proxy_list=EXTERNAL_PROXY_URLS,
+                                                         headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/"})
+            if master_resp.status_code == 200:
+                lines = master_resp.text.splitlines()
+                for i, line in enumerate(lines):
+                    if line.startswith("#EXT-X-STREAM-INF"):
+                        name = "Source"
+                        res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
+                        if res_match:
+                            name = res_match.group(1).split('x')[1] + 'p'
+                        else:
+                            bw_match = re.search(r'BANDWIDTH=(\d+)', line)
+                            if bw_match:
+                                kbps = int(int(bw_match.group(1)) / 1000)
+                                name = f"{kbps}k"
+                        if i + 1 < len(lines):
+                            sub_url = lines[i + 1].strip()
+                            if not sub_url:
+                                continue
+                            if not sub_url.startswith("http"):
+                                sub_url = urljoin(real_m3u8, sub_url)
+                            streams.append({"cdn": f"PandaTV-{name}", "url": sub_url, "type": "m3u8"})
+                if streams:
+                    streams.sort(key=lambda s: float(s['cdn'].replace('PandaTV-','').replace('p','').replace('k','000')), reverse=True)
+        except Exception as e:
+            print(f"[PandaTV] 解析多画质失败，回退到单一源: {e}")
+
+        if not streams:
+            streams = [{"cdn": "PandaTV-Source", "url": real_m3u8, "type": "m3u8"}]
+
         return {"streams": streams, "title": f"{anchor_name}-{user_id}", "avatar": "", "isLive": True}
     except Exception as e:
         print(f"[PandaTV] 手动解析异常: {e}")
