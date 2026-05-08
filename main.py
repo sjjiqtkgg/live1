@@ -102,7 +102,44 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
 
     resp = await request_with_proxy_group(request.method, url, proxy_list=proxy_list, headers=headers, content=body)
-    out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": resp.headers.get("content-type", "application/json")}
+    content_type = resp.headers.get("content-type", "")
+    is_m3u8 = (
+        "mpegurl" in content_type.lower()
+        or url.split("?")[0].endswith(".m3u8")
+    )
+    if is_m3u8:
+        # 重写 m3u8 中的相对/绝对 URL，使子播放列表和分片也走代理
+        base_url = url.rsplit("/", 1)[0] + "/"
+        parsed_cdn = urlparse(url)
+        cdn_origin = f"{parsed_cdn.scheme}://{parsed_cdn.netloc}"
+        # 用完整绝对 URL 避免 hls.js 相对路径解析错误
+        proxy_base = str(request.base_url).rstrip("/") + "/api/proxy"
+        eff_referer = referer or "https://play.sooplive.com"
+        lines = resp.text.splitlines()
+        rewritten = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                if stripped.startswith("http://") or stripped.startswith("https://"):
+                    abs_url = stripped
+                elif stripped.startswith("/"):
+                    # 以 / 开头的绝对路径，补全 CDN host
+                    abs_url = cdn_origin + stripped
+                else:
+                    abs_url = base_url + stripped
+                # safe='' 保证 URL 中的 : / ? = & 全部被编码
+                proxied = f"{proxy_base}?url={quote(abs_url, safe='')}&referer={quote(eff_referer, safe='')}"
+                rewritten.append(proxied)
+            else:
+                rewritten.append(line)
+        body_out = "\n".join(rewritten).encode("utf-8")
+        out_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Content-Type": "application/vnd.apple.mpegurl",
+        }
+        return StreamingResponse(iter([body_out]), status_code=resp.status_code, headers=out_headers)
+
+    out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": content_type or "application/json"}
     return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
 
 def build_streams(flv, m3u8):
