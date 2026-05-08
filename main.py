@@ -13,6 +13,7 @@ import ssl
 import traceback
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs, quote, urljoin
 
@@ -30,6 +31,7 @@ except ImportError:
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
@@ -43,15 +45,52 @@ EXTERNAL_PROXY_LIST_STR = os.getenv("EXTERNAL_PROXY_LIST", "")
 EXTERNAL_PROXY_URLS = [p.strip() for p in EXTERNAL_PROXY_LIST_STR.split(",") if p.strip()] if EXTERNAL_PROXY_LIST_STR else [None]
 print(f"[代理] 外网代理 {len(EXTERNAL_PROXY_URLS)} 个: {EXTERNAL_PROXY_URLS}")
 
+# ==================== 全局连接池 ====================
+CLIENT_POOL: dict = {}
+CLIENT_LOCK = asyncio.Lock()
+DEFAULT_TIMEOUT = 15
+
+async def get_client(proxy=None, timeout=None):
+    if timeout is None:
+        timeout = DEFAULT_TIMEOUT
+    key = f"{proxy or 'direct'}_t{timeout}"
+    async with CLIENT_LOCK:
+        if key not in CLIENT_POOL:
+            CLIENT_POOL[key] = httpx.AsyncClient(
+                timeout=timeout,
+                proxy=proxy,
+                http2=True,
+                verify=False,
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=20
+                )
+            )
+        return CLIENT_POOL[key]
+
+# ==================== 流媒体代理映射（TS 按主 m3u8 URL 固定） ====================
+STREAM_PROXY_MAP: dict = {}  # key: 主 m3u8 URL 的标识部分, value: proxy
+
+# ==================== m3u8 缓存 ====================
+M3U8_CACHE: dict = {}  # room_id -> {"data": parse_result, "expire": timestamp}
+
+def get_fixed_proxy_list(proxy_pool):
+    """返回一个列表，第一个元素是随机选择的代理，后面跟随其余代理（用于解析流程固定 IP）"""
+    if not proxy_pool or proxy_pool[0] is None:
+        return [None]
+    primary = random.choice(proxy_pool)
+    rest = [p for p in proxy_pool if p != primary]
+    return [primary] + rest
+
 async def request_with_retry(method, url, **kwargs):
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     for idx, proxy in enumerate(PROXY_URLS):
         try:
             print(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
-            async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
-                resp = await client.request(method, url, **kwargs)
-                return resp
+            client = await get_client(proxy, timeout)
+            resp = await client.request(method, url, **kwargs)
+            return resp
         except Exception as e:
             last_error = e
             print(f"[请求重试] 失败: {e}")
@@ -60,26 +99,24 @@ async def request_with_retry(method, url, **kwargs):
 async def request_with_proxy_group(method, url, proxy_list, **kwargs):
     last_error = None
     timeout = kwargs.pop("timeout", 15)
-    shuffle_proxy = kwargs.pop("shuffle_proxy", False)   # 是否随机轮换
+    shuffle_proxy = kwargs.pop("shuffle_proxy", False)
 
     targets = proxy_list[:]
     if shuffle_proxy and targets:
-        # 随机打乱，但不影响原列表
         random.shuffle(targets)
 
     for idx, proxy in enumerate(targets):
         try:
             print(f"[分组请求] 使用代理 [{idx+1}/{len(targets)}]: {proxy or '直连'}")
-            async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
-                resp = await client.request(method, url, **kwargs)
-                # 可选：调试出口 IP
-                if shuffle_proxy:
-                    try:
-                        ip_resp = await client.get("https://api.ipify.org")
-                        print(f"[出口IP] {ip_resp.text}")
-                    except Exception:
-                        pass
-                return resp
+            client = await get_client(proxy, timeout)
+            resp = await client.request(method, url, **kwargs)
+            if shuffle_proxy:
+                try:
+                    ip_resp = await client.get("https://api.ipify.org")
+                    print(f"[出口IP] {ip_resp.text}")
+                except Exception:
+                    pass
+            return resp
         except Exception as e:
             last_error = e
             print(f"[分组请求] 失败: {e}")
@@ -117,22 +154,27 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     )
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
 
-    # 判断是否为 TS 分片
     is_ts = url.lower().endswith(".ts")
 
     if is_ts:
-        # TS 分片固定一个代理 IP，避免 HLS 会话跳变
-        if proxy_list and proxy_list[0] is not None:
-            idx = hash(url) % len(proxy_list)
-            fixed_proxy = proxy_list[idx]
-            print(f"[TS固定代理] 使用代理: {fixed_proxy}")
+        # 使用主 m3u8 的 referer 作为流标识来固定代理
+        stream_key = referer or url
+        if stream_key not in STREAM_PROXY_MAP:
+            if proxy_list and proxy_list[0] is not None:
+                STREAM_PROXY_MAP[stream_key] = random.choice(proxy_list)
+            else:
+                STREAM_PROXY_MAP[stream_key] = None
+        fixed_proxy = STREAM_PROXY_MAP[stream_key]
+        if fixed_proxy:
             proxies_to_use = [fixed_proxy]
+            shuffle_proxy = False
+            print(f"[TS固定代理] 使用代理: {fixed_proxy}")
         else:
-            proxies_to_use = proxy_list  # 直连
-        shuffle_proxy = False
+            proxies_to_use = proxy_list
+            shuffle_proxy = False
     else:
         proxies_to_use = proxy_list
-        shuffle_proxy = True   # m3u8 等请求随机轮换 IP
+        shuffle_proxy = True  # m3u8 请求随机轮换
 
     resp = await request_with_proxy_group(
         request.method, url,
@@ -146,13 +188,10 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         or url.split("?")[0].endswith(".m3u8")
     )
     if is_m3u8:
-        # 重写 m3u8 中的相对/绝对 URL，使子播放列表和分片也走代理
         base_url = url.rsplit("/", 1)[0] + "/"
         parsed_cdn = urlparse(url)
         cdn_origin = f"{parsed_cdn.scheme}://{parsed_cdn.netloc}"
-        # 用完整绝对 URL 避免 hls.js 相对路径解析错误
         proxy_base = str(request.base_url).rstrip("/") + "/api/proxy"
-        # 根据 URL 自动选择合理的 Referer
         if referer:
             eff_referer = referer
         elif "pandalive" in url or "live-video.net" in url:
@@ -169,11 +208,9 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
                 if stripped.startswith("http://") or stripped.startswith("https://"):
                     abs_url = stripped
                 elif stripped.startswith("/"):
-                    # 以 / 开头的绝对路径，补全 CDN host
                     abs_url = cdn_origin + stripped
                 else:
                     abs_url = base_url + stripped
-                # safe='' 保证 URL 中的 : / ? = & 全部被编码
                 proxied = f"{proxy_base}?url={quote(abs_url, safe='')}&referer={quote(eff_referer, safe='')}"
                 rewritten.append(proxied)
             else:
@@ -185,6 +222,16 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         }
         return StreamingResponse(iter([body_out]), status_code=resp.status_code, headers=out_headers)
 
+    # TS 流式转发，避免内存堆积
+    if is_ts:
+        return StreamingResponse(
+            resp.aiter_bytes(),
+            status_code=resp.status_code,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Content-Type": content_type or "video/mp2t"
+            }
+        )
     out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": content_type or "application/json"}
     return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
 
@@ -430,7 +477,8 @@ async def parse_twitch(url):
         gql_url = "https://gql.twitch.tv/gql"
         payload = [{"operationName": "PlaybackAccessToken", "variables": {"login": channel, "playerType": "site"},
                      "query": "query PlaybackAccessToken($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: { platform: \"web\", playerType: $playerType, playerBackend: \"mediaplayer\" }) { value signature } }"}]
-        resp = await request_with_proxy_group("POST", gql_url, proxy_list=EXTERNAL_PROXY_URLS, json=payload, headers=headers, shuffle_proxy=True)
+        proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
+        resp = await request_with_proxy_group("POST", gql_url, proxy_list=proxylist, json=payload, headers=headers, shuffle_proxy=False)
         if resp.status_code != 200: return {"streams": [], "isLive": False}
         data = resp.json()
         token = sig = None
@@ -439,8 +487,8 @@ async def parse_twitch(url):
             if t: token, sig = t.get("value"), t.get("signature")
         if not token or not sig: return {"streams": [], "isLive": False}
         m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true"
-        usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=EXTERNAL_PROXY_URLS,
-                                                     headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"}, shuffle_proxy=True)
+        usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=proxylist,
+                                                     headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"}, shuffle_proxy=False)
         if usher_resp.status_code != 200: return {"streams": [], "isLive": False}
         if "#EXT-X-STREAM-INF" not in usher_resp.text: return {"streams": [], "isLive": False}
         streams, lines = [], usher_resp.text.splitlines()
@@ -463,6 +511,12 @@ async def parse_twitch(url):
 # ==================== SOOP ====================
 async def parse_soop(url):
     try:
+        # 尝试从缓存读取
+        cached = M3U8_CACHE.get(url)
+        if cached and cached["expire"] > time.time():
+            print(f"[SOOP] 使用缓存: {url}")
+            return cached["data"]
+
         parts = url.rstrip('/').split('/')
         bj_id = parts[3].split('?')[0] if len(parts) > 3 else parts[-1].split('?')[0]
 
@@ -473,9 +527,11 @@ async def parse_soop(url):
             'referer': 'https://play.sooplive.com',
         }
 
+        proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
+
         # 1. 获取主播昵称
         nick_api = f'https://st.sooplive.com/api/get_station_status.php?szBjId={bj_id}'
-        nick_resp = await request_with_proxy_group("GET", nick_api, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc, shuffle_proxy=True)
+        nick_resp = await request_with_proxy_group("GET", nick_api, proxy_list=proxylist, headers=headers_pc, shuffle_proxy=False)
         if nick_resp.status_code != 200:
             return {"streams": [], "isLive": False}
         nick_data = nick_resp.json()
@@ -495,7 +551,7 @@ async def parse_soop(url):
             'from_api': '0',
             'is_revive': 'false',
         }
-        live_resp = await request_with_proxy_group("POST", live_api, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc, data=live_data_form, shuffle_proxy=True)
+        live_resp = await request_with_proxy_group("POST", live_api, proxy_list=proxylist, headers=headers_pc, data=live_data_form, shuffle_proxy=False)
         if live_resp.status_code != 200:
             return {"streams": [], "isLive": False}
         live_json = live_resp.json()
@@ -508,7 +564,7 @@ async def parse_soop(url):
         if not broad_no:
             return {"streams": [], "isLive": False}
 
-        # 3. 动态时间戳获取CDN View URL
+        # 3. 获取CDN View URL
         ts = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
@@ -518,7 +574,7 @@ async def parse_soop(url):
             'time': str(ts),
         }
         cdn_url = 'http://livestream-manager.sooplive.com/broad_stream_assign.html'
-        cdn_resp = await request_with_proxy_group("GET", cdn_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc, params=cdn_params, shuffle_proxy=True)
+        cdn_resp = await request_with_proxy_group("GET", cdn_url, proxy_list=proxylist, headers=headers_pc, params=cdn_params, shuffle_proxy=False)
         if cdn_resp.status_code != 200:
             return {"streams": [], "isLive": False}
         cdn_json = cdn_resp.json()
@@ -526,10 +582,10 @@ async def parse_soop(url):
         if not view_url:
             return {"streams": [], "isLive": False}
 
-        # 4. 获取 AID 鉴权
+        # 4. 获取 AID
         aid_form = live_data_form.copy()
         aid_form['type'] = 'aid'
-        aid_resp = await request_with_proxy_group("POST", live_api, proxy_list=EXTERNAL_PROXY_URLS, headers=headers_pc, data=aid_form, shuffle_proxy=True)
+        aid_resp = await request_with_proxy_group("POST", live_api, proxy_list=proxylist, headers=headers_pc, data=aid_form, shuffle_proxy=False)
         if aid_resp.status_code != 200:
             return {"streams": [], "isLive": False}
         aid_json = aid_resp.json()
@@ -537,15 +593,15 @@ async def parse_soop(url):
         if not aid:
             return {"streams": [], "isLive": False}
 
-        # 5. 拼接最终 master m3u8
+        # 5. 拼接 m3u8
         m3u8_url = f'{view_url}?aid={aid}'
 
-        # 6. 请求 master m3u8，解析多画质子流
+        # 6. 请求 master m3u8，解析多画质
         streams = []
         try:
             master_resp = await request_with_proxy_group(
-                "GET", m3u8_url, proxy_list=EXTERNAL_PROXY_URLS,
-                headers={"User-Agent": UA, "Referer": "https://play.sooplive.com"}, shuffle_proxy=True
+                "GET", m3u8_url, proxy_list=proxylist,
+                headers={"User-Agent": UA, "Referer": "https://play.sooplive.com"}, shuffle_proxy=False
             )
             if master_resp.status_code == 200:
                 lines = master_resp.text.splitlines()
@@ -579,7 +635,10 @@ async def parse_soop(url):
         if not streams:
             streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
 
-        return {"streams": streams, "title": f"{nickname}-{bj_id}", "avatar": "", "isLive": True}
+        result = {"streams": streams, "title": f"{nickname}-{bj_id}", "avatar": "", "isLive": True}
+        # 缓存30秒
+        M3U8_CACHE[url] = {"data": result, "expire": time.time() + 30}
+        return result
 
     except Exception as e:
         print(f"[SOOP] 解析异常: {e}")
@@ -591,12 +650,20 @@ async def parse_panda(url):
 
 async def parse_panda_manual(url):
     try:
+        # 尝试缓存
+        cached = M3U8_CACHE.get(url)
+        if cached and cached["expire"] > time.time():
+            print(f"[PandaTV] 使用缓存: {url}")
+            return cached["data"]
+
         user_id = url.split('?')[0].rstrip('/').split('/')[-1]
         headers = {'origin': 'https://www.pandalive.co.kr', 'referer': 'https://www.pandalive.co.kr/', 'user-agent': UA}
 
-        # 1. 获取主播信息与直播状态
+        proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
+
+        # 1. 获取主播信息
         info_url = 'https://api.pandalive.co.kr/v1/member/bj'
-        resp = await request_with_proxy_group("POST", info_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data={'userId': user_id, 'info': 'media fanGrade'}, shuffle_proxy=True)
+        resp = await request_with_proxy_group("POST", info_url, proxy_list=proxylist, headers=headers, data={'userId': user_id, 'info': 'media fanGrade'}, shuffle_proxy=False)
         if resp.status_code != 200:
             print(f"[PandaTV] member/bj 请求失败: {resp.status_code}")
             return {"streams": [], "isLive": False}
@@ -611,7 +678,7 @@ async def parse_panda_manual(url):
 
         # 2. 获取播放地址
         play_url = 'https://api.pandalive.co.kr/v1/live/play'
-        resp2 = await request_with_proxy_group("POST", play_url, proxy_list=EXTERNAL_PROXY_URLS, headers=headers, data={'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''}, shuffle_proxy=True)
+        resp2 = await request_with_proxy_group("POST", play_url, proxy_list=proxylist, headers=headers, data={'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''}, shuffle_proxy=False)
         if resp2.status_code != 200:
             print(f"[PandaTV] live/play 请求失败: {resp2.status_code}")
             return {"streams": [], "isLive": False}
@@ -626,11 +693,11 @@ async def parse_panda_manual(url):
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
         print(f"[PandaTV] 获取到 master m3u8: {real_m3u8}")
 
-        # 3. 请求 master m3u8 并解析多画质
+        # 3. 解析多画质
         streams = []
         try:
-            master_resp = await request_with_proxy_group("GET", real_m3u8, proxy_list=EXTERNAL_PROXY_URLS,
-                                                         headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/"}, shuffle_proxy=True)
+            master_resp = await request_with_proxy_group("GET", real_m3u8, proxy_list=proxylist,
+                                                         headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/"}, shuffle_proxy=False)
             if master_resp.status_code != 200:
                 print(f"[PandaTV] m3u8 请求失败: {master_resp.status_code}, 回退单一源")
             else:
@@ -660,8 +727,11 @@ async def parse_panda_manual(url):
 
         if not streams:
             streams = [{"cdn": "PandaTV-Source", "url": real_m3u8, "type": "m3u8"}]
+        result = {"streams": streams, "title": f"{anchor_name}-{user_id}", "avatar": "", "isLive": True}
         print(f"[PandaTV] 最终流列表: {[s['cdn'] for s in streams]}")
-        return {"streams": streams, "title": f"{anchor_name}-{user_id}", "avatar": "", "isLive": True}
+        # 缓存30秒
+        M3U8_CACHE[url] = {"data": result, "expire": time.time() + 30}
+        return result
 
     except Exception as e:
         print(f"[PandaTV] 手动解析异常: {e}")
@@ -697,7 +767,6 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                     while True:
                         data = await websocket.receive_text()
                         if data == 'ping':
-                            # 发送 WebSocket ping 帧给 Go 保活
                             try:
                                 await go_ws.ping()
                             except Exception:
