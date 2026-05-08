@@ -609,7 +609,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     go_task = None
 
     try:
-        go_ws = await websockets.connect(go_ws_url, ping_间隔=None)
+        go_ws = await websockets.connect(go_ws_url, ping_interval=None)
         print(f"[WS] 已连接 Go 服务: {go_ws_url}")
 
         async def forward_to_go():
