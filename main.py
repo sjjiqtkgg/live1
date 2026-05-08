@@ -14,7 +14,7 @@ import traceback
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from urllib.parse import unquote, urlparse, parse_qs, quote
+from urllib.parse import unquote, urlparse, parse_qs, quote, urljoin
 
 try:
     from streamget.platforms.soop.live_stream import SoopLiveStream
@@ -405,7 +405,6 @@ async def parse_twitch(url):
                 if i+1 < len(lines):
                     sub_url = lines[i+1].strip()
                     if not sub_url.startswith("http"):
-                        from urllib.parse import urljoin
                         sub_url = urljoin(m3u8_url, sub_url)
                     streams.append({"cdn": f"Twitch-{name}", "url": sub_url, "type": "m3u8"})
         streams.sort(key=lambda s: (0 if "source" in s["cdn"] else 1, s["cdn"]))
@@ -494,7 +493,7 @@ async def parse_soop(url):
         if not aid:
             return {"streams": [], "isLive": False}
 
-        # 5. 拼接最终 m3u8
+        # 5. 拼接最终 master m3u8
         m3u8_url = f'{view_url}?aid={aid}'
 
         # 6. 请求 master m3u8，解析多画质子流
@@ -502,42 +501,36 @@ async def parse_soop(url):
         try:
             master_resp = await request_with_proxy_group(
                 "GET", m3u8_url, proxy_list=EXTERNAL_PROXY_URLS,
-                headers={
-                    "User-Agent": UA,
-                    "Referer": "https://play.sooplive.com"
-                }
+                headers={"User-Agent": UA, "Referer": "https://play.sooplive.com"}
             )
             if master_resp.status_code == 200:
                 lines = master_resp.text.splitlines()
                 for i, line in enumerate(lines):
                     if line.startswith("#EXT-X-STREAM-INF"):
-                        # 默认名称
                         name = "Source"
                         # 优先用分辨率
                         res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
                         if res_match:
-                            name = res_match.group(1).split('x')[1] + 'p'  # 如 720p
+                            name = res_match.group(1).split('x')[1] + 'p'
                         else:
                             # 次选带宽
                             bw_match = re.search(r'BANDWIDTH=(\d+)', line)
                             if bw_match:
                                 kbps = int(int(bw_match.group(1)) / 1000)
                                 name = f"{kbps}k"
-                        # 下一行是子流 URL
                         if i + 1 < len(lines):
                             sub_url = lines[i + 1].strip()
                             if not sub_url:
                                 continue
                             # 补全相对路径
                             if not sub_url.startswith("http"):
-                                from urllib.parse import urljoin
                                 sub_url = urljoin(m3u8_url, sub_url)
                             streams.append({
                                 "cdn": f"SOOP-{name}",
                                 "url": sub_url,
                                 "type": "m3u8"
                             })
-                # 按带宽从高到低排序（画质降序）
+                # 按画质从高到低排序
                 if streams:
                     streams.sort(key=lambda s: float(s['cdn'].replace('SOOP-','').replace('p','').replace('k','000')), reverse=True)
         except Exception as e:
@@ -548,6 +541,10 @@ async def parse_soop(url):
             streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
 
         return {"streams": streams, "title": f"{nickname}-{bj_id}", "avatar": "", "isLive": True}
+
+    except Exception as e:
+        print(f"[SOOP] 解析异常: {e}")
+        return {"streams": [], "isLive": False}
 
 # ==================== PandaTV ====================
 async def parse_panda(url):
@@ -612,7 +609,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     go_task = None
 
     try:
-        go_ws = await websockets.connect(go_ws_url, ping_interval=None)
+        go_ws = await websockets.connect(go_ws_url, ping_间隔=None)
         print(f"[WS] 已连接 Go 服务: {go_ws_url}")
 
         async def forward_to_go():
