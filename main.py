@@ -142,6 +142,13 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
+    # Amazon IVS (live-video.net) 强制校验 Origin（JWT aws:strict-origin-enforcement=true）
+    # 必须携带匹配的 Origin，否则直接 403
+    _ivs_host = urlparse(url).hostname or ""
+    if "live-video.net" in _ivs_host:
+        headers["Origin"] = "https://www.pandalive.co.kr"
+        headers["Referer"] = "https://www.pandalive.co.kr/"
+
     EXTERNAL_DOMAINS = [
         "twitch.tv", "ttvnw.net", "twitchsvc.net",
         "sooplive.com", "livestream-manager.sooplive.com",
