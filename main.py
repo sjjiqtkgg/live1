@@ -142,13 +142,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     if request.method == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    # Amazon IVS (live-video.net) 强制校验 Origin（JWT aws:strict-origin-enforcement=true）
-    # 必须携带匹配的 Origin，否则直接 403
-    _ivs_host = urlparse(url).hostname or ""
-    if "live-video.net" in _ivs_host:
-        headers["Origin"] = "https://www.pandalive.co.kr"
-        headers["Referer"] = "https://www.pandalive.co.kr/"
-
     EXTERNAL_DOMAINS = [
         "twitch.tv", "ttvnw.net", "twitchsvc.net",
         "sooplive.com", "livestream-manager.sooplive.com",
@@ -704,7 +697,7 @@ async def parse_panda_manual(url):
         streams = []
         try:
             master_resp = await request_with_proxy_group("GET", real_m3u8, proxy_list=proxylist,
-                                                         headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/"}, shuffle_proxy=False)
+                                                         headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/", "Origin": "https://www.pandalive.co.kr"}, shuffle_proxy=False)
             if master_resp.status_code != 200:
                 print(f"[PandaTV] m3u8 请求失败: {master_resp.status_code}, 回退单一源")
             else:
