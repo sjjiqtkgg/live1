@@ -154,11 +154,13 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     )
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
 
-    is_ts = url.lower().endswith(".ts")
+    is_ts = url.lower().endswith(".ts") or (".ts?" in url.lower() and "live-video.net" in url)
+    _is_ivs = "live-video.net" in (urlparse(url).hostname or "")
 
-    if is_ts:
-        # 使用主 m3u8 的 referer 作为流标识来固定代理
-        stream_key = referer or url
+    if is_ts or _is_ivs:
+        # TS 文件 & Amazon IVS m3u8 子流：锁定单一代理 IP 贯穿整个播放会话
+        # Amazon IVS/CloudFront 会封杀部分数据中心 IP，随机轮换会大概率命中被封 IP
+        stream_key = referer or url.split("/v1/")[0]  # 以主播流为粒度锁定
         if stream_key not in STREAM_PROXY_MAP:
             if proxy_list and proxy_list[0] is not None:
                 STREAM_PROXY_MAP[stream_key] = random.choice(proxy_list)
@@ -168,13 +170,14 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         if fixed_proxy:
             proxies_to_use = [fixed_proxy]
             shuffle_proxy = False
-            print(f"[TS固定代理] 使用代理: {fixed_proxy}")
+            label = "IVS-m3u8锁定代理" if _is_ivs else "TS固定代理"
+            print(f"[{label}] 使用代理: {fixed_proxy}")
         else:
             proxies_to_use = proxy_list
             shuffle_proxy = False
     else:
         proxies_to_use = proxy_list
-        shuffle_proxy = True  # m3u8 请求随机轮换
+        shuffle_proxy = True  # 其他平台 m3u8 请求随机轮换
 
     resp = await request_with_proxy_group(
         request.method, url,
@@ -692,6 +695,17 @@ async def parse_panda_manual(url):
             return {"streams": [], "isLive": False}
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
         print(f"[PandaTV] 获取到 master m3u8: {real_m3u8}")
+
+        # 把当前使用的代理 IP 预先写入 STREAM_PROXY_MAP
+        # 这样前端通过 /api/proxy 请求子流 m3u8 时，会使用同一个 IP
+        # 避免 CloudFront 因 IP 切换而 403
+        _panda_referer = "https://www.pandalive.co.kr/"
+        # stream_key 与 api_proxy 中保持一致：用 referer（所有 PandaTV 子流共享同一 key）
+        _panda_stream_key = _panda_referer
+        if proxylist and proxylist[0] is not None:
+            _locked_proxy = proxylist[0]  # get_fixed_proxy_list 已把选中 IP 排在首位
+            STREAM_PROXY_MAP[_panda_stream_key] = _locked_proxy
+            print(f"[PandaTV] 锁定代理 IP: {_locked_proxy}")
 
         # 3. 解析多画质
         streams = []
