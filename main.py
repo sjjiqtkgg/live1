@@ -45,6 +45,13 @@ EXTERNAL_PROXY_LIST_STR = os.getenv("EXTERNAL_PROXY_LIST", "")
 EXTERNAL_PROXY_URLS = [p.strip() for p in EXTERNAL_PROXY_LIST_STR.split(",") if p.strip()] if EXTERNAL_PROXY_LIST_STR else [None]
 print(f"[代理] 外网代理 {len(EXTERNAL_PROXY_URLS)} 个: {EXTERNAL_PROXY_URLS}")
 
+# CF Worker URL，用于海外平台 m3u8 拉取（不受外网代理 IP 封禁影响）
+CF_WORKER = os.getenv("CF_WORKER_URL", "")
+if CF_WORKER:
+    print(f"[CF Worker] 已配置: {CF_WORKER}")
+else:
+    print("[CF Worker] 未配置，海外平台 m3u8 将走外网代理")
+
 # ==================== 全局连接池 ====================
 CLIENT_POOL: dict = {}
 CLIENT_LOCK = asyncio.Lock()
@@ -192,12 +199,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         parsed_cdn = urlparse(url)
         cdn_origin = f"{parsed_cdn.scheme}://{parsed_cdn.netloc}"
         proxy_base = str(request.base_url).rstrip("/") + "/api/proxy"
-        # 海外平台（PandaTV/SOOP/Twitch）的 m3u8 子流地址重写到 CF Worker
-        # 这样 TS 切片直接从浏览器 → CF Worker → CDN，不再经过 Render
-        CF_WORKER = os.getenv("CF_WORKER_URL", "").rstrip("/")
-        is_foreign = any(d in url for d in ("live-video.net", "pandalive", "sooplive", "ttvnw", "twitch"))
-        if CF_WORKER and is_foreign:
-            proxy_base = CF_WORKER
         if referer:
             eff_referer = referer
         elif "pandalive" in url or "live-video.net" in url:
@@ -700,10 +701,18 @@ async def parse_panda_manual(url):
         print(f"[PandaTV] 获取到 master m3u8: {real_m3u8}")
 
         # 3. 解析多画质
+        # 优先通过 CF Worker 拉取 master m3u8（不依赖外网代理 IP，不会被 AWS 封）
         streams = []
         try:
-            master_resp = await request_with_proxy_group("GET", real_m3u8, proxy_list=proxylist,
-                                                         headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/"}, shuffle_proxy=False)
+            cf_worker = CF_WORKER.rstrip("/") if CF_WORKER else ""
+            if cf_worker:
+                fetch_url = f"{cf_worker}?url={quote(real_m3u8, safe='')}&referer={quote('https://www.pandalive.co.kr/', safe='')}"
+                master_resp = await request_with_proxy_group("GET", fetch_url, proxy_list=[None],
+                                                             headers={"User-Agent": UA}, shuffle_proxy=False)
+                print(f"[PandaTV] 通过 CF Worker 拉取 master m3u8: {master_resp.status_code}")
+            else:
+                master_resp = await request_with_proxy_group("GET", real_m3u8, proxy_list=proxylist,
+                                                             headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/", "Origin": "https://www.pandalive.co.kr"}, shuffle_proxy=False)
             if master_resp.status_code != 200:
                 print(f"[PandaTV] m3u8 请求失败: {master_resp.status_code}, 回退单一源")
             else:
