@@ -199,6 +199,12 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         parsed_cdn = urlparse(url)
         cdn_origin = f"{parsed_cdn.scheme}://{parsed_cdn.netloc}"
         proxy_base = str(request.base_url).rstrip("/") + "/api/proxy"
+        # 海外平台子流地址重写到 CF Worker，不再经过 Render
+        _is_foreign_stream = any(d in url for d in (
+            "live-video.net", "pandalive", "sooplive", "ttvnw", "twitch"
+        ))
+        if CF_WORKER and _is_foreign_stream:
+            proxy_base = CF_WORKER.rstrip("/")
         if referer:
             eff_referer = referer
         elif "pandalive" in url or "live-video.net" in url:
