@@ -47,7 +47,6 @@ print(f"[代理] 外网代理 {len(EXTERNAL_PROXY_URLS)} 个: {EXTERNAL_PROXY_UR
 
 # CF Worker URL，用于海外平台 m3u8 拉取（不受外网代理 IP 封禁影响）
 CF_WORKER = os.getenv("CF_WORKER_URL", "")
-SOOP_COOKIE = os.getenv("SOOP_COOKIE", "")
 if CF_WORKER:
     print(f"[CF Worker] 已配置: {CF_WORKER}")
 else:
@@ -481,13 +480,17 @@ async def parse_douyin(url):
         return {"streams": [], "isLive": False}
 
 # ==================== Twitch ====================
-async def parse_twitch(url):
+async def parse_twitch(url, cookie: str = ""):
     try:
         match = re.search(r"twitch\.tv/([^/?]+)", url)
         if not match: return {"streams": [], "isLive": False}
         channel = match.group(1)
         client_id = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+        eff_cookie = cookie or TWITCH_COOKIE
         headers = {"Client-ID": client_id, "Content-Type": "application/json", "User-Agent": UA}
+        if eff_cookie:
+            headers["Cookie"] = eff_cookie
+            print(f"[Twitch] 携带登录 Cookie 请求 1080p60")
         gql_url = "https://gql.twitch.tv/gql"
         payload = [{"operationName": "PlaybackAccessToken", "variables": {"login": channel, "playerType": "site"},
                      "query": "query PlaybackAccessToken($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: { platform: \"web\", playerType: $playerType, playerBackend: \"mediaplayer\" }) { value signature } }"}]
@@ -500,7 +503,7 @@ async def parse_twitch(url):
             t = data[0].get("data", {}).get("streamPlaybackAccessToken")
             if t: token, sig = t.get("value"), t.get("signature")
         if not token or not sig: return {"streams": [], "isLive": False}
-        m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true"
+        m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true&allow_spectre=true&fast_bread=true"
         usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=proxylist,
                                                      headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"}, shuffle_proxy=False)
         if usher_resp.status_code != 200: return {"streams": [], "isLive": False}
@@ -523,12 +526,10 @@ async def parse_twitch(url):
         return {"streams": [], "isLive": False}
 
 # ==================== SOOP ====================
-async def parse_soop(url, cookie: str = ""):
+async def parse_soop(url):
     try:
-        eff_cookie = cookie or SOOP_COOKIE
-        # 19+ 直播间不用缓存（带 cookie 的结果不应被无 cookie 的请求复用）
-        cache_key = url + ("_auth" if eff_cookie else "")
-        cached = M3U8_CACHE.get(cache_key)
+        # 尝试从缓存读取
+        cached = M3U8_CACHE.get(url)
         if cached and cached["expire"] > time.time():
             print(f"[SOOP] 使用缓存: {url}")
             return cached["data"]
@@ -542,9 +543,6 @@ async def parse_soop(url, cookie: str = ""):
             'origin': 'https://play.sooplive.com',
             'referer': 'https://play.sooplive.com',
         }
-        if eff_cookie:
-            headers_pc['cookie'] = eff_cookie
-            print(f"[SOOP] 携带 Cookie 请求（{len(eff_cookie)} 字符）")
 
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
@@ -576,10 +574,6 @@ async def parse_soop(url, cookie: str = ""):
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
         result_code = channel.get('RESULT', -1)
-        print(f"[SOOP] RESULT={result_code}, cookie={'有' if eff_cookie else '无'}")
-        if result_code == -6:
-            print("[SOOP] 19+ 成年内容，需要登录 Cookie")
-            return {"streams": [], "isLive": False, "error": "19+成年直播间，请在设置中填入SOOP登录Cookie"}
         if result_code not in [0, 1]:
             return {"streams": [], "isLive": False}
         broad_no = channel.get('BNO', '')
@@ -769,14 +763,14 @@ async def parse_panda_manual(url):
         return {"streams": [], "isLive": False}
 
 @app.get("/api/parse")
-async def api_parse(url: str = Query(...), cookie: str = Query("")):
+async def api_parse(url: str = Query(...)):
     try:
         if "huya.com" in url: return await parse_huya(url)
         if "douyu.com" in url: return await parse_douyu(url)
         if "bilibili.com" in url: return await parse_bilibili(url)
         if "douyin.com" in url: return await parse_douyin(url)
-        if "twitch.tv" in url: return await parse_twitch(url)
-        if "sooplive.com" in url: return await parse_soop(url, cookie=cookie)
+        if "twitch.tv" in url: return await parse_twitch(url, cookie=cookie)
+        if "sooplive.com" in url: return await parse_soop(url)
         if "pandalive.co.kr" in url: return await parse_panda(url)
         raise HTTPException(400, "不支持的平台")
     except HTTPException: raise
