@@ -23,6 +23,13 @@ except ImportError:
     SoopLiveStream = None
 
 try:
+    from python_socks.sync import Proxy
+    SOCKS_SUPPORT = True
+except ImportError:
+    SOCKS_SUPPORT = False
+    print("[警告] python_socks 未安装，WebSocket 将不使用代理")
+
+try:
     import websocket as websocket_client  # websocket-client 库，用于 Twitch IRC
     WEBSOCKET_CLIENT_AVAILABLE = True
 except ImportError:
