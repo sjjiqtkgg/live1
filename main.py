@@ -520,8 +520,9 @@ async def parse_douyin(url):
                 match = re.search(r'"room_id":"(\d+)"', resp.text)
                 if match: room_id = match.group(1)
             except Exception: pass
+        print(f"[抖音DEBUG] raw keys: {list(raw.keys())}, avatar相关: { {k:v for k,v in raw.items() if 'avatar' in k.lower() or 'head' in k.lower() or 'img' in k.lower() or 'cover' in k.lower()} }")
         return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"),
-                "avatar": raw.get("avatar", ""), "roomId": room_id, "isLive": True}
+                "avatar": raw.get("avatar") or raw.get("avatar_thumb") or raw.get("head_img_url") or raw.get("cover") or "", "roomId": room_id, "isLive": True}
     except Exception as e:
         print(f"[抖音] 解析异常: {e}")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
