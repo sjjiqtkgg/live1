@@ -345,7 +345,12 @@ async def parse_huya(url):
             except Exception:
                 pass
         anchor_name = anchor_name or "虎牙主播"
-        avatar = profile.get("avatar", "") or anchor.get("avatar", "")
+        avatar = (
+            profile.get("sAvatar180") or profile.get("sAvatar") or
+            profile.get("avatar") or anchor.get("sAvatar180") or
+            anchor.get("sAvatar") or anchor.get("avatar") or
+            room_info.get("sAvatar180") or room_info.get("sAvatar") or ""
+        )
 
         if live.get("realLiveStatus") != "ON":
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
