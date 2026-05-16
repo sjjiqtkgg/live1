@@ -36,7 +36,33 @@ except ImportError:
     WEBSOCKET_CLIENT_AVAILABLE = False
     print("[警告] websocket-client 未安装，Twitch 弹幕不可用")
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    # 启动时开始后台任务：每60秒清理过期缓存
+    async def _cache_cleanup():
+        while True:
+            await asyncio.sleep(60)
+            now = time.time()
+            expired = [k for k, v in list(M3U8_CACHE.items()) if v.get('expire', 0) < now]
+            for k in expired:
+                M3U8_CACHE.pop(k, None)
+            if expired:
+                print(f"[缓存] 清理 {len(expired)} 条过期条目，剩余 {len(M3U8_CACHE)} 条")
+            # STREAM_PROXY_MAP 超过500条时清半（保留最新的250条）
+            if len(STREAM_PROXY_MAP) > 500:
+                keys = list(STREAM_PROXY_MAP.keys())
+                for k in keys[:250]:
+                    STREAM_PROXY_MAP.pop(k, None)
+                print(f"[缓存] STREAM_PROXY_MAP 超限，已清理至 {len(STREAM_PROXY_MAP)} 条")
+    task = asyncio.create_task(_cache_cleanup())
+    yield
+    task.cancel()
+    try: await task
+    except asyncio.CancelledError: pass
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
