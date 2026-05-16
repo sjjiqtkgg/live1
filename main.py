@@ -23,11 +23,11 @@ except ImportError:
     SoopLiveStream = None
 
 try:
-    from python_socks.sync import Proxy
-    SOCKS_SUPPORT = True
+    import websocket as websocket_client  # websocket-client 库，用于 Twitch IRC
+    WEBSOCKET_CLIENT_AVAILABLE = True
 except ImportError:
-    SOCKS_SUPPORT = False
-    print("[警告] python_socks 未安装，WebSocket 将不使用代理")
+    WEBSOCKET_CLIENT_AVAILABLE = False
+    print("[警告] websocket-client 未安装，Twitch 弹幕不可用")
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -850,8 +850,11 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         except: pass
 
 @app.websocket("/ws/twitch/{channel_name}")
-async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
-    await websocket.accept()
+async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
+    await ws_conn.accept()
+    if not WEBSOCKET_CLIENT_AVAILABLE:
+        await ws_conn.close()
+        return
     stop_event = threading.Event()
     queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
@@ -862,7 +865,7 @@ async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
         if m:
             asyncio.run_coroutine_threadsafe(queue.put({"type":"chat","nick":m.group(1),"content":m.group(2)}), loop)
     def run():
-        ws = websocket.WebSocketApp("wss://irc-ws.chat.twitch.tv:443",
+        ws = websocket_client.WebSocketApp("wss://irc-ws.chat.twitch.tv:443",
                                      on_message=on_msg,
                                      on_error=lambda w,e: print(f"Twitch IRC err: {e}"),
                                      on_close=lambda w,c,m: print("Twitch IRC closed"))
@@ -875,13 +878,13 @@ async def websocket_twitch_danmaku(websocket: WebSocket, channel_name: str):
         while not stop_event.is_set():
             try:
                 msg = await asyncio.wait_for(queue.get(), 1)
-                await websocket.send_json(msg)
+                await ws_conn.send_json(msg)
             except: pass
     send_task = asyncio.create_task(sender())
     try:
         while True:
-            data = await websocket.receive_text()
-            if data == "ping": await websocket.send_text("pong")
+            data = await ws_conn.receive_text()
+            if data == "ping": await ws_conn.send_text("pong")
     except WebSocketDisconnect:
         pass
     finally:
