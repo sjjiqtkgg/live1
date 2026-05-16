@@ -346,10 +346,11 @@ async def parse_huya(url):
                 pass
         anchor_name = anchor_name or "虎牙主播"
         avatar = (
-            profile.get("sAvatar180") or profile.get("sAvatar") or
-            profile.get("avatar") or anchor.get("sAvatar180") or
+            profile.get("avatar180") or profile.get("sAvatar180") or
+            profile.get("sAvatar") or profile.get("avatar") or
+            anchor.get("avatar180") or anchor.get("sAvatar180") or
             anchor.get("sAvatar") or anchor.get("avatar") or
-            room_info.get("sAvatar180") or room_info.get("sAvatar") or ""
+            room_info.get("avatar180") or room_info.get("sAvatar180") or ""
         )
 
         if live.get("realLiveStatus") != "ON":
@@ -520,17 +521,31 @@ async def parse_douyin(url):
                 match = re.search(r'"room_id":"(\d+)"', resp.text)
                 if match: room_id = match.group(1)
             except Exception: pass
-        # streamget 不返回头像，从页面 HTML 里单独提取
+        # 从 webcast API 获取头像（比页面 HTML 提取更稳定）
         avatar = ""
         try:
-            resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
-            m = re.search(r'"avatar_thumb":\{"url_list":\["([^"]+)"', resp.text) or \
-                re.search(r'"avatar":\{"url_list":\["([^"]+)"', resp.text) or \
-                re.search(r'"head_img_url":"([^"]+)"', resp.text)
-            if m:
-                avatar = m.group(1).replace("\\u002F", "/")
+            wc_resp = await request_with_retry(
+                "GET",
+                f"https://webcast.amemv.com/douyin/webcast/reflow/{room_id}",
+                headers={"User-Agent": UA, "Referer": "https://live.douyin.com/"}
+            )
+            wc_data = wc_resp.json()
+            url_list = (wc_data.get("data", {}).get("room", {})
+                        .get("owner", {}).get("avatarThumb", {}).get("urlList", []))
+            if url_list:
+                avatar = url_list[0]
         except Exception:
             pass
+        # 降级：从页面 HTML 提取
+        if not avatar:
+            try:
+                resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
+                m = re.search(r'"avatarThumb":\{"urlList":\["([^"]+)"', resp.text) or \
+                    re.search(r'"avatar_thumb":\{"url_list":\["([^"]+)"', resp.text)
+                if m:
+                    avatar = m.group(1).replace("\\u002F", "/")
+            except Exception:
+                pass
         return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"),
                 "avatar": avatar, "roomId": room_id, "isLive": True}
     except Exception as e:
