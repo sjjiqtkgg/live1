@@ -352,6 +352,7 @@ async def parse_huya(url):
             anchor.get("sAvatar") or anchor.get("avatar") or
             room_info.get("avatar180") or room_info.get("sAvatar180") or ""
         )
+        print(f"[虎牙DEBUG] profile keys={list(profile.keys())[:15]}, anchor keys={list(anchor.keys())[:15]}, avatar={'有:'+avatar[:30] if avatar else '空'}")
 
         if live.get("realLiveStatus") != "ON":
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
