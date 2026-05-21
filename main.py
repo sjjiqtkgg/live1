@@ -368,7 +368,7 @@ async def parse_huya(url):
             stream_name = s.get("sStreamName", "")
             anti_code = s.get("sFlvAntiCode", "")
             suffix = s.get("sFlvUrlSuffix", "flv")
-            if not (flv_url && stream_name && anti_code): continue
+            if not (flv_url and stream_name and anti_code): continue  # 【已修正该行的语法错误】
             built = huya_build_anticode(anti_code, stream_name)
             full_url = f"{flv_url}/{stream_name}.{suffix}?{built}"
             label = CDN_NAMES.get(cdn_type, cdn_type or "CDN")
