@@ -352,7 +352,6 @@ async def parse_huya(url):
             anchor.get("sAvatar") or anchor.get("avatar") or
             room_info.get("avatar180") or room_info.get("sAvatar180") or ""
         )
-        print(f"[虎牙DEBUG] profile keys={list(profile.keys())[:15]}, anchor keys={list(anchor.keys())[:15]}, avatar={'有:'+avatar[:30] if avatar else '空'}")
 
         if live.get("realLiveStatus") != "ON":
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
@@ -361,20 +360,39 @@ async def parse_huya(url):
         if not cdn_list:
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
         cdn_list.sort(key=lambda s: CDN_ORDER.get(s.get("sCdnType", "ZZ"), 9))
-        streams, seen = [], set()
-        for s in cdn_list:
-            cdn_type = s.get("sCdnType", "")
-            if cdn_type in seen: continue
-            flv_url = s.get("sFlvUrl", "")
-            stream_name = s.get("sStreamName", "")
-            anti_code = s.get("sFlvAntiCode", "")
-            suffix = s.get("sFlvUrlSuffix", "flv")
-            if not (flv_url and stream_name and anti_code): continue
+
+        # 取第一个最优 CDN 作为画质源
+        best_cdn = cdn_list[0]
+        flv_url = best_cdn.get("sFlvUrl", "")
+        base_stream_name = best_cdn.get("sStreamName", "")
+        anti_code = best_cdn.get("sFlvAntiCode", "")
+        suffix = best_cdn.get("sFlvUrlSuffix", "flv")
+        cdn_type = best_cdn.get("sCdnType", "")
+        cdn_label = CDN_NAMES.get(cdn_type, cdn_type or "CDN")
+
+        if not (flv_url and base_stream_name and anti_code):
+            return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
+
+        # 生成多画质流（原画、超清、高清）
+        quality_suffixes = [
+            ("原画", ""),
+            ("超清", "_1"),
+            ("高清", "_2")
+        ]
+        streams = []
+        seen = set()
+        for quality_name, qs in quality_suffixes:
+            stream_name = base_stream_name + qs
             built = huya_build_anticode(anti_code, stream_name)
             full_url = f"{flv_url}/{stream_name}.{suffix}?{built}"
-            label = CDN_NAMES.get(cdn_type, cdn_type or "CDN")
-            streams.append({"cdn": label, "url": full_url.replace("http://", "https://"), "type": "flv"})
-            seen.add(cdn_type)
+            if full_url not in seen:
+                seen.add(full_url)
+                streams.append({
+                    "cdn": f"{cdn_label}-{quality_name}",
+                    "url": full_url.replace("http://", "https://"),
+                    "type": "flv"
+                })
+
         if not streams:
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
 
@@ -416,8 +434,7 @@ async def parse_douyu(url):
             secret = hashlib.md5((secret + white['key']).encode()).hexdigest()
         suffix = f"{real_id}{ts}" if not white.get('is_special', False) else ""
         auth = hashlib.md5((secret + white['key'] + suffix).encode()).hexdigest()
-        params = {
-            'rate': '0',
+        base_params = {
             'ver': '219032101',
             'iar': '0',
             'ive': '0',
@@ -430,19 +447,39 @@ async def parse_douyu(url):
             'did': did,
             'auth': auth,
         }
-        stream_resp = await request_with_retry("POST", f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
-                                               headers=hdrs, data=params)
-        stream_data = stream_resp.json()
-        if stream_data.get("error") != 0:
-            return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
-        info_stream = stream_data["data"]
-        flv_url = f"{info_stream['rtmp_url']}/{info_stream['rtmp_live']}" if info_stream.get('rtmp_url') and info_stream.get('rtmp_live') else None
-        hls_url = info_stream.get('hls_url')
+
+        # 定义画质与 rate 值的映射
+        rate_map = {0: "原画", 2: "高清", 4: "标清"}
+
+        async def fetch_rate(rate_val):
+            params = base_params.copy()
+            params['rate'] = str(rate_val)
+            try:
+                r = await request_with_retry("POST",
+                    f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
+                    headers=hdrs, data=params, timeout=10)
+                if r.status_code == 200:
+                    d = r.json()
+                    if d.get("error") == 0:
+                        info = d["data"]
+                        flv_url = f"{info['rtmp_url']}/{info['rtmp_live']}"
+                        return rate_val, flv_url
+            except Exception:
+                pass
+            return rate_val, None
+
+        # 并发请求多个画质
+        tasks = [fetch_rate(r) for r in rate_map.keys()]
+        results = await asyncio.gather(*tasks)
+
         streams = []
-        if flv_url:
-            streams.append({"cdn": "FLV", "url": flv_url, "type": "flv"})
-        if hls_url and hls_url.startswith("http"):
-            streams.append({"cdn": "HLS", "url": hls_url, "type": "m3u8"})
+        seen = set()
+        for rate_val, flv_url in results:
+            if flv_url and flv_url not in seen:
+                seen.add(flv_url)
+                label = rate_map.get(rate_val, f"画质{rate_val}")
+                streams.append({"cdn": label, "url": flv_url, "type": "flv"})
+
         if not streams:
             return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
 
@@ -510,11 +547,29 @@ async def parse_douyin(url):
         from streamget import DouyinLiveStream
         live = DouyinLiveStream()
         data = await live.fetch_web_stream_data(url, process_data=True)
-        stream_obj = await live.fetch_stream_url(data, "OD")
-        raw = json.loads(stream_obj.to_json())
-        streams = build_streams(raw.get("flv_url", ""), raw.get("m3u8_url", ""))
+
+        # 画质列表，按优先级从高到低
+        qualities = ["OD", "UHD", "HD", "SD", "LD"]
+        streams = []
+        seen = set()
+        for q in qualities:
+            try:
+                stream_obj = await live.fetch_stream_url(data, q)
+                raw = json.loads(stream_obj.to_json())
+                flv = raw.get("flv_url", "")
+                m3u8 = raw.get("m3u8_url", "")
+                if flv and flv not in seen:
+                    seen.add(flv)
+                    streams.append({"cdn": f"抖音-{q}", "url": flv, "type": "flv"})
+                if m3u8 and m3u8 not in seen:
+                    seen.add(m3u8)
+                    streams.append({"cdn": f"抖音-{q}", "url": m3u8, "type": "m3u8"})
+            except Exception as e:
+                print(f"[抖音] 画质 {q} 获取失败: {e}")
+
         if not streams:
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
+
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         if not room_id.isdigit():
             try:
@@ -522,7 +577,8 @@ async def parse_douyin(url):
                 match = re.search(r'"room_id":"(\d+)"', resp.text)
                 if match: room_id = match.group(1)
             except Exception: pass
-        # 从 webcast API 获取头像（比页面 HTML 提取更稳定）
+
+        # 获取头像
         avatar = ""
         try:
             wc_resp = await request_with_retry(
@@ -537,7 +593,6 @@ async def parse_douyin(url):
                 avatar = url_list[0]
         except Exception:
             pass
-        # 降级：从页面 HTML 提取
         if not avatar:
             try:
                 resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
@@ -547,6 +602,7 @@ async def parse_douyin(url):
                     avatar = m.group(1).replace("\\u002F", "/")
             except Exception:
                 pass
+
         return {"streams": streams, "title": raw.get("anchor_name", "抖音主播"),
                 "avatar": avatar, "roomId": room_id, "isLive": True}
     except Exception as e:
