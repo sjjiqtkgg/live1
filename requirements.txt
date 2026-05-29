@@ -7,4 +7,4 @@ protobuf>=3.19.0
 websocket-client>=1.6.0
 PyExecJS
 python-socks
-streamlink==6.7.2
+streamlink==8.4.0
