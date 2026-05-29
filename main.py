@@ -11,11 +11,19 @@ import base64
 import random
 import ssl
 import traceback
+import concurrent.futures
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
 from urllib.parse import unquote, urlparse, parse_qs, quote, urljoin
+
+try:
+    from streamlink import Streamlink
+    STREAMLINK_AVAILABLE = True
+except ImportError:
+    STREAMLINK_AVAILABLE = False
+    print("[警告] streamlink 未安装，Twitch 解析将降级为原有逻辑")
 
 try:
     from streamget.platforms.soop.live_stream import SoopLiveStream
@@ -673,8 +681,87 @@ async def parse_douyin(url):
         print(f"[抖音] 解析异常: {e}")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== Twitch（去广告优化） ====================
+# ==================== Twitch (streamlink 优先，原有逻辑回退) ====================
 async def parse_twitch(url, cookie: str = ""):
+    if STREAMLINK_AVAILABLE:
+        try:
+            match = re.search(r"twitch\.tv/([^/?]+)", url)
+            if not match:
+                return {"streams": [], "isLive": False, "title": "", "avatar": ""}
+            channel = match.group(1)
+            eff_cookie = cookie or TWITCH_COOKIE
+
+            def _get_streams(proxy=None):
+                session = Streamlink()
+                session.set_option("twitch-disable-ads", True)
+                session.set_option("twitch-low-latency", True)
+                if proxy:
+                    session.set_option("http-proxy", proxy)
+                    session.set_option("https-proxy", proxy)
+                # 设置 Cookie
+                if eff_cookie:
+                    session.set_plugin_option("twitch", "api-header",
+                                              [["Cookie", eff_cookie]])
+                session.set_plugin_option("twitch", "api-header",
+                                          [["User-Agent", UA]])
+                return session.streams(f"https://www.twitch.tv/{channel}")
+
+            # 随机选一个外网代理
+            proxy = random.choice(EXTERNAL_PROXY_URLS) if EXTERNAL_PROXY_URLS and EXTERNAL_PROXY_URLS[0] is not None else None
+
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                stream_map = await loop.run_in_executor(pool, _get_streams, proxy)
+
+            if not stream_map:
+                return await parse_twitch_fallback(url, cookie)
+
+            # 获取主播信息
+            nickname = channel
+            avatar = ""
+            try:
+                headers = {"Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko", "User-Agent": UA}
+                if eff_cookie:
+                    headers["Cookie"] = eff_cookie
+                proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
+                user_resp = await request_with_proxy_group("GET", f"https://api.twitch.tv/helix/users?login={channel}",
+                                                           proxy_list=proxylist, headers=headers, shuffle_proxy=False)
+                if user_resp.status_code == 200:
+                    user_data = user_resp.json()
+                    ud = user_data.get("data", [])
+                    if ud:
+                        avatar = ud[0].get("profile_image_url", "")
+                        nickname = ud[0].get("display_name", channel)
+            except Exception:
+                pass
+
+            # 构建画质列表
+            streams = []
+            priority = ["best", "1080p60", "720p60", "720p", "480p", "360p", "worst"]
+            seen = set()
+            for key in priority:
+                if key in stream_map and key not in seen:
+                    seen.add(key)
+                    s = stream_map[key]
+                    streams.append({"cdn": f"Twitch-{key}", "url": s.url, "type": "m3u8"})
+
+            # 兜底：加入所有未包含的画质
+            for key, s in stream_map.items():
+                if key not in seen and hasattr(s, 'url'):
+                    streams.append({"cdn": f"Twitch-{key}", "url": s.url, "type": "m3u8"})
+
+            return {"streams": streams, "title": nickname, "avatar": avatar,
+                    "channelName": channel, "isLive": bool(streams)}
+
+        except Exception as e:
+            print(f"[Twitch] streamlink 解析异常，回退原有逻辑: {e}")
+            return await parse_twitch_fallback(url, cookie)
+    else:
+        return await parse_twitch_fallback(url, cookie)
+
+
+async def parse_twitch_fallback(url, cookie: str = ""):
+    """原有的 Twitch 解析逻辑，当 streamlink 不可用或失败时作为备用"""
     try:
         match = re.search(r"twitch\.tv/([^/?]+)", url)
         if not match:
@@ -704,13 +791,12 @@ async def parse_twitch(url, cookie: str = ""):
         except Exception:
             pass
 
-        # 获取播放 token（playerType 改为 "embed" 以尝试绕过广告）
+        # 获取播放 token
         gql_headers = {"Client-ID": client_id, "Content-Type": "application/json", "User-Agent": UA}
         if eff_cookie:
             gql_headers["Cookie"] = eff_cookie
         gql_url = "https://gql.twitch.tv/gql"
-        payload = [{"operationName": "PlaybackAccessToken",
-                     "variables": {"login": channel, "playerType": "embed"},  # 改为 embed
+        payload = [{"operationName": "PlaybackAccessToken", "variables": {"login": channel, "playerType": "site"},
                      "query": "query PlaybackAccessToken($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: { platform: \"web\", playerType: $playerType, playerBackend: \"mediaplayer\" }) { value signature } }"}]
         resp = await request_with_proxy_group("POST", gql_url, proxy_list=proxylist, json=payload,
                                              headers=gql_headers, shuffle_proxy=False)
@@ -724,7 +810,6 @@ async def parse_twitch(url, cookie: str = ""):
         if not token or not sig:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
 
-        # usher URL 追加 &allow_ads=false 以进一步禁止广告
         m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true&allow_spectre=true&fast_bread=true&allow_ads=false"
         usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=proxylist,
                                                      headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"},
@@ -748,7 +833,7 @@ async def parse_twitch(url, cookie: str = ""):
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
         return {"streams": streams, "title": nickname, "avatar": avatar, "channelName": channel, "isLive": True}
     except Exception as e:
-        print(f"[Twitch] 解析异常: {e}")
+        print(f"[Twitch Fallback] 解析异常: {e}")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
 # ==================== SOOP ====================
