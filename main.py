@@ -673,7 +673,7 @@ async def parse_douyin(url):
         print(f"[抖音] 解析异常: {e}")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== Twitch ====================
+# ==================== Twitch（去广告优化） ====================
 async def parse_twitch(url, cookie: str = ""):
     try:
         match = re.search(r"twitch\.tv/([^/?]+)", url)
@@ -704,12 +704,13 @@ async def parse_twitch(url, cookie: str = ""):
         except Exception:
             pass
 
-        # 获取播放 token
+        # 获取播放 token（playerType 改为 "embed" 以尝试绕过广告）
         gql_headers = {"Client-ID": client_id, "Content-Type": "application/json", "User-Agent": UA}
         if eff_cookie:
             gql_headers["Cookie"] = eff_cookie
         gql_url = "https://gql.twitch.tv/gql"
-        payload = [{"operationName": "PlaybackAccessToken", "variables": {"login": channel, "playerType": "site"},
+        payload = [{"operationName": "PlaybackAccessToken",
+                     "variables": {"login": channel, "playerType": "embed"},  # 改为 embed
                      "query": "query PlaybackAccessToken($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: { platform: \"web\", playerType: $playerType, playerBackend: \"mediaplayer\" }) { value signature } }"}]
         resp = await request_with_proxy_group("POST", gql_url, proxy_list=proxylist, json=payload,
                                              headers=gql_headers, shuffle_proxy=False)
@@ -723,7 +724,8 @@ async def parse_twitch(url, cookie: str = ""):
         if not token or not sig:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
 
-        m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true&allow_spectre=true&fast_bread=true"
+        # usher URL 追加 &allow_ads=false 以进一步禁止广告
+        m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true&allow_spectre=true&fast_bread=true&allow_ads=false"
         usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=proxylist,
                                                      headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"},
                                                      shuffle_proxy=False)
