@@ -134,6 +134,7 @@ async def request_with_retry(method, url, **kwargs):
         except Exception as e:
             last_error = e
             print(f"[请求重试] 失败: {e}")
+            await asyncio.sleep(0.5)  # 短暂延迟，避免触发风控
     raise last_error or Exception("所有代理均失败")
 
 async def request_with_proxy_group(method, url, proxy_list, **kwargs):
@@ -160,6 +161,7 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
         except Exception as e:
             last_error = e
             print(f"[分组请求] 失败: {e}")
+            await asyncio.sleep(0.5)  # 短暂延迟，避免触发风控
     raise last_error or Exception("所有代理均失败")
 
 # ------------------ 代理接口不变 -----------------
