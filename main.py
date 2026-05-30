@@ -97,27 +97,15 @@ async def get_client(proxy=None, timeout=None):
     key = f"{proxy or 'direct'}_t{timeout}"
     async with CLIENT_LOCK:
         if key not in CLIENT_POOL:
-            mounts = None
-            proxy_arg = proxy
-            
-            # 处理 HTTPS 代理的自签名证书
-            if isinstance(proxy, str) and proxy.startswith("https://"):
-                transport = httpx.AsyncHTTPTransport(
-                    proxy=proxy,
-                    verify=False,  # 跳过代理证书验证
-                    http2=True,
-                    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
-                )
-                mounts = {"http://": transport, "https://": transport}
-                proxy_arg = None  # 顶层不再设置 proxy
-                
             CLIENT_POOL[key] = httpx.AsyncClient(
                 timeout=timeout,
-                proxy=proxy_arg,
-                mounts=mounts,
+                proxy=proxy,
                 http2=True,
-                verify=False,  # 跳过目标网站证书验证
-                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+                verify=False,
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=20
+                )
             )
         return CLIENT_POOL[key]
 
@@ -146,7 +134,7 @@ async def request_with_retry(method, url, **kwargs):
         except Exception as e:
             last_error = e
             print(f"[请求重试] 失败: {e}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)  # 短暂延迟，避免触发风控
     raise last_error or Exception("所有代理均失败")
 
 async def request_with_proxy_group(method, url, proxy_list, **kwargs):
@@ -173,7 +161,7 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
         except Exception as e:
             last_error = e
             print(f"[分组请求] 失败: {e}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)  # 短暂延迟，避免触发风控
     raise last_error or Exception("所有代理均失败")
 
 # ------------------ 代理接口不变 -----------------
