@@ -1244,7 +1244,7 @@ async def api_strip_cam(username: str = Query(...)):
         print(f"[Strip cam] 错误: {e}")
         raise HTTPException(500, str(e))
 
-# 高级播放器 HTML 模板（黑色主题 + 白色弹幕）
+# 高级播放器 HTML 模板（黑色主题 + 白色弹幕，流地址自动走代理）
 def get_strip_advanced_html_template():
     return r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1302,6 +1302,7 @@ def get_strip_advanced_html_template():
 <body>
     <div id="config" style="display:none;">
         <div id="liveData" style="display:none;">{{RESULT_DATA}}</div>
+        <div id="apiBase" style="display:none;">{{API_BASE}}</div>
     </div>
     
     <div class="app-container">
@@ -1334,7 +1335,13 @@ def get_strip_advanced_html_template():
 
     <script>
         const liveDataElement = document.getElementById('liveData');
+        const apiBaseElement = document.getElementById('apiBase');
         let liveData = {};
+        let API_BASE = window.location.origin; // 默认使用当前域
+        
+        if (apiBaseElement && apiBaseElement.textContent) {
+            API_BASE = apiBaseElement.textContent.trim();
+        }
         
         if (liveDataElement.textContent) {
             try { liveData = JSON.parse(liveDataElement.textContent); } catch (e) {}
@@ -1468,12 +1475,14 @@ def get_strip_advanced_html_template():
             const line = (config.hlsLines || [])[lineIndex];
             if (!line || !config.stream) return '';
             
-            const pureStatus = (config.status || '').toLowerCase();
             let suffix = '_auto';
-            if (pureStatus !== 'public') suffix = '_160p_blurred';
-            else if (quality !== 'auto') suffix = '_' + quality;
+            if (quality !== 'auto') suffix = '_' + quality;
             
-            return 'https://edge-hls.' + line + '/hls/' + config.stream + '/master/' + config.stream + suffix + '.m3u8?pkey={{PKEY}}';
+            // 生成原始 HLS 地址
+            const rawUrl = 'https://edge-hls.' + line + '/hls/' + config.stream + '/master/' + config.stream + suffix + '.m3u8?pkey={{PKEY}}';
+            
+            // 自动走后端代理
+            return API_BASE + '/api/proxy?url=' + encodeURIComponent(rawUrl);
         };
         
         function switchStream(url) {
@@ -1520,7 +1529,10 @@ def get_strip_advanced_html_template():
         function initPlayer() {
             config = Object.assign({}, liveData, { currentLine: 0, currentQuality: 'auto' });
             const url = getStreamUrl();
-            if (!url) return;
+            if (!url) {
+                addSystemMessage('无法获取流地址');
+                return;
+            }
             switchStream(url);
         }
 
@@ -1574,8 +1586,11 @@ async def strip_play_page(username: str, request: Request):
     try:
         cam_resp = await api_strip_cam(username)
         result_json = json.dumps(cam_resp, ensure_ascii=False)
+        api_base = str(request.base_url).rstrip("/")
         html = get_strip_advanced_html_template()
-        html = html.replace("{{RESULT_DATA}}", result_json).replace("{{PKEY}}", STRIP_PKEY)
+        html = html.replace("{{RESULT_DATA}}", result_json)
+        html = html.replace("{{PKEY}}", STRIP_PKEY)
+        html = html.replace("{{API_BASE}}", api_base)
         return HTMLResponse(content=html)
     except Exception as e:
         raise HTTPException(500, f"加载高级播放器失败: {str(e)}")
