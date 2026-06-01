@@ -1099,6 +1099,189 @@ def root(): return {"status":"ok"}
 @app.api_route("/health", methods=["GET","HEAD"])
 async def health(): return {"status":"alive"}
 
+# ==================== Strip直播新增接口 ====================
+STRIP_HOST = os.getenv("STRIP_HOST", "https://zh.topcams.tv")
+STRIP_PKEY = os.getenv("STRIP_PKEY", "bXorqTB5ZhP5FcpX")
+STRIP_UA = "Mozilla/5.0 (Android 13; Mobile; rv:109.0) Gecko/117.0 Firefox/117.0"
+
+# 分类列表（固定，也可从环境变量覆盖）
+STRIP_CATEGORIES_RAW = os.getenv("STRIP_CATEGORIES", "")
+if STRIP_CATEGORIES_RAW:
+    try:
+        STRIP_CATEGORIES = json.loads(STRIP_CATEGORIES_RAW)
+    except Exception:
+        STRIP_CATEGORIES = []
+else:
+    STRIP_CATEGORIES = [
+        {"type_id": "/api/front/v2/models?limit=60&primaryTag=girls", "type_name": "全部直播"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"recommended\"]]", "type_name": "直播推荐"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"mobile\"]]", "type_name": "竖屏直播"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"tagLanguageChinese\"]]", "type_name": "中文直播"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"tagLanguageJapanese\"]]", "type_name": "日本直播"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"tagLanguageKorean\"]]", "type_name": "韩国直播"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"doPublicPlace\"]]", "type_name": "户外直播"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"asmr\"]]", "type_name": "ASMR"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"doCosplay\"]]", "type_name": "COS直播"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=couples", "type_name": "情侣直播"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"autoTagInteractiveToy\"]]", "type_name": "互动玩具"},
+        {"type_id": "/api/front/models?limit=60&primaryTag=girls&filterGroupTags=[[\"autoTagNew\"]]", "type_name": "新人直播"},
+    ]
+
+async def strip_fetch(path: str):
+    """请求 Strip API"""
+    url = STRIP_HOST + path
+    # 使用外网代理（因为 topcams 可能被墙）
+    proxy_list = EXTERNAL_PROXY_URLS if EXTERNAL_PROXY_URLS[0] is not None else [None]
+    try:
+        resp = await request_with_proxy_group(
+            "GET", url,
+            proxy_list=proxy_list,
+            headers={"User-Agent": STRIP_UA, "Referer": STRIP_HOST},
+            timeout=12
+        )
+        return resp.json()
+    except Exception as e:
+        print(f"[Strip] 请求失败: {e}")
+        return None
+
+@app.get("/api/strip/categories")
+async def api_strip_categories():
+    return {"class": STRIP_CATEGORIES}
+
+@app.get("/api/strip/models")
+async def api_strip_models(tid: str = Query(...)):
+    try:
+        data = await strip_fetch(tid)
+        if not data:
+            return {"list": []}
+        models = data.get("models") or data.get("users") or []
+        videos = []
+        for m in models:
+            username = m.get("username", "")
+            preview = ""
+            if m.get("previewImages"):
+                preview = m["previewImages"][0]
+            elif m.get("popularSnapshotTimestamp") and m.get("id"):
+                preview = f"https://img.doppiocdn.live/thumbs/{m['popularSnapshotTimestamp']}/{m['id']}_webp"
+            viewers = m.get("viewersCount", 0)
+            videos.append({
+                "vod_id": username,
+                "vod_name": username,
+                "vod_pic": preview,
+                "vod_remarks": f"👁 {viewers}" if viewers else "📡直播中"
+            })
+        return {"list": videos}
+    except Exception as e:
+        print(f"[Strip models] 错误: {e}")
+        return {"list": []}
+
+@app.get("/api/strip/detail")
+async def api_strip_detail(username: str = Query(...), request: Request = None):
+    # 返回给前端用于主页面点击播放时的信息（含跳转高级播放器的地址）
+    origin = str(request.base_url).rstrip("/") if request else ""
+    return {
+        "list": [{
+            "vod_id": username,
+            "vod_name": username,
+            "vod_pic": "",
+            "vod_remarks": "高级直播间",
+            "vod_content": "正在进入 Strip 高级交互直播间...",
+            "vod_play_from": "Strip直播",
+            "vod_play_url": f"高级线路$${origin}/strip_play/{username}"
+        }]
+    }
+
+@app.get("/api/strip/cam")
+async def api_strip_cam(username: str = Query(...)):
+    try:
+        cam_data = await strip_fetch(f"/api/front/v2/models/username/{username}/cam?uniq=0")
+        config_data = await strip_fetch("/api/front/v3/config/initial")
+        members_data = await strip_fetch(f"/api/front/v2/models/username/{username}/members?uniq=0")
+
+        user = (cam_data or {}).get("user", {}).get("user", {})
+        cam = (cam_data or {}).get("cam", {})
+        config = config_data or {}
+
+        # 构建响应
+        response = {
+            "status": user.get("status", "offline"),
+            "avatarUrl": user.get("avatarUrl", ""),
+            "startTime": user.get("statusChangedAt", ""),
+            "userDescription": user.get("description", ""),
+            "goalDescription": (cam.get("goal") or {}).get("description", ""),
+            "fanClubDescription": (cam.get("userFanClub") or {}).get("description", ""),
+            "topic": cam.get("topic", ""),
+            "username": username,
+            "stream": cam.get("streamName", ""),
+            "topBestPlace": user.get("topBestPlace", ""),
+            "modelId": user.get("id", ""),
+            "hlsLines": [],
+            "cdn": "",
+            "pixelatedResolutions": [],
+            "membersCount": 0,
+            "tipMenuPriceList": [],
+            "isLive": user.get("isOnline", False),
+            "tipMenuCreatedAt": (cam.get("tipMenu") or {}).get("createdAt", ""),
+            "websocketUrl": "",
+            "websocketToken": ""
+        }
+
+        # 封面图
+        if user.get("snapshotTimestamp") and response["modelId"]:
+            response["coverImg"] = f"https://img.doppiocdn.live/thumbs/{user['snapshotTimestamp']}/{response['modelId']}"
+
+        # 画质列表
+        presets = (cam.get("broadcastSettings") or {}).get("presets", {})
+        all_res = []
+        for key in ["default", "pixelated", "testing", "h265", "vr"]:
+            arr = presets.get(key, [])
+            if isinstance(arr, list):
+                all_res.extend(arr)
+        unique = sorted(list(set(all_res)), key=lambda x: (0 if x == "auto" else 1, -int(x.replace("p","").replace("_blurred","0"))))
+        response["pixelatedResolutions"] = unique
+
+        # 打赏菜单
+        tip_settings = (cam.get("tipMenu") or {}).get("settings", [])
+        response["tipMenuPriceList"] = [{"activity": item.get("activity",""), "price": item.get("price",0)} for item in tip_settings]
+
+        # HLS 线路
+        hosts = (config.get("initial") or {}).get("common", {}).get("hlsStreamHosts", {})
+        hls_lines = [hosts.get(k) for k in ["A","B","C","D","E","F"] if hosts.get(k)]
+        response["hlsLines"] = hls_lines
+        response["cdn"] = hls_lines[0] if hls_lines else ""
+
+        # WebSocket
+        client = (config.get("initial") or {}).get("client", {})
+        response["websocketUrl"] = client.get("websocket", {}).get("url", "")
+        response["websocketToken"] = client.get("websocket", {}).get("token", "")
+
+        # 观众数
+        members = members_data or {}
+        response["membersCount"] = (
+            (members.get("guests") or 0) + (members.get("spies") or 0) +
+            (members.get("invisibles") or 0) + (members.get("greens") or 0) +
+            (members.get("golds") or 0) + (members.get("regulars") or 0)
+        )
+
+        return response
+    except Exception as e:
+        print(f"[Strip cam] 错误: {e}")
+        raise HTTPException(500, str(e))
+
+# 高级播放器独立页面（内嵌HTML）
+@app.get("/strip_play/{username}")
+async def strip_play_page(username: str, request: Request):
+    try:
+        # 获取初始数据
+        cam_resp = await api_strip_cam(username)
+        # 将数据注入HTML模板
+        template = get_strip_advanced_html_template()
+        result_json = json.dumps(cam_resp, ensure_ascii=False)
+        html = template.replace("{{RESULT_DATA}}", result_json).replace("{{PKEY}}", STRIP_PKEY)
+        return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(500, f"加载高级播放器失败: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
