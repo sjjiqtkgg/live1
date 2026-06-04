@@ -199,7 +199,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     is_ts = url.lower().endswith(".ts")
 
     if is_ts:
-        stream_key = referer or url
+        stream_key = hashlib.md5(url.encode()).hexdigest()[:16]
         if stream_key not in STREAM_PROXY_MAP:
             if proxy_list and proxy_list[0] is not None:
                 STREAM_PROXY_MAP[stream_key] = random.choice(proxy_list)
@@ -601,30 +601,32 @@ async def parse_douyin(url):
         # 画质中文映射
         quality_names = {"OD": "原画", "UHD": "蓝光", "HD": "超清", "SD": "高清", "LD": "标清"}
 
-        streams = []
-        seen_urls = set()
-        seen_qualities = set()
-
-        for q in qualities:
+        # 并发获取所有画质，比串行快 5 倍
+        async def _fetch_quality(q):
             try:
                 stream_obj = await live.fetch_stream_url(data, q)
                 raw = json.loads(stream_obj.to_json())
-                flv = raw.get("flv_url", "")
-                m3u8 = raw.get("m3u8_url", "")
-
-                label = quality_names.get(q, q)
-
-                # 优先添加 FLV，每个画质只保留一个 URL
-                if flv and flv not in seen_urls and label not in seen_qualities:
-                    seen_urls.add(flv)
-                    seen_qualities.add(label)
-                    streams.append({"cdn": f"抖音-{label}", "url": flv, "type": "flv"})
-                elif m3u8 and m3u8 not in seen_urls and label not in seen_qualities:
-                    seen_urls.add(m3u8)
-                    seen_qualities.add(label)
-                    streams.append({"cdn": f"抖音-{label}", "url": m3u8, "type": "m3u8"})
+                return q, raw.get("flv_url", ""), raw.get("m3u8_url", "")
             except Exception as e:
                 print(f"[抖音] 画质 {q} 获取失败: {e}")
+                return q, "", ""
+
+        results = await asyncio.gather(*[_fetch_quality(q) for q in qualities])
+
+        streams = []
+        seen_urls = set()
+        seen_qualities = set()
+        for q, flv, m3u8 in results:
+            label = quality_names.get(q, q)
+            # 优先添加 FLV，每个画质只保留一个 URL
+            if flv and flv not in seen_urls and label not in seen_qualities:
+                seen_urls.add(flv)
+                seen_qualities.add(label)
+                streams.append({"cdn": f"抖音-{label}", "url": flv, "type": "flv"})
+            elif m3u8 and m3u8 not in seen_urls and label not in seen_qualities:
+                seen_urls.add(m3u8)
+                seen_qualities.add(label)
+                streams.append({"cdn": f"抖音-{label}", "url": m3u8, "type": "m3u8"})
 
         if not streams:
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
@@ -1057,13 +1059,17 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
     stop_event = threading.Event()
     queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
+    _irc_ws = None  # 保存 ws 引用，用于主动关闭
+
     def on_msg(ws, msg):
         if msg.startswith("PING"): ws.send("PONG :tmi.twitch.tv"); return
         if msg.startswith("PONG"): return
         m = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
         if m:
             asyncio.run_coroutine_threadsafe(queue.put({"type":"chat","nick":m.group(1),"content":m.group(2)}), loop)
+
     def run():
+        nonlocal _irc_ws
         ws = websocket_client.WebSocketApp("wss://irc-ws.chat.twitch.tv:443",
                                      on_message=on_msg,
                                      on_error=lambda w,e: print(f"Twitch IRC err: {e}"),
@@ -1071,7 +1077,10 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
         ws.on_open = lambda w: (w.send("CAP REQ :twitch.tv/tags twitch.tv/commands"),
                                 w.send("PASS SCHMOOPIIE"), w.send("NICK justinfan12345"),
                                 w.send(f"JOIN #{channel_name.lower()}"))
-        ws.run_forever()
+        _irc_ws = ws
+        ws.run_forever(ping_interval=30, ping_timeout=10)
+        _irc_ws = None  # 退出后清空引用
+
     task = loop.run_in_executor(None, run)
     async def sender():
         while not stop_event.is_set():
@@ -1088,10 +1097,15 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
         pass
     finally:
         stop_event.set()
+        # 主动关闭 IRC WS，让 run_forever() 能立即退出，不再阻塞线程
+        if _irc_ws:
+            try: _irc_ws.close()
+            except: pass
         send_task.cancel()
         try: await send_task
         except: pass
-        task.cancel()
+        try: await asyncio.wait_for(task, timeout=3)
+        except: pass
 
 @app.get("/")
 def root(): return {"status":"ok"}
