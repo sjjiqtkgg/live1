@@ -164,7 +164,7 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
             await asyncio.sleep(0.5)  # 短暂延迟，避免触发风控
     raise last_error or Exception("所有代理均失败")
 
-# ------------------ 代理接口不变 -----------------
+# ------------------ 代理接口（修复SSRF） -----------------
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
     ALLOWED = [
@@ -175,7 +175,19 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         ".live-video.net",
         ".pandalivecdn.com",
     ]
-    if not any(urlparse(url).hostname.endswith(domain) for domain in ALLOWED):
+
+    # 修复SSRF：严格域名校验
+    def is_allowed_domain(url: str) -> bool:
+        hostname = urlparse(url).hostname
+        if not hostname:
+            return False
+        for domain in ALLOWED:
+            clean = domain.lstrip('.')
+            if hostname == clean or hostname.endswith('.' + clean):
+                return True
+        return False
+
+    if not is_allowed_domain(url):
         raise HTTPException(403, "domain not allowed")
 
     body = await request.body() if request.method == "POST" else None
@@ -199,7 +211,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     is_ts = url.lower().endswith(".ts")
 
     if is_ts:
-        stream_key = referer or url
+        stream_key = hashlib.md5(url.encode()).hexdigest()[:16]
         if stream_key not in STREAM_PROXY_MAP:
             if proxy_list and proxy_list[0] is not None:
                 STREAM_PROXY_MAP[stream_key] = random.choice(proxy_list)
@@ -589,56 +601,49 @@ async def parse_bilibili(url):
         print(f"[B站] 解析异常: {e}")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== 抖音 ====================
+# ==================== 抖音（修复 raw 未定义） ====================
 async def parse_douyin(url):
     try:
         from streamget import DouyinLiveStream
         live = DouyinLiveStream()
         data = await live.fetch_web_stream_data(url, process_data=True)
 
-        # 画质优先级
         qualities = ["OD", "UHD", "HD", "SD", "LD"]
-        # 画质中文映射
         quality_names = {"OD": "原画", "UHD": "蓝光", "HD": "超清", "SD": "高清", "LD": "标清"}
+
+        async def _fetch_quality(q):
+            try:
+                stream_obj = await live.fetch_stream_url(data, q)
+                raw = json.loads(stream_obj.to_json())
+                return q, raw.get("flv_url", ""), raw.get("m3u8_url", ""), raw.get("anchor_name", "")
+            except Exception as e:
+                print(f"[抖音] 画质 {q} 获取失败: {e}")
+                return q, "", "", ""
+
+        results = await asyncio.gather(*[_fetch_quality(q) for q in qualities])
 
         streams = []
         seen_urls = set()
         seen_qualities = set()
-        anchor_name = "抖音主播"  # 兜底主播名，防止 raw 未定义
-
-        for q in qualities:
-            try:
-                stream_obj = await live.fetch_stream_url(data, q)
-                raw = json.loads(stream_obj.to_json())
-                # 每次成功解析都更新主播名
-                if raw.get("anchor_name"):
-                    anchor_name = raw["anchor_name"]
-                flv = raw.get("flv_url", "")
-                m3u8 = raw.get("m3u8_url", "")
-
-                label = quality_names.get(q, q)
-
-                # 优先添加 FLV，每个画质只保留一个 URL
-                if flv and flv not in seen_urls and label not in seen_qualities:
-                    seen_urls.add(flv)
-                    seen_qualities.add(label)
-                    streams.append({"cdn": f"抖音-{label}", "url": flv, "type": "flv"})
-                elif m3u8 and m3u8 not in seen_urls and label not in seen_qualities:
-                    seen_urls.add(m3u8)
-                    seen_qualities.add(label)
-                    streams.append({"cdn": f"抖音-{label}", "url": m3u8, "type": "m3u8"})
-            except Exception as e:
-                print(f"[抖音] 画质 {q} 获取失败: {e}")
+        anchor_name = "抖音主播"
+        for q, flv, m3u8, name in results:
+            if name and anchor_name == "抖音主播":
+                anchor_name = name
+            label = quality_names.get(q, q)
+            if flv and flv not in seen_urls and label not in seen_qualities:
+                seen_urls.add(flv)
+                seen_qualities.add(label)
+                streams.append({"cdn": f"抖音-{label}", "url": flv, "type": "flv"})
+            elif m3u8 and m3u8 not in seen_urls and label not in seen_qualities:
+                seen_urls.add(m3u8)
+                seen_qualities.add(label)
+                streams.append({"cdn": f"抖音-{label}", "url": m3u8, "type": "m3u8"})
 
         if not streams:
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-        # 按画质优先级排序
         quality_order = {"原画": 0, "蓝光": 1, "超清": 2, "高清": 3, "标清": 4}
-        def sort_key(s):
-            q_name = s["cdn"].replace("抖音-", "")
-            return quality_order.get(q_name, 99)
-        streams.sort(key=sort_key)
+        streams.sort(key=lambda s: quality_order.get(s["cdn"].replace("抖音-", ""), 99))
 
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         if not room_id.isdigit():
@@ -648,7 +653,6 @@ async def parse_douyin(url):
                 if match: room_id = match.group(1)
             except Exception: pass
 
-        # 获取头像
         avatar = ""
         try:
             wc_resp = await request_with_retry(
@@ -659,8 +663,7 @@ async def parse_douyin(url):
             wc_data = wc_resp.json()
             url_list = (wc_data.get("data", {}).get("room", {})
                         .get("owner", {}).get("avatarThumb", {}).get("urlList", []))
-            if url_list:
-                avatar = url_list[0]
+            if url_list: avatar = url_list[0]
         except Exception:
             pass
         if not avatar:
@@ -668,8 +671,7 @@ async def parse_douyin(url):
                 resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
                 m = re.search(r'"avatarThumb":\{"urlList":\["([^"]+)"', resp.text) or \
                     re.search(r'"avatar_thumb":\{"url_list":\["([^"]+)"', resp.text)
-                if m:
-                    avatar = m.group(1).replace("\\u002F", "/")
+                if m: avatar = m.group(1).replace("\\u002F", "/")
             except Exception:
                 pass
 
@@ -1061,13 +1063,17 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
     stop_event = threading.Event()
     queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
+    _irc_ws = None  # 保存 ws 引用，用于主动关闭
+
     def on_msg(ws, msg):
         if msg.startswith("PING"): ws.send("PONG :tmi.twitch.tv"); return
         if msg.startswith("PONG"): return
         m = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
         if m:
             asyncio.run_coroutine_threadsafe(queue.put({"type":"chat","nick":m.group(1),"content":m.group(2)}), loop)
+
     def run():
+        nonlocal _irc_ws
         ws = websocket_client.WebSocketApp("wss://irc-ws.chat.twitch.tv:443",
                                      on_message=on_msg,
                                      on_error=lambda w,e: print(f"Twitch IRC err: {e}"),
@@ -1075,7 +1081,10 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
         ws.on_open = lambda w: (w.send("CAP REQ :twitch.tv/tags twitch.tv/commands"),
                                 w.send("PASS SCHMOOPIIE"), w.send("NICK justinfan12345"),
                                 w.send(f"JOIN #{channel_name.lower()}"))
-        ws.run_forever()
+        _irc_ws = ws
+        ws.run_forever(ping_interval=30, ping_timeout=10)
+        _irc_ws = None  # 退出后清空引用
+
     task = loop.run_in_executor(None, run)
     async def sender():
         while not stop_event.is_set():
@@ -1092,10 +1101,15 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
         pass
     finally:
         stop_event.set()
+        # 主动关闭 IRC WS，让 run_forever() 能立即退出，不再阻塞线程
+        if _irc_ws:
+            try: _irc_ws.close()
+            except: pass
         send_task.cancel()
         try: await send_task
         except: pass
-        task.cancel()
+        try: await asyncio.wait_for(task, timeout=3)
+        except: pass
 
 @app.get("/")
 def root(): return {"status":"ok"}
