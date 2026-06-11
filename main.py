@@ -456,7 +456,7 @@ async def parse_huya(url):
         logging.exception("[虎牙] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== 斗鱼（头像修复） ====================
+# ==================== 斗鱼（使用 open.douyucdn.cn + betard 双重兜底） ====================
 async def parse_douyu(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -466,14 +466,36 @@ async def parse_douyu(url):
         room = info.get("room")
         if not room:
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
-        name = room.get("nickname") or "斗鱼主播"
-        # 【修复】优先从 owner.avatar 获取真实头像，其次兜底 room_pic
-        owner = room.get("owner", {})
-        avatar_obj = owner.get("avatar", {})
-        if isinstance(avatar_obj, dict):
-            avatar = avatar_obj.get("big") or avatar_obj.get("middle") or avatar_obj.get("small") or ""
-        else:
-            avatar = room.get("avatar") or room.get("room_pic") or ""
+
+        name = "斗鱼主播"
+        avatar = ""
+        
+        # 【修复 1】优先使用 open.douyucdn.cn 接口，最稳定
+        try:
+            open_api = f"https://open.douyucdn.cn/api/RoomApi/room/{room_id}"
+            open_resp = await request_with_retry("GET", open_api, headers={"User-Agent": UA})
+            if open_resp.status_code == 200:
+                open_data = open_resp.json()
+                if open_data.get("error") == 0:
+                    d = open_data.get("data", {})
+                    name = d.get("owner_name") or name
+                    avatar = d.get("avatar_big") or d.get("avatar_middle") or d.get("avatar") or ""
+        except Exception:
+            pass
+
+        # 【修复 2】如果 open 接口失败，从 betard 接口兜底提取
+        if not avatar or name == "斗鱼主播":
+            name = room.get("nickname") or name
+            owner = room.get("owner", {})
+            avatar_obj = owner.get("avatar", {})
+            if isinstance(avatar_obj, dict):
+                avatar = avatar_obj.get("big") or avatar_obj.get("middle") or avatar_obj.get("small") or avatar
+            else:
+                avatar = room.get("avatar") or room.get("room_pic") or avatar
+                
+        # 【修复 3】补全 URL 协议头
+        if avatar and avatar.startswith("//"):
+            avatar = "https:" + avatar
 
         if room.get("show_status") != 1 or room.get("videoLoop") == 1:
             return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
@@ -548,7 +570,7 @@ async def parse_douyu(url):
         logging.exception("[斗鱼] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== B站（头像接口修复） ====================
+# ==================== B站（使用 get_anchor_in_room） ====================
 async def parse_bilibili(url):
     try:
         rid = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -559,7 +581,6 @@ async def parse_bilibili(url):
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
         real_rid = room_data["data"]["room_id"]
 
-        # 提前获取主播信息（改用 get_anchor_in_room 防风控）
         name, avatar = "B站主播", ""
         try:
             anchor_resp = await request_with_retry("GET",
@@ -602,7 +623,7 @@ async def parse_bilibili(url):
         logging.exception("[B站] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== 抖音（头像提取双重兜底） ====================
+# ==================== 抖音 ====================
 async def parse_douyin(url):
     try:
         from streamget import DouyinLiveStream
@@ -696,7 +717,7 @@ async def parse_douyin(url):
         logging.exception("[抖音] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== Twitch（GQL 头像 + 备用ID池） ====================
+# ==================== Twitch ====================
 TWITCH_CLIENT_IDS = [
     "kimne78kx3ncx6brgo4mv6wki5h1ko",
     "ue666xxq81dq0l30715w03p3h3a6h", 
@@ -713,7 +734,6 @@ async def parse_twitch(url, cookie: str = ""):
 
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # 获取头像和昵称 (使用 GQL UserAvatar 查询)
         nickname = channel
         avatar = ""
         for client_id in TWITCH_CLIENT_IDS:
@@ -738,7 +758,6 @@ async def parse_twitch(url, cookie: str = ""):
             except Exception:
                 continue
 
-        # 获取播放 token
         token, sig = None, None
         for client_id in TWITCH_CLIENT_IDS:
             gql_headers = {"Client-ID": client_id, "Content-Type": "application/json", "User-Agent": UA}
@@ -791,7 +810,7 @@ async def parse_twitch(url, cookie: str = ""):
         logging.exception("[Twitch] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== SOOP（头像多源 + og:image 兜底） ====================
+# ==================== SOOP ====================
 async def parse_soop(url, cookie: str = ""):
     try:
         eff_cookie = cookie or SOOP_COOKIE
@@ -816,7 +835,6 @@ async def parse_soop(url, cookie: str = ""):
 
         nickname = f'BJ-{bj_id}'
         avatar = ''
-        # 尝试 A: 官方 station API (兼容 .co.kr 和 .com)
         try:
             info_apis = [
                 f'https://st.sooplive.co.kr/api/get_station_info.php?szBjId={bj_id}',
@@ -836,7 +854,6 @@ async def parse_soop(url, cookie: str = ""):
         except Exception:
             pass
 
-        # 尝试 B: 网页 og:image 兜底
         if not avatar:
             try:
                 home_url = f'https://play.sooplive.com/{bj_id}'
@@ -852,7 +869,6 @@ async def parse_soop(url, cookie: str = ""):
             except Exception:
                 pass
 
-        # 2. 直播状态
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -882,7 +898,6 @@ async def parse_soop(url, cookie: str = ""):
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 30}
             return result
 
-        # 3. 获取 view_url 与 aid
         ts_now = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
@@ -965,7 +980,7 @@ async def parse_soop(url, cookie: str = ""):
         logging.exception("[SOOP] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== PandaTV（头像路径补全） ====================
+# ==================== PandaTV ====================
 async def parse_panda(url):
     return await parse_panda_manual(url)
 
@@ -992,7 +1007,6 @@ async def parse_panda_manual(url):
         bj_info = info_json['bjInfo']
         anchor_name = bj_info.get('nick', user_id)
         avatar = bj_info.get('profileImg', '')
-        # 【修复】补全 URL 协议与域名
         if avatar and avatar.startswith('//'):
             avatar = 'https:' + avatar
         elif avatar and not avatar.startswith('http'):
