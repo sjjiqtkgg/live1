@@ -988,7 +988,7 @@ async def parse_soop(url, cookie: str = ""):
         logging.exception("[SOOP] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== PandaTV ====================
+# ==================== PandaTV（头像获取逻辑已增强） ====================
 async def parse_panda(url):
     return await parse_panda_manual(url)
 
@@ -1012,13 +1012,29 @@ async def parse_panda_manual(url):
         info_json = resp.json()
         if 'bjInfo' not in info_json:
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
-        bj_info = info_json['bjInfo']
+        bj_info = info_json.get('bjInfo', {})
         anchor_name = bj_info.get('nick', user_id)
-        avatar = bj_info.get('profileImg', '')
-        if avatar and avatar.startswith('//'):
+        # 【修复 1】兼容 PandaTV 可能变更的头像字段名
+        avatar = bj_info.get('profileImg', '') or bj_info.get('profileImage', '') or bj_info.get('img', '')
+
+        # 补全 URL 协议头
+        if avatar and avatar.startswith('//'): 
             avatar = 'https:' + avatar
-        elif avatar and not avatar.startswith('http'):
-            avatar = 'https://profile.pandalive.co.kr/' + avatar.lstrip('/')
+        elif avatar and not avatar.startswith('http'): 
+            avatar = 'https://pdliveimg.pandalive.co.kr' + (avatar if avatar.startswith('/') else '/' + avatar)
+
+        # 【修复 2】终极兜底：如果 API 没拿到，去主播主页 HTML 抓 og:image (最稳)
+        if not avatar:
+            try:
+                home_url = f'https://www.pandalive.co.kr/live/play/{user_id}'
+                home_resp = await request_with_proxy_group("GET", home_url, proxy_list=proxylist, headers=headers, shuffle_proxy=False)
+                if home_resp.status_code == 200:
+                    m = re.search(r'<meta\s+(?:property|name)="og:image"\s+content="([^"]+)"', home_resp.text)
+                    if m:
+                        avatar = m.group(1)
+                        if avatar.startswith('//'): avatar = 'https:' + avatar
+            except Exception:
+                pass
 
         if 'media' not in info_json:
             result = {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
