@@ -9,13 +9,13 @@ import hashlib
 import base64
 import random
 import ssl
-import traceback
 import logging
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse, Response
 from urllib.parse import unquote, urlparse, parse_qs, quote, urljoin
+from streamget import DouyinLiveStream  # 顶部统一导入
 
 # -------------------- 日志配置 --------------------
 logging.basicConfig(
@@ -28,12 +28,6 @@ try:
     from streamget.platforms.soop.live_stream import SoopLiveStream
 except ImportError:
     SoopLiveStream = None
-
-try:
-    from streamget import DouyinLiveStream
-except ImportError:
-    DouyinLiveStream = None
-    logging.warning("streamget 未安装，抖音平台不可用")
 
 try:
     from python_socks.sync import Proxy
@@ -92,7 +86,7 @@ if CF_WORKER:
 else:
     logging.info("[CF Worker] 未配置，海外平台 m3u8 将走外网代理")
 
-# ==================== 全局连接池 ====================
+# ==================== 全局连接池（双重检查锁） ====================
 CLIENT_POOL: dict = {}
 CLIENT_LOCK = asyncio.Lock()
 DEFAULT_TIMEOUT = 15
@@ -101,10 +95,11 @@ async def get_client(proxy=None, timeout=None):
     if timeout is None:
         timeout = DEFAULT_TIMEOUT
     key = f"{proxy or 'direct'}_t{timeout}"
-    if key in CLIENT_POOL:                       # 快速路径：不加锁
+    # 无锁快速路径
+    if key in CLIENT_POOL:
         return CLIENT_POOL[key]
     async with CLIENT_LOCK:
-        if key not in CLIENT_POOL:               # 持锁后二次确认
+        if key not in CLIENT_POOL:  # 持锁再次确认
             CLIENT_POOL[key] = httpx.AsyncClient(
                 timeout=timeout,
                 proxy=proxy,
@@ -153,13 +148,13 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
 
     for idx, proxy in enumerate(targets):
         try:
-            logging.info(f"[分组请求] 使用代理 [{idx+1}/{len(targets)}]: {proxy or '直连'}")
+            logging.debug(f"[分组请求] 使用代理 [{idx+1}/{len(targets)}]: {proxy or '直连'}")
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
             if shuffle_proxy:
                 try:
                     ip_resp = await client.get("https://api.ipify.org")
-                    logging.info(f"[出口IP] {ip_resp.text}")
+                    logging.debug(f"[出口IP] {ip_resp.text}")
                 except Exception:
                     pass
             return resp
@@ -212,7 +207,8 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         any(d in (referer or "") for d in EXTERNAL_REFERERS)
     )
     proxy_list = EXTERNAL_PROXY_URLS if use_external else PROXY_URLS
-    is_ts = url.lower().endswith(".ts")
+    # 修复 TS 识别（兼容带查询参数）
+    is_ts = url.lower().split("?")[0].endswith(".ts")
 
     if is_ts:
         stream_key = hashlib.md5(url.encode()).hexdigest()[:16]
@@ -295,6 +291,38 @@ def build_streams(flv, m3u8):
     if m3u8 and m3u8.startswith("http"):
         s.append({"cdn": "HLS", "url": m3u8, "type": "m3u8"})
     return s
+
+# ==================== 通用 M3U8 多画质解析（提取公共逻辑） ====================
+def parse_multivariant_m3u8(text, base_url, prefix):
+    """从多码率 M3U8 中提取画质列表，prefix 用于拼接 cdn 名称，如 'SOOP' 或 'PandaTV'"""
+    streams = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF"):
+            name = "Source"
+            res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
+            if res_match:
+                name = res_match.group(1).split('x')[1] + 'p'
+            else:
+                bw_match = re.search(r'BANDWIDTH=(\d+)', line)
+                if bw_match:
+                    kbps = int(int(bw_match.group(1)) / 1000)
+                    name = f"{kbps}k"
+            if i + 1 < len(lines):
+                sub_url = lines[i + 1].strip()
+                if not sub_url:
+                    continue
+                if not sub_url.startswith("http"):
+                    sub_url = urljoin(base_url, sub_url)
+                streams.append({"cdn": f"{prefix}-{name}", "url": sub_url, "type": "m3u8"})
+    if streams:
+        def quality_key(s):
+            n = s['cdn'].replace(f'{prefix}-', '')
+            if 'Source' in n: return 999999
+            num = re.search(r'\d+', n)
+            return float(num.group()) if num else 0
+        streams.sort(key=quality_key, reverse=True)
+    return streams
 
 # ==================== 虎牙 ====================
 async def fetch_huya_danmaku_params(room_id):
@@ -528,7 +556,7 @@ async def parse_douyu(url):
             params = base_params.copy()
             params['rate'] = str(rate_val)
             try:
-                await asyncio.sleep(0.2 * rate_val)  # 错峰防封
+                await asyncio.sleep(0.2 * rate_val)  # 错峰
                 r = await request_with_retry("POST",
                     f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
                     headers=hdrs, data=params, timeout=10)
@@ -538,8 +566,8 @@ async def parse_douyu(url):
                         info = d["data"]
                         flv_url = f"{info['rtmp_url']}/{info['rtmp_live']}"
                         return rate_val, flv_url
-            except Exception:
-                pass
+            except Exception as e:
+                logging.debug(f"[斗鱼] 画质 {rate_val} 请求异常: {e}")
             return rate_val, None
 
         tasks = [fetch_rate(r) for r in rate_map.keys()]
@@ -617,10 +645,9 @@ async def parse_bilibili(url):
         logging.exception("[B站] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== 抖音 ====================
+# ==================== 抖音（含递归深度限制） ====================
 async def parse_douyin(url):
     try:
-        from streamget import DouyinLiveStream
         live = DouyinLiveStream()
         data = await live.fetch_web_stream_data(url, process_data=True)
 
@@ -671,7 +698,8 @@ async def parse_douyin(url):
 
         avatar = ""
         
-        def find_avatar_in_dict(d):
+        def find_avatar_in_dict(d, depth=10):
+            if depth <= 0: return None
             if isinstance(d, dict):
                 for k, v in d.items():
                     if k in ("avatarThumb", "avatar_thumb", "avatar_larger", "avatar") and isinstance(v, dict):
@@ -680,11 +708,11 @@ async def parse_douyin(url):
                             return urls[0]
                         elif isinstance(urls, str) and urls.startswith("http"):
                             return urls
-                    res = find_avatar_in_dict(v)
+                    res = find_avatar_in_dict(v, depth-1)
                     if res: return res
             elif isinstance(d, list):
                 for item in d:
-                    res = find_avatar_in_dict(item)
+                    res = find_avatar_in_dict(item, depth-1)
                     if res: return res
             return None
 
@@ -698,7 +726,6 @@ async def parse_douyin(url):
                 resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
                 m_render = re.search(r'<script id="RENDER_DATA" type="application/json">([^<]+)</script>', resp.text)
                 if m_render:
-                    from urllib.parse import unquote
                     render_json = json.loads(unquote(m_render.group(1)))
                     avatar = find_avatar_in_dict(render_json) or ""
             except Exception:
@@ -806,7 +833,7 @@ async def parse_twitch(url, cookie: str = ""):
         logging.exception("[Twitch] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== SOOP ====================
+# ==================== SOOP（缓存时间差异化） ====================
 async def parse_soop(url, cookie: str = ""):
     try:
         eff_cookie = cookie or SOOP_COOKIE
@@ -875,7 +902,7 @@ async def parse_soop(url, cookie: str = ""):
                                                    headers=headers_pc, data=live_data_form, shuffle_proxy=False)
         if live_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 30}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
@@ -885,13 +912,13 @@ async def parse_soop(url, cookie: str = ""):
                     "title": nickname, "avatar": avatar}
         if result_code not in [0, 1]:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 30}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
         broad_no = channel.get('BNO', '')
         if not broad_no:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 30}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
         ts_now = time.time()
@@ -907,13 +934,13 @@ async def parse_soop(url, cookie: str = ""):
             proxy_list=proxylist, headers=headers_pc, params=cdn_params, shuffle_proxy=False)
         if cdn_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 30}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
         cdn_json = cdn_resp.json()
         view_url = cdn_json.get('view_url')
         if not view_url:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 30}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
         aid_form = live_data_form.copy()
@@ -922,13 +949,13 @@ async def parse_soop(url, cookie: str = ""):
                                                   headers=headers_pc, data=aid_form, shuffle_proxy=False)
         if aid_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 30}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
         aid_json = aid_resp.json()
         aid = aid_json.get('CHANNEL', {}).get('AID', '')
         if not aid:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 30}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
         m3u8_url = f'{view_url}?aid={aid}'
@@ -938,47 +965,26 @@ async def parse_soop(url, cookie: str = ""):
                                                          headers={"User-Agent": UA, "Referer": "https://play.sooplive.com"},
                                                          shuffle_proxy=False)
             if master_resp.status_code == 200:
-                lines = master_resp.text.splitlines()
-                for i, line in enumerate(lines):
-                    if line.startswith("#EXT-X-STREAM-INF"):
-                        name = "Source"
-                        res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
-                        if res_match:
-                            name = res_match.group(1).split('x')[1] + 'p'
-                        else:
-                            bw_match = re.search(r'BANDWIDTH=(\d+)', line)
-                            if bw_match:
-                                kbps = int(int(bw_match.group(1)) / 1000)
-                                name = f"{kbps}k"
-                        if i + 1 < len(lines):
-                            sub_url = lines[i + 1].strip()
-                            if not sub_url:
-                                continue
-                            if not sub_url.startswith("http"):
-                                sub_url = urljoin(m3u8_url, sub_url)
-                            streams.append({"cdn": f"SOOP-{name}", "url": sub_url, "type": "m3u8"})
-                if streams:
-                    def get_soop_quality(s):
-                        n = s['cdn'].replace('SOOP-', '')
-                        if 'Source' in n: return 999999
-                        num = re.search(r'\d+', n)
-                        return float(num.group()) if num else 0
-                    streams.sort(key=get_soop_quality, reverse=True)
+                streams = parse_multivariant_m3u8(master_resp.text, m3u8_url, "SOOP")
         except Exception:
             pass
         if not streams:
             streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
 
         result = {"streams": streams, "title": nickname, "avatar": avatar, "isLive": True}
-        M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 30}
+        # 在线状态缓存 15 秒
+        M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 15}
         return result
     except Exception as e:
         logging.exception("[SOOP] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== PandaTV（头像获取已按最新方案增强） ====================
-async def parse_panda(url):
-    return await parse_panda_manual(url)
+# ==================== PandaTV（头像获取终极增强） ====================
+# 可识别的图片字段名
+_IMG_FIELDS = (
+    'profileImg', 'profileImage', 'img', 'profile_img', 'avatar', 'avatarImg',
+    'avatarImage', 'thumb', 'thumbnail', 'pic', 'picture', 'photo', 'icon', 'logo'
+)
 
 async def parse_panda_manual(url):
     try:
@@ -990,6 +996,7 @@ async def parse_panda_manual(url):
         headers = {'origin': 'https://www.pandalive.co.kr', 'referer': 'https://www.pandalive.co.kr/', 'user-agent': UA}
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
+        # 第一个 API：member/bj
         info_url = 'https://api.pandalive.co.kr/v1/member/bj'
         resp = await request_with_proxy_group("POST", info_url, proxy_list=proxylist,
                                               headers=headers,
@@ -1000,25 +1007,27 @@ async def parse_panda_manual(url):
         info_json = resp.json()
         if 'bjInfo' not in info_json:
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
+        
         bj_info = info_json.get('bjInfo', {})
         anchor_name = bj_info.get('nick', user_id)
-
-        # PandaTV API 字段名不稳定，穷举所有已知变体
-        _IMG_FIELDS = (
-            'profileImg', 'profileImage', 'img', 'userImg', 'thumbImg',
-            'bjImg', 'thumb', 'photo', 'avatar', 'iconImg', 'userPic',
-            'thumbnail', 'profile', 'profileThumb',
-        )
-        avatar = next((bj_info[k] for k in _IMG_FIELDS if bj_info.get(k)), '')
-
-        # 诊断日志：首次上线时可确认实际字段名，稳定后可改为 DEBUG 级别
+        # 从 bjInfo 中提取头像（尝试 14 种字段名）
+        avatar = next((str(bj_info.get(k)) for k in _IMG_FIELDS if bj_info.get(k)), '')
+        # 记下实际字段，便于后续排错
         logging.info(f"[PandaTV] bjInfo 字段列表: {list(bj_info.keys())} | 头像原始值: {avatar!r}")
 
+        # 补全协议/域名
+        if avatar and avatar.startswith('//'): 
+            avatar = 'https:' + avatar
+        elif avatar and not avatar.startswith('http'): 
+            avatar = 'https://profile.pandalive.co.kr' + (avatar if avatar.startswith('/') else '/' + avatar)
+
+        # 检查是否有直播流
         if 'media' not in info_json:
             result = {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
-            M3U8_CACHE[url] = {"data": result, "expire": time.time() + 30}
+            M3U8_CACHE[url] = {"data": result, "expire": time.time() + 60}
             return result
 
+        # 第二个 API：live/play
         play_url = 'https://api.pandalive.co.kr/v1/live/play'
         resp2 = await request_with_proxy_group("POST", play_url, proxy_list=proxylist,
                                                headers=headers,
@@ -1033,26 +1042,18 @@ async def parse_panda_manual(url):
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
 
-        # ── 头像兜底：play_json 通常比 member/bj 返回更完整的 bjInfo ──
+        # 如果头像还未拿到，或拿到的是默认占位图，从 play_json 中提取
         if not avatar or 'default' in avatar.lower() or 'no_image' in avatar.lower():
             for _section in ('bjInfo', 'userInfo', 'bjProfile', 'channelInfo', 'mediaInfo'):
                 _d = play_json.get(_section)
                 if isinstance(_d, dict):
-                    _candidate = next((str(_d[k]) for k in _IMG_FIELDS if _d.get(k)), '')
+                    _candidate = next((str(_d.get(k)) for k in _IMG_FIELDS if _d.get(k)), '')
                     if _candidate:
                         avatar = _candidate
                         logging.info(f"[PandaTV] 从 play_json[{_section}] 获取到头像")
                         break
 
-        # 统一补全协议前缀
-        def _fix_avatar_url(u):
-            if not u: return ''
-            if u.startswith('//'): return 'https:' + u
-            if not u.startswith('http'):
-                return 'https://profile.pandalive.co.kr' + ('/' if not u.startswith('/') else '') + u
-            return u
-        avatar = _fix_avatar_url(avatar)
-
+        # 画质解析（复用公共函数）
         streams = []
         try:
             cf_worker = CF_WORKER.rstrip("/") if CF_WORKER else ""
@@ -1066,39 +1067,14 @@ async def parse_panda_manual(url):
                                                                       "Origin": "https://www.pandalive.co.kr"},
                                                              shuffle_proxy=False)
             if master_resp.status_code == 200:
-                lines = master_resp.text.splitlines()
-                for i, line in enumerate(lines):
-                    if line.startswith("#EXT-X-STREAM-INF"):
-                        name = "Source"
-                        res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
-                        if res_match:
-                            name = res_match.group(1).split('x')[1] + 'p'
-                        else:
-                            bw_match = re.search(r'BANDWIDTH=(\d+)', line)
-                            if bw_match:
-                                kbps = int(int(bw_match.group(1)) / 1000)
-                                name = f"{kbps}k"
-                        if i + 1 < len(lines):
-                            sub_url = lines[i + 1].strip()
-                            if not sub_url:
-                                continue
-                            if not sub_url.startswith("http"):
-                                sub_url = urljoin(real_m3u8, sub_url)
-                            streams.append({"cdn": f"PandaTV-{name}", "url": sub_url, "type": "m3u8"})
-                if streams:
-                    def get_panda_quality(s):
-                        n = s['cdn'].replace('PandaTV-', '')
-                        if 'Source' in n: return 999999
-                        num = re.search(r'\d+', n)
-                        return float(num.group()) if num else 0
-                    streams.sort(key=get_panda_quality, reverse=True)
+                streams = parse_multivariant_m3u8(master_resp.text, real_m3u8, "PandaTV")
         except Exception:
             pass
         if not streams:
             streams = [{"cdn": "PandaTV-Source", "url": real_m3u8, "type": "m3u8"}]
 
         result = {"streams": streams, "title": anchor_name, "avatar": avatar, "isLive": True}
-        M3U8_CACHE[url] = {"data": result, "expire": time.time() + 30}
+        M3U8_CACHE[url] = {"data": result, "expire": time.time() + 15}
         return result
     except Exception as e:
         logging.exception("[PandaTV] 解析异常")
@@ -1113,7 +1089,7 @@ async def api_parse(url: str = Query(...), cookie: str = Query("")):
         if "douyin.com" in url: return await parse_douyin(url)
         if "twitch.tv" in url: return await parse_twitch(url, cookie=cookie)
         if "sooplive.com" in url: return await parse_soop(url, cookie=cookie)
-        if "pandalive.co.kr" in url: return await parse_panda(url)
+        if "pandalive.co.kr" in url: return await parse_panda_manual(url)
         raise HTTPException(400, "不支持的平台")
     except HTTPException:
         raise
@@ -1134,7 +1110,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                         try: await go_ws.ping()
                         except: pass
                         await websocket.send_text('pong')
-                    elif go_ws.open:
+                    elif go_ws.state.name == 'OPEN':  # 修复弃用属性
                         await go_ws.send(data)
             async def forward_to_frontend():
                 while True:
