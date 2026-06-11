@@ -30,6 +30,12 @@ except ImportError:
     SoopLiveStream = None
 
 try:
+    from streamget import DouyinLiveStream
+except ImportError:
+    DouyinLiveStream = None
+    logging.warning("streamget 未安装，抖音平台不可用")
+
+try:
     from python_socks.sync import Proxy
     SOCKS_SUPPORT = True
 except ImportError:
@@ -95,8 +101,10 @@ async def get_client(proxy=None, timeout=None):
     if timeout is None:
         timeout = DEFAULT_TIMEOUT
     key = f"{proxy or 'direct'}_t{timeout}"
+    if key in CLIENT_POOL:                       # 快速路径：不加锁
+        return CLIENT_POOL[key]
     async with CLIENT_LOCK:
-        if key not in CLIENT_POOL:
+        if key not in CLIENT_POOL:               # 持锁后二次确认
             CLIENT_POOL[key] = httpx.AsyncClient(
                 timeout=timeout,
                 proxy=proxy,
@@ -124,7 +132,7 @@ async def request_with_retry(method, url, **kwargs):
     timeout = kwargs.pop("timeout", 15)
     for idx, proxy in enumerate(PROXY_URLS):
         try:
-            logging.info(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
+            logging.debug(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
             return resp
@@ -994,44 +1002,17 @@ async def parse_panda_manual(url):
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
         bj_info = info_json.get('bjInfo', {})
         anchor_name = bj_info.get('nick', user_id)
-        # 兼容 API 可能的字段名变更
-        avatar = bj_info.get('profileImg', '') or bj_info.get('profileImage', '') or bj_info.get('img', '')
 
-        # 补全 URL 协议头
-        if avatar and avatar.startswith('//'): 
-            avatar = 'https:' + avatar
-        elif avatar and not avatar.startswith('http'): 
-            avatar = 'https://profile.pandalive.co.kr' + (avatar if avatar.startswith('/') else '/' + avatar)
+        # PandaTV API 字段名不稳定，穷举所有已知变体
+        _IMG_FIELDS = (
+            'profileImg', 'profileImage', 'img', 'userImg', 'thumbImg',
+            'bjImg', 'thumb', 'photo', 'avatar', 'iconImg', 'userPic',
+            'thumbnail', 'profile', 'profileThumb',
+        )
+        avatar = next((bj_info[k] for k in _IMG_FIELDS if bj_info.get(k)), '')
 
-        # 【终极修复】如果 API 没拿到，或者拿到的是无效占位图，去主页 HTML 死磕
-        if not avatar or 'default' in avatar.lower() or 'no_image' in avatar.lower():
-            try:
-                # 同时尝试 channel 页面和 play 页面，确保万无一失
-                home_urls = [
-                    f'https://www.pandalive.co.kr/channel/{user_id}',
-                    f'https://www.pandalive.co.kr/live/play/{user_id}'
-                ]
-                for home_url in home_urls:
-                    home_resp = await request_with_proxy_group("GET", home_url, proxy_list=proxylist,
-                                                               headers=headers, shuffle_proxy=False)
-                    if home_resp.status_code == 200:
-                        html = home_resp.text
-                        # 正则 1: 提取 og:image (兼容 property 和 content 属性顺序反转)
-                        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html) or \
-                            re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
-                        
-                        # 正则 2: 提取 PandaTV 特有的 class="profileimg" 标签
-                        if not m:
-                            m = re.search(r'<img[^>]+class=["\']profileimg["\'][^>]+src=["\']([^"\']+)["\']', html) or \
-                                re.search(r'<img[^>]+src=["\']([^"\']+)["\'][^>]+class=["\']profileimg["\']', html)
-                        
-                        if m:
-                            avatar = m.group(1)
-                            if avatar.startswith('//'): avatar = 'https:' + avatar
-                            elif not avatar.startswith('http'): avatar = urljoin('https://www.pandalive.co.kr/', avatar)
-                            break # 拿到了就跳出循环
-            except Exception as e:
-                logging.warning(f"[PandaTV] 主页抓取头像异常: {e}")
+        # 诊断日志：首次上线时可确认实际字段名，稳定后可改为 DEBUG 级别
+        logging.info(f"[PandaTV] bjInfo 字段列表: {list(bj_info.keys())} | 头像原始值: {avatar!r}")
 
         if 'media' not in info_json:
             result = {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
@@ -1051,6 +1032,26 @@ async def parse_panda_manual(url):
         if 'PlayList' not in play_json or 'hls' not in play_json['PlayList']:
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
+
+        # ── 头像兜底：play_json 通常比 member/bj 返回更完整的 bjInfo ──
+        if not avatar or 'default' in avatar.lower() or 'no_image' in avatar.lower():
+            for _section in ('bjInfo', 'userInfo', 'bjProfile', 'channelInfo', 'mediaInfo'):
+                _d = play_json.get(_section)
+                if isinstance(_d, dict):
+                    _candidate = next((str(_d[k]) for k in _IMG_FIELDS if _d.get(k)), '')
+                    if _candidate:
+                        avatar = _candidate
+                        logging.info(f"[PandaTV] 从 play_json[{_section}] 获取到头像")
+                        break
+
+        # 统一补全协议前缀
+        def _fix_avatar_url(u):
+            if not u: return ''
+            if u.startswith('//'): return 'https:' + u
+            if not u.startswith('http'):
+                return 'https://profile.pandalive.co.kr' + ('/' if not u.startswith('/') else '') + u
+            return u
+        avatar = _fix_avatar_url(avatar)
 
         streams = []
         try:
