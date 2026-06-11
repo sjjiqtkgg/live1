@@ -340,13 +340,13 @@ async def parse_huya(url):
         live = data["data"]
 
         # 提取主播信息（不论是否开播）
-        profile = live.get("profileRoom", {})
-        room_info = live.get("roomInfo", {})
+        # 【修复】：虎牙 API 实际返回的字段是 profileInfo 和 liveData，而不是 profileRoom/roomInfo
+        profile_info = live.get("profileInfo", {})
         live_data = live.get("liveData", {})
-        anchor = live.get("anchor", {})
+        
         anchor_name = (
-            profile.get("nick") or room_info.get("nick") or live_data.get("nick") or anchor.get("nick") or
-            profile.get("sNick") or room_info.get("sNick") or ""
+            profile_info.get("nick") or live_data.get("nick") or 
+            profile_info.get("sNick") or live_data.get("sNick") or ""
         )
         if not anchor_name:
             try:
@@ -359,12 +359,12 @@ async def parse_huya(url):
             except Exception:
                 pass
         anchor_name = anchor_name or "虎牙主播"
+
         avatar = (
-            profile.get("avatar180") or profile.get("sAvatar180") or
-            profile.get("sAvatar") or profile.get("avatar") or
-            anchor.get("avatar180") or anchor.get("sAvatar180") or
-            anchor.get("sAvatar") or anchor.get("avatar") or
-            room_info.get("avatar180") or room_info.get("sAvatar180") or ""
+            profile_info.get("avatar180") or profile_info.get("sAvatar180") or
+            profile_info.get("sAvatar") or profile_info.get("avatar") or
+            live_data.get("avatar180") or live_data.get("sAvatar180") or
+            live_data.get("sAvatar") or live_data.get("avatar") or ""
         )
 
         if live.get("realLiveStatus") != "ON":
@@ -562,13 +562,15 @@ async def parse_bilibili(url):
         # 提前获取主播信息
         name, avatar = "B站主播", ""
         try:
+            # 【修复】：getInfoByRoom 容易触发 -352 风控，改用 Master/info 接口通过 uid 获取
+            uid = room_data["data"]["uid"]
             ir_resp = await request_with_retry("GET",
-                f"https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id={real_rid}",
+                f"https://api.live.bilibili.com/live_user/v1/Master/info?uid={uid}",
                 headers=hdrs)
             ir = ir_resp.json()
-            ri = ir.get("data", {}).get("room_info", {})
-            name = ri.get("uname") or name
-            avatar = ri.get("face") or ""
+            info = ir.get("data", {}).get("info", {})
+            name = info.get("uname") or name
+            avatar = info.get("face") or ""
         except Exception:
             pass
 
