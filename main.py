@@ -623,7 +623,7 @@ async def parse_bilibili(url):
         logging.exception("[B站] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== 抖音 ====================
+# ==================== 抖音（头像提取双重兜底，递归查找） ====================
 async def parse_douyin(url):
     try:
         from streamget import DouyinLiveStream
@@ -676,40 +676,48 @@ async def parse_douyin(url):
             except Exception: pass
 
         avatar = ""
-        # 尝试 1：从 streamget 的返回数据中提取
+        
+        # 【修复 1】定义一个递归函数，专门用于从复杂的 JSON 字典中精准提取头像 URL
+        def find_avatar_in_dict(d):
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    # 匹配抖音常见的头像字段名
+                    if k in ("avatarThumb", "avatar_thumb", "avatar_larger", "avatar") and isinstance(v, dict):
+                        urls = v.get("urlList") or v.get("url_list") or v.get("url")
+                        if isinstance(urls, list) and urls:
+                            return urls[0]
+                        elif isinstance(urls, str) and urls.startswith("http"):
+                            return urls
+                    res = find_avatar_in_dict(v)
+                    if res: return res
+            elif isinstance(d, list):
+                for item in d:
+                    res = find_avatar_in_dict(item)
+                    if res: return res
+            return None
+
+        # 【修复 2】优先从 streamget 已经获取的 data 中提取（零额外网络请求，最稳，无风控）
         try:
-            user_info = data.get("user", {}) or data.get("room", {}).get("user", {}) or {}
-            avatar = (user_info.get("avatar_thumb", {}).get("url_list", [""])[0] or
-                      user_info.get("avatar_larger", {}).get("url_list", [""])[0] or
-                      user_info.get("avatar", ""))
+            avatar = find_avatar_in_dict(data) or ""
         except Exception:
             pass
 
-        # 尝试 2：网页 RENDER_DATA 解析 (终极兜底)
+        # 【修复 3】终极兜底：如果 streamget 没拿到，解析网页的 RENDER_DATA (URL 解码 + JSON 解析)
         if not avatar:
             try:
                 resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
-                m = re.search(r'<script id="RENDER_DATA" type="application/json">([^<]+)</script>', resp.text)
-                if m:
+                m_render = re.search(r'<script id="RENDER_DATA" type="application/json">([^<]+)</script>', resp.text)
+                if m_render:
                     from urllib.parse import unquote
-                    render_json = json.loads(unquote(m.group(1)))
-                    def find_avatar(d):
-                        if isinstance(d, dict):
-                            if "avatarThumb" in d and isinstance(d["avatarThumb"], dict):
-                                urls = d["avatarThumb"].get("urlList", [])
-                                if urls: return urls[0]
-                            for v in d.values():
-                                res = find_avatar(v)
-                                if res: return res
-                        elif isinstance(d, list):
-                            for item in d:
-                                res = find_avatar(item)
-                                if res: return res
-                        return None
-                    avatar = find_avatar(render_json) or ""
-                    if avatar: avatar = avatar.replace("\\u002F", "/")
+                    # 核心：必须经过 unquote 解码后，才能转为正常的 JSON 字典
+                    render_json = json.loads(unquote(m_render.group(1)))
+                    avatar = find_avatar_in_dict(render_json) or ""
             except Exception:
                 pass
+                
+        # 【修复 4】补全协议头，防止 //p3-webcast.douyinpic.com 这种相对路径导致前端拼接错误
+        if avatar and avatar.startswith("//"):
+            avatar = "https:" + avatar
 
         return {"streams": streams, "title": anchor_name,
                 "avatar": avatar, "roomId": room_id, "isLive": True}
