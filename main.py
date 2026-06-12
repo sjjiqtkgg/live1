@@ -304,7 +304,8 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
             }
         )
     out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": content_type or "application/json"}
-    return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
+    # 修复 FLV 流传输：使用异步迭代器，避免阻塞
+    return StreamingResponse(resp.aiter_bytes(), status_code=resp.status_code, headers=out_headers)
 
 
 def build_streams(flv, m3u8):
@@ -1118,7 +1119,7 @@ async def parse_panda_manual(url):
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
 @app.post("/api/follows/batch")
-@limiter.limit("10/minute")
+@limiter.limit("20/minute")   # 调整批量查询限制，避免误触
 async def api_follows_batch(request: Request):
     """批量查询关注列表的直播状态，避免前端逐条调用 /api/parse。
     请求体: {"items": [{"url": "...", "cookie": "..."}, ...]}
@@ -1155,7 +1156,7 @@ async def api_follows_batch(request: Request):
     return {"results": results}
 
 @app.get("/api/parse")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")   # 放宽限制，配合前端防抖
 async def api_parse(request: Request, url: str = Query(...), cookie: str = Query("")):
     try:
         return await _parse_dispatch(url, cookie)
