@@ -14,8 +14,16 @@ import logging
 from fastapi import FastAPI, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
 from urllib.parse import unquote, urlparse, parse_qs, quote, urljoin
+
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    SLOWAPI_AVAILABLE = True
+except ImportError:
+    SLOWAPI_AVAILABLE = False
 
 # -------------------- 日志配置 --------------------
 logging.basicConfig(
@@ -69,6 +77,22 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=500)
+
+# ==================== API 限流 ====================
+# 防止 /api/parse、/api/proxy 被脚本批量刷，避免代理池和上游平台风控被打爆
+if SLOWAPI_AVAILABLE:
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+else:
+    logging.warning("[限流] slowapi 未安装，/api/parse 与 /api/proxy 不受限流保护，建议 pip install slowapi")
+    # 提供一个空操作装饰器，使下方 @limiter.limit(...) 在未安装时不报错
+    class _NoopLimiter:
+        def limit(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+    limiter = _NoopLimiter()
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
@@ -156,12 +180,6 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
             logging.debug(f"[分组请求] 使用代理 [{idx+1}/{len(targets)}]: {proxy or '直连'}")
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
-            if shuffle_proxy:
-                try:
-                    ip_resp = await client.get("https://api.ipify.org")
-                    logging.info(f"[出口IP] {ip_resp.text}")
-                except Exception:
-                    pass
             return resp
         except Exception as e:
             last_error = e
@@ -171,6 +189,7 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
 
 # ------------------ 代理接口 -----------------
 @app.api_route("/api/proxy", methods=["GET", "POST"])
+@limiter.limit("60/minute")
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
     ALLOWED = [
         ".douyu.com", ".huya.com", ".bilibili.com", ".bilivideo.com", ".douyucdn.cn",
@@ -565,7 +584,7 @@ async def parse_douyu(url):
             params = base_params.copy()
             params['rate'] = str(rate_val)
             try:
-                await asyncio.sleep(0.2 * rate_val)  # 错峰防封
+                await asyncio.sleep(0.2 * rate_val + random.uniform(0, 0.3))  # 错峰防封 + 随机抖动
                 r = await request_with_retry("POST",
                     f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
                     headers=hdrs, data=params, timeout=10)
@@ -1098,8 +1117,54 @@ async def parse_panda_manual(url):
         logging.exception("[PandaTV] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
+@app.post("/api/follows/batch")
+@limiter.limit("10/minute")
+async def api_follows_batch(request: Request):
+    """批量查询关注列表的直播状态，避免前端逐条调用 /api/parse。
+    请求体: {"items": [{"url": "...", "cookie": "..."}, ...]}
+    返回: {"results": [{"url": "...", ...parse结果}, ...]}（顺序与输入一致）
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "请求体必须是 JSON")
+
+    items = body.get("items", [])
+    if not isinstance(items, list) or not items:
+        raise HTTPException(400, "items 不能为空")
+    if len(items) > 30:
+        raise HTTPException(400, "单次最多查询 30 个")
+
+    # 限制并发，避免一次性把代理池/上游接口打爆
+    sem = asyncio.Semaphore(5)
+
+    async def _one(item):
+        url = item.get("url", "")
+        cookie = item.get("cookie", "")
+        async with sem:
+            try:
+                result = await _parse_dispatch(url, cookie)
+            except HTTPException as e:
+                result = {"streams": [], "isLive": False, "title": "", "avatar": "", "error": str(e.detail)}
+            except Exception as e:
+                result = {"streams": [], "isLive": False, "title": "", "avatar": "", "error": str(e)}
+        result["url"] = url
+        return result
+
+    results = await asyncio.gather(*(_one(it) for it in items))
+    return {"results": results}
+
 @app.get("/api/parse")
-async def api_parse(url: str = Query(...), cookie: str = Query("")):
+@limiter.limit("30/minute")
+async def api_parse(request: Request, url: str = Query(...), cookie: str = Query("")):
+    try:
+        return await _parse_dispatch(url, cookie)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+async def _parse_dispatch(url: str, cookie: str = ""):
     try:
         if "huya.com" in url: return await parse_huya(url)
         if "douyu.com" in url: return await parse_douyu(url)
@@ -1160,19 +1225,17 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
                     m = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
                     if m:
                         await ws_conn.send_json({"type": "chat", "nick": m.group(1), "content": m.group(2)})
-                        
-            async def heartbeat():
-                while True:
-                    await asyncio.sleep(15)
-                    try:
-                        data = await asyncio.wait_for(ws_conn.receive_text(), timeout=1)
-                        if data == "ping": await ws_conn.send_text("pong")
-                    except asyncio.TimeoutError:
-                        pass
-                    except Exception:
-                        break
 
-            await asyncio.gather(forward_to_frontend(), heartbeat())
+            async def listen_to_frontend():
+                # 持续监听前端消息：
+                # 1) 及时响应前端 ping/pong（避免老的 15s 轮询造成的延迟）
+                # 2) 利用 receive 自身检测前端断开连接，断开后退出 gather 结束本次会话
+                while True:
+                    data = await ws_conn.receive_text()
+                    if data == "ping":
+                        await ws_conn.send_text("pong")
+
+            await asyncio.gather(forward_to_frontend(), listen_to_frontend())
     except Exception as e:
         logging.warning(f"[Twitch WS] 连接异常: {e}")
     finally:
