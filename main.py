@@ -69,9 +69,9 @@ async def get_client(proxy=None, timeout=None):
             CLIENT_POOL[key] = httpx.AsyncClient(
                 timeout=timeout,
                 proxy=proxy,
-                http2=(proxy is None),  # 【优化】代理连接关闭 HTTP/2 防兼容问题
+                http2=(proxy is None),  # 代理连接关闭 HTTP/2 防兼容问题
                 verify=False,
-                follow_redirects=True,  # 【修复】强制跟随 302 重定向 (SOOP .co.kr 必需)
+                follow_redirects=True,  # 强制跟随 302 重定向 (SOOP .co.kr 必需)
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
             )
     return CLIENT_POOL[key]
@@ -99,7 +99,7 @@ async def request_with_retry(method, url, **kwargs):
 
 async def request_with_proxy_group(method, url, proxy_list, **kwargs):
     last_error = None
-    timeout = kwargs.pop("timeout", 6)  # 【优化】外网代理默认超时降至 6s，防卡死
+    timeout = kwargs.pop("timeout", 6)  # 外网代理默认超时降至 6s
     shuffle_proxy = kwargs.pop("shuffle_proxy", False)
     targets = proxy_list[:]
     if shuffle_proxy and targets: random.shuffle(targets)
@@ -134,7 +134,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
-# 【新增】全局异常兜底，防止 Render 网关返回无 CORS 头的 500 HTML 导致前端跨域报错
+# 全局异常兜底，防止 500 时返回无 CORS 头的 HTML
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logging.exception(f"[全局异常] 未捕获的服务器错误: {exc}")
@@ -209,11 +209,9 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
             else:
                 rewritten.append(line)
         body_out = "\n".join(rewritten).encode("utf-8")
-        # 【修复】直接返回 Response，消灭 gen.throw
         return Response(content=body_out, status_code=resp.status_code, headers={"Access-Control-Allow-Origin": "*", "Content-Type": "application/vnd.apple.mpegurl"})
 
     if is_ts:
-        # 【修复】安全生成器，吞噬客户端断开导致的 CancelledError
         async def safe_aiter_bytes(response):
             try:
                 async for chunk in response.aiter_bytes(): yield chunk
@@ -243,6 +241,18 @@ def huya_build_anticode(raw_anti, stream_name):
     params["u"] = "0"
     return "&".join(f"{k}={v}" for k, v in params.items())
 
+async def fetch_huya_danmaku_params(room_id):
+    try:
+        resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
+            headers={"User-Agent": MOBILE_UA, "Referer": "https://www.huya.com/"})
+        html = resp.text
+        ayyuid = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
+        top_sid = int((re.search(r'"lChannelId":(\d+)', html) or [None, 0])[1])
+        sub_sid = int((re.search(r'"lSubChannelId":(\d+)', html) or [None, 0])[1])
+        return {"platform": "huya", "ayyuid": ayyuid, "topSid": top_sid, "subSid": sub_sid}
+    except Exception:
+        return {}
+
 async def parse_huya(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -270,7 +280,8 @@ async def parse_huya(url):
                     seen_urls.add(full_url)
                     streams.append({"cdn": f"{CDN_NAMES.get(cdn.get('sCdnType','CDN'))}-{q_name}", "url": full_url, "type": "flv"})
         streams.sort(key=lambda s: {"原画":0,"蓝光":1,"超清":2,"高清":3,"标清":4}.get(s["cdn"].split("-")[-1], 99))
-        return {"streams": streams, "title": anchor_name, "avatar": avatar, "isLive": True}
+        danmaku = await fetch_huya_danmaku_params(room_id)
+        return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
     except Exception as e:
         logging.exception("[虎牙] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
@@ -279,7 +290,16 @@ async def parse_douyu(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         hdrs = {"User-Agent": UA, "Referer": f"https://www.douyu.com/{room_id}"}
-        name, avatar = "斗鱼主播", ""
+        
+        # 始终请求 betard 获取房间基本信息（含 real_id、show_status）
+        info_resp = await request_with_retry("GET", f"https://www.douyu.com/betard/{room_id}", headers=hdrs)
+        room = info_resp.json().get("room", {})
+        if not room:
+            return {"streams": [], "isLive": False, "title": "", "avatar": ""}
+        
+        # 头像和昵称优先用 open API，失败则使用 betard 数据
+        name = "斗鱼主播"
+        avatar = ""
         try:
             open_resp = await request_with_retry("GET", f"https://open.douyucdn.cn/api/RoomApi/room/{room_id}", headers={"User-Agent": UA})
             if open_resp.status_code == 200:
@@ -287,13 +307,20 @@ async def parse_douyu(url):
                 name = d.get("owner_name") or name
                 avatar = d.get("avatar_big") or d.get("avatar") or ""
         except: pass
-        if not avatar:
-            info_resp = await request_with_retry("GET", f"https://www.douyu.com/betard/{room_id}", headers=hdrs)
-            room = info_resp.json().get("room", {})
+        
+        if not name or name == "斗鱼主播":
             name = room.get("nickname") or name
-            avatar = room.get("owner", {}).get("avatar", {}).get("big") or room.get("room_pic") or ""
-        if avatar and avatar.startswith("//"): avatar = "https:" + avatar
-        if room.get("show_status") != 1: return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
+        if not avatar:
+            owner_avatar = room.get("owner", {}).get("avatar", {})
+            if isinstance(owner_avatar, dict):
+                avatar = owner_avatar.get("big") or owner_avatar.get("middle") or ""
+            else:
+                avatar = room.get("room_pic") or ""
+        if avatar and avatar.startswith("//"):
+            avatar = "https:" + avatar
+        
+        if room.get("show_status") != 1 or room.get("videoLoop") == 1:
+            return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
         
         real_id = str(room["room_id"])
         did = "10000000000000000000000000001501"
@@ -301,7 +328,8 @@ async def parse_douyu(url):
         white = enc_resp.json()["data"]
         ts = int(time.time())
         secret = white['rand_str']
-        for _ in range(white['enc_time']): secret = hashlib.md5((secret + white['key']).encode()).hexdigest()
+        for _ in range(white['enc_time']):
+            secret = hashlib.md5((secret + white['key']).encode()).hexdigest()
         auth = hashlib.md5((secret + white['key'] + f"{real_id}{ts}").encode()).hexdigest()
         base_params = {'ver': '219032101', 'rid': real_id, 'enc_data': white['enc_data'], 'tt': str(ts), 'did': did, 'auth': auth}
         rate_map = {0: "原画", 2: "高清", 4: "标清"}
@@ -337,7 +365,6 @@ async def parse_bilibili(url):
         
         name, avatar = "B站主播", ""
         try:
-            # 【修复】使用 get_anchor_in_room 防 -352 风控
             anchor_resp = await request_with_retry("GET", f"https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={rid}", headers=hdrs)
             info = anchor_resp.json().get("data", {}).get("info", {})
             name = info.get("uname") or name
@@ -398,7 +425,6 @@ async def parse_douyin(url):
                 if match: room_id = match.group(1)
             except: pass
             
-        # 【修复】深度递归提取 streamget 数据中的头像
         def find_avatar_in_dict(d, depth=0):
             if depth > 12: return None
             if isinstance(d, dict):
@@ -642,7 +668,7 @@ async def parse_panda_manual(url):
         logging.exception("[PandaTV] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== 轻量级状态检测接口（专为关注列表设计） ====================
+# ==================== 轻量级状态检测接口 ====================
 @app.get("/api/status")
 async def api_status(url: str = Query(...)):
     """仅检测直播间是否在线，不解析流地址，极大降低后端 CPU 和网络开销。"""
@@ -722,7 +748,6 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         try: await websocket.close()
         except: pass
 
-# 【修复】Twitch 弹幕改用原生异步 websockets，彻底消灭线程泄漏
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
     await ws_conn.accept()
