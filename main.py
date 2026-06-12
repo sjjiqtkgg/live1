@@ -1020,11 +1020,15 @@ async def parse_panda_manual(url):
 
         # PandaTV API 字段名不稳定，穷举所有已知变体
         _IMG_FIELDS = (
-            'profileImg', 'profileImage', 'img', 'userImg', 'thumbImg',
+            'thumbUrl', 'profileImg', 'profileImage', 'img', 'userImg', 'thumbImg',
             'bjImg', 'thumb', 'photo', 'avatar', 'iconImg', 'userPic',
             'thumbnail', 'profile', 'profileThumb',
         )
         avatar = next((bj_info[k] for k in _IMG_FIELDS if bj_info.get(k)), '')
+
+        # isImgProfile=false 表示主播未设置自定义头像，thumbUrl 为 PandaTV 默认占位图（属正常情况）
+        if not bj_info.get('isImgProfile', True):
+            logging.info(f"[PandaTV] 主播 {anchor_name} 未设置自定义头像 (isImgProfile=False)，将使用默认占位头像")
 
         # 诊断日志：首次上线时可确认实际字段名，稳定后可改为 DEBUG 级别
         logging.info(f"[PandaTV] bjInfo 字段列表: {list(bj_info.keys())} | 头像原始值: {avatar!r}")
