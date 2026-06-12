@@ -51,6 +51,9 @@ BILI_COOKIE = os.getenv("BILI_COOKIE", "").strip()
 if CF_WORKER:
     logging.info(f"[CF Worker] 已配置: {CF_WORKER}")
 
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
+
 # ==================== 全局连接池 ====================
 CLIENT_POOL: dict = {}
 CLIENT_LOCK = asyncio.Lock()
@@ -66,7 +69,7 @@ async def get_client(proxy=None, timeout=None):
             CLIENT_POOL[key] = httpx.AsyncClient(
                 timeout=timeout,
                 proxy=proxy,
-                http2=True,
+                http2=(proxy is None),  # 【优化】代理连接关闭 HTTP/2 防兼容问题
                 verify=False,
                 follow_redirects=True,  # 【修复】强制跟随 302 重定向 (SOOP .co.kr 必需)
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
@@ -144,7 +147,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ==================== 代理接口 ====================
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
-    ALLOWED = [".douyu.com", ".huya.com", ".bilibili.com", ".bilivideo.com", ".douyucdn.cn", ".douyin.com", ".live.bilibili.com", ".twitch.tv", ".ttvnw.net", ".sooplive.com", ".sooplive.net", ".sooplivecdn.com", ".pandalive.co.kr", ".live-video.net", ".pandalivecdn.com"]
+    ALLOWED = [
+        ".douyu.com", ".huya.com", ".bilibili.com", ".bilivideo.com", ".douyucdn.cn",
+        ".douyin.com", ".live.bilibili.com", ".twitch.tv", ".ttvnw.net",
+        ".sooplive.com", ".sooplive.net", ".sooplivecdn.com",
+        ".pandalive.co.kr", ".live-video.net", ".pandalivecdn.com"
+    ]
     
     def is_allowed_domain(u: str) -> bool:
         hostname = urlparse(u).hostname
@@ -158,7 +166,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         raise HTTPException(403, "domain not allowed")
 
     body = await request.body() if request.method == "POST" else None
-    headers = {"User-Agent": ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36", "Referer": referer or ""}
+    headers = {"User-Agent": ua or UA, "Referer": referer or ""}
     if cookie: headers["Cookie"] = cookie
     if request.method == "POST": headers["Content-Type"] = "application/x-www-form-urlencoded"
 
@@ -238,7 +246,6 @@ def huya_build_anticode(raw_anti, stream_name):
 async def parse_huya(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
-        UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
         resp = await request_with_retry("GET", f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}", headers={"User-Agent": UA, "Referer": "https://www.huya.com/"})
         data = resp.json()
         if data.get("status") != 200: return {"streams": [], "isLive": False, "title": "", "avatar": ""}
@@ -271,7 +278,6 @@ async def parse_huya(url):
 async def parse_douyu(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
-        UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
         hdrs = {"User-Agent": UA, "Referer": f"https://www.douyu.com/{room_id}"}
         name, avatar = "斗鱼主播", ""
         try:
@@ -322,7 +328,6 @@ async def parse_douyu(url):
 async def parse_bilibili(url):
     try:
         rid = url.rstrip("/").split("/")[-1].split("?")[0]
-        UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
         hdrs = {"User-Agent": UA, "Referer": "https://live.bilibili.com/"}
         if BILI_COOKIE: hdrs["Cookie"] = BILI_COOKIE
         room_resp = await request_with_retry("GET", f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={rid}", headers=hdrs)
@@ -413,7 +418,6 @@ async def parse_douyin(url):
         avatar = find_avatar_in_dict(data) or ""
         if not avatar:
             try:
-                UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
                 resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
                 m_render = re.search(r'<script id="RENDER_DATA" type="application/json">([^<]+)</script>', resp.text)
                 if m_render:
@@ -434,10 +438,8 @@ async def parse_twitch(url, cookie: str = ""):
         channel = match.group(1)
         eff_cookie = cookie or TWITCH_COOKIE
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
-        UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
         
         nickname, avatar = channel, ""
-        # 【修复】使用 GQL 获取头像，防 Helix API 401 风控
         for client_id in TWITCH_CLIENT_IDS:
             try:
                 gql_avatar_payload = [{"operationName": "UserAvatar", "variables": {"login": channel}, "query": "query UserAvatar($login: String!) { user(login: $login) { profileImageURL(width: 300) displayName } }"}]
@@ -639,6 +641,46 @@ async def parse_panda_manual(url):
     except Exception as e:
         logging.exception("[PandaTV] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
+
+# ==================== 轻量级状态检测接口（专为关注列表设计） ====================
+@app.get("/api/status")
+async def api_status(url: str = Query(...)):
+    """仅检测直播间是否在线，不解析流地址，极大降低后端 CPU 和网络开销。"""
+    try:
+        is_live = False
+        if "huya.com" in url:
+            room_id = url.rstrip("/").split("/")[-1].split("?")[0]
+            resp = await request_with_retry("GET", f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}", headers={"User-Agent": UA}, timeout=5)
+            is_live = resp.json().get("data", {}).get("realLiveStatus") == "ON"
+        elif "douyu.com" in url:
+            room_id = url.rstrip("/").split("/")[-1].split("?")[0]
+            resp = await request_with_retry("GET", f"https://open.douyucdn.cn/api/RoomApi/room/{room_id}", headers={"User-Agent": UA}, timeout=5)
+            is_live = resp.json().get("data", {}).get("room_status") == "1"
+        elif "bilibili.com" in url:
+            rid = url.rstrip("/").split("/")[-1].split("?")[0]
+            resp = await request_with_retry("GET", f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={rid}", headers={"User-Agent": UA, "Referer": "https://live.bilibili.com/"}, timeout=5)
+            is_live = resp.json().get("data", {}).get("live_status") == 1
+        elif "sooplive.com" in url:
+            bj_id = url.rstrip('/').split('/')[-1].split('?')[0]
+            resp = await request_with_proxy_group("POST", f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}', 
+                                                  proxy_list=get_fixed_proxy_list(EXTERNAL_PROXY_URLS),
+                                                  headers={'origin': 'https://play.sooplive.com', 'referer': 'https://play.sooplive.com'}, 
+                                                  data={'bid': bj_id, 'bno': '', 'type': '', 'pwd': '', 'player_type': 'html5', 'stream_type': 'common', 'quality': 'master', 'mode': 'landing', 'from_api': '0', 'is_revive': 'false'}, 
+                                                  shuffle_proxy=False, timeout=5)
+            if resp.status_code == 200:
+                is_live = resp.json().get('CHANNEL', {}).get('RESULT') in [0, 1]
+        elif "pandalive.co.kr" in url:
+            user_id = url.split('?')[0].rstrip('/').split('/')[-1]
+            resp = await request_with_proxy_group("POST", 'https://api.pandalive.co.kr/v1/member/bj', 
+                                                  proxy_list=get_fixed_proxy_list(EXTERNAL_PROXY_URLS),
+                                                  headers={'origin': 'https://www.pandalive.co.kr', 'referer': 'https://www.pandalive.co.kr/'}, 
+                                                  data={'userId': user_id, 'info': 'media fanGrade'}, shuffle_proxy=False, timeout=5)
+            if resp.status_code == 200:
+                is_live = 'media' in resp.json()
+        return {"isLive": is_live}
+    except Exception as e:
+        logging.warning(f"[状态检测] {url} 异常: {e}")
+        return {"isLive": False}
 
 @app.get("/api/parse")
 async def api_parse(url: str = Query(...), cookie: str = Query("")):
