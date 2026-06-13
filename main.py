@@ -163,13 +163,12 @@ async def request_with_retry(method, url, **kwargs):
     timeout = kwargs.pop("timeout", 15)
     for idx, proxy in enumerate(PROXY_URLS):
         try:
-            logging.debug(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
             return resp
         except Exception as e:
             last_error = e
-            logging.warning(f"[请求重试] 失败: {e}")
+            logging.warning(f"[请求重试] {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
             await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
 
@@ -177,6 +176,7 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     shuffle_proxy = kwargs.pop("shuffle_proxy", False)
+    log_tag = kwargs.pop("log_tag", None)
 
     targets = proxy_list[:]
     if shuffle_proxy and targets:
@@ -184,13 +184,14 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
 
     for idx, proxy in enumerate(targets):
         try:
-            logging.debug(f"[分组请求] 使用代理 [{idx+1}/{len(targets)}]: {proxy or '直连'}")
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
+            if log_tag:
+                logging.info(f"[{log_tag}] {proxy or '直连'} → HTTP {resp.status_code} {url.split('?')[0][-60:]}")
             return resp
         except Exception as e:
             last_error = e
-            logging.warning(f"[分组请求] 失败: {e}")
+            logging.warning(f"[分组请求] {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
             await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
 
@@ -828,7 +829,8 @@ async def parse_twitch(url, cookie: str = ""):
                          "query": "query PlaybackAccessToken($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: { platform: \"web\", playerType: $playerType, playerBackend: \"mediaplayer\" }) { value signature } }"}]
             try:
                 resp = await request_with_proxy_group("POST", gql_url, proxy_list=proxylist, json=payload,
-                                                     headers=gql_headers, shuffle_proxy=False)
+                                                     headers=gql_headers, shuffle_proxy=False,
+                                                     log_tag="Twitch-token")
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, list) and len(data) > 0:
@@ -846,7 +848,7 @@ async def parse_twitch(url, cookie: str = ""):
         m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true&allow_spectre=true&fast_bread=true&allow_ads=false"
         usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=proxylist,
                                                      headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"},
-                                                     shuffle_proxy=False)
+                                                     shuffle_proxy=False, log_tag="Twitch-m3u8")
         if usher_resp.status_code != 200 or "#EXT-X-STREAM-INF" not in usher_resp.text:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
 
@@ -901,7 +903,8 @@ async def parse_soop(url, cookie: str = ""):
             ]
             for info_api in info_apis:
                 info_resp = await request_with_proxy_group("GET", info_api, proxy_list=proxylist,
-                                                           headers=headers_pc, shuffle_proxy=False)
+                                                           headers=headers_pc, shuffle_proxy=False,
+                                                           follow_redirects=True)
                 if info_resp.status_code == 200:
                     si = info_resp.json()
                     station = si.get('station', {})
@@ -912,6 +915,24 @@ async def parse_soop(url, cookie: str = ""):
                         break
         except Exception:
             pass
+
+        # 备用：bjapi 接口，直接返回 JSON 无需重定向
+        if not avatar:
+            try:
+                bjapi_resp = await request_with_proxy_group(
+                    "GET", f'https://bjapi.sooplive.com/api/{bj_id}/station',
+                    proxy_list=proxylist,
+                    headers={'User-Agent': UA, 'Referer': 'https://play.sooplive.com/'},
+                    shuffle_proxy=False, follow_redirects=True)
+                if bjapi_resp.status_code == 200:
+                    bj_data = bjapi_resp.json()
+                    avatar = (bj_data.get('profile_image') or bj_data.get('profile_img') or
+                              bj_data.get('station', {}).get('profile_image') or '')
+                    if avatar:
+                        if avatar.startswith('//'): avatar = 'https:' + avatar
+                        nickname = bj_data.get('user_nick') or bj_data.get('bj_nick') or nickname
+            except Exception:
+                pass
 
         if not avatar:
             try:
@@ -935,6 +956,9 @@ async def parse_soop(url, cookie: str = ""):
             cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
             if cached_avatar and cached_avatar["expire"] > time.time():
                 avatar = cached_avatar["avatar"]
+                logging.info(f"[SOOP] {bj_id} 头像从缓存恢复")
+            else:
+                logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存")
 
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
@@ -943,7 +967,8 @@ async def parse_soop(url, cookie: str = ""):
             'mode': 'landing', 'from_api': '0', 'is_revive': 'false',
         }
         live_resp = await request_with_proxy_group("POST", live_api, proxy_list=proxylist,
-                                                   headers=headers_pc, data=live_data_form, shuffle_proxy=False)
+                                                   headers=headers_pc, data=live_data_form, shuffle_proxy=False,
+                                                   log_tag="SOOP-live")
         if live_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
@@ -975,7 +1000,8 @@ async def parse_soop(url, cookie: str = ""):
         }
         cdn_resp = await request_with_proxy_group("GET",
             'http://livestream-manager.sooplive.com/broad_stream_assign.html',
-            proxy_list=proxylist, headers=headers_pc, params=cdn_params, shuffle_proxy=False)
+            proxy_list=proxylist, headers=headers_pc, params=cdn_params, shuffle_proxy=False,
+            log_tag="SOOP-cdn")
         if cdn_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
@@ -1053,11 +1079,6 @@ async def parse_panda_manual(url):
         )
         avatar = next((bj_info[k] for k in _IMG_FIELDS if bj_info.get(k)), '')
 
-        if not bj_info.get('isImgProfile', True):
-            logging.info(f"[PandaTV] 主播 {anchor_name} 未设置自定义头像 (isImgProfile=False)，将使用默认占位头像")
-
-        logging.info(f"[PandaTV] bjInfo 字段列表: {list(bj_info.keys())} | 头像原始值: {avatar!r}")
-
         if 'media' not in info_json:
             result = {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
             M3U8_CACHE[url] = {"data": result, "expire": time.time() + 60}
@@ -1067,7 +1088,7 @@ async def parse_panda_manual(url):
         resp2 = await request_with_proxy_group("POST", play_url, proxy_list=proxylist,
                                                headers=headers,
                                                data={'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''},
-                                               shuffle_proxy=False)
+                                               shuffle_proxy=False, log_tag="PandaTV-play")
         if resp2.status_code != 200:
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
         play_json = resp2.json()
