@@ -58,16 +58,24 @@ async def lifespan(app):
         while True:
             await asyncio.sleep(60)
             now = time.time()
+            # 清理 M3U8 缓存
             expired = [k for k, v in list(M3U8_CACHE.items()) if v.get('expire', 0) < now]
             for k in expired:
                 M3U8_CACHE.pop(k, None)
             if expired:
                 logging.info(f"[缓存] 清理 {len(expired)} 条过期条目，剩余 {len(M3U8_CACHE)} 条")
+            # 清理 STREAM_PROXY_MAP
             if len(STREAM_PROXY_MAP) > 500:
                 keys = list(STREAM_PROXY_MAP.keys())
                 for k in keys[:250]:
                     STREAM_PROXY_MAP.pop(k, None)
                 logging.info(f"[缓存] STREAM_PROXY_MAP 超限，已清理至 {len(STREAM_PROXY_MAP)} 条")
+            # 清理 SOOP 头像缓存（过期时间 1 年，实际相当于长期保留，只清理过期条目）
+            expired_avatar = [k for k, v in list(SOOP_AVATAR_CACHE.items()) if v.get('expire', 0) < now]
+            for k in expired_avatar:
+                SOOP_AVATAR_CACHE.pop(k, None)
+            if expired_avatar:
+                logging.info(f"[头像缓存] 清理 {len(expired_avatar)} 条过期 SOOP 头像，剩余 {len(SOOP_AVATAR_CACHE)} 条")
     task = asyncio.create_task(_cache_cleanup())
     yield
     task.cancel()
@@ -79,14 +87,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # ==================== API 限流 ====================
-# 防止 /api/parse、/api/proxy 被脚本批量刷，避免代理池和上游平台风控被打爆
 if SLOWAPI_AVAILABLE:
     limiter = Limiter(key_func=get_remote_address)
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 else:
     logging.warning("[限流] slowapi 未安装，/api/parse 与 /api/proxy 不受限流保护，建议 pip install slowapi")
-    # 提供一个空操作装饰器，使下方 @limiter.limit(...) 在未安装时不报错
     class _NoopLimiter:
         def limit(self, *args, **kwargs):
             def decorator(func):
@@ -125,10 +131,10 @@ async def get_client(proxy=None, timeout=None):
     if timeout is None:
         timeout = DEFAULT_TIMEOUT
     key = f"{proxy or 'direct'}_t{timeout}"
-    if key in CLIENT_POOL:                       # 快速路径：不加锁
+    if key in CLIENT_POOL:
         return CLIENT_POOL[key]
     async with CLIENT_LOCK:
-        if key not in CLIENT_POOL:               # 持锁后二次确认
+        if key not in CLIENT_POOL:
             CLIENT_POOL[key] = httpx.AsyncClient(
                 timeout=timeout,
                 proxy=proxy,
@@ -143,6 +149,7 @@ async def get_client(proxy=None, timeout=None):
 
 STREAM_PROXY_MAP: dict = {}
 M3U8_CACHE: dict = {}
+SOOP_AVATAR_CACHE: dict = {}   # { bj_id: {"avatar": url, "expire": ts } }
 
 def get_fixed_proxy_list(proxy_pool):
     if not proxy_pool or proxy_pool[0] is None:
@@ -316,10 +323,7 @@ def build_streams(flv, m3u8):
     return s
 
 def parse_multivariant_m3u8(text, base_url, cdn_prefix):
-    """解析 HLS multivariant playlist，提取各画质子播放列表 URL。
-    用于 SOOP / PandaTV 等返回标准 #EXT-X-STREAM-INF 列表的平台。
-    cdn_prefix: 生成的 cdn 标签前缀，如 'SOOP' / 'PandaTV'
-    """
+    """解析 HLS multivariant playlist，提取各画质子播放列表 URL。"""
     streams = []
     lines = text.splitlines()
     for i, line in enumerate(lines):
@@ -521,7 +525,6 @@ async def parse_douyu(url):
         name = "斗鱼主播"
         avatar = ""
         
-        # 优先使用 open.douyucdn.cn 接口
         try:
             open_api = f"https://open.douyucdn.cn/api/RoomApi/room/{room_id}"
             open_resp = await request_with_retry("GET", open_api, headers={"User-Agent": UA})
@@ -534,7 +537,6 @@ async def parse_douyu(url):
         except Exception:
             pass
 
-        # 兜底从 betard 接口提取
         if not avatar or name == "斗鱼主播":
             name = room.get("nickname") or name
             owner = room.get("owner", {})
@@ -584,7 +586,7 @@ async def parse_douyu(url):
             params = base_params.copy()
             params['rate'] = str(rate_val)
             try:
-                await asyncio.sleep(0.2 * rate_val + random.uniform(0, 0.3))  # 错峰防封 + 随机抖动
+                await asyncio.sleep(0.2 * rate_val + random.uniform(0, 0.3))
                 r = await request_with_retry("POST",
                     f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
                     headers=hdrs, data=params, timeout=10)
@@ -926,6 +928,14 @@ async def parse_soop(url, cookie: str = ""):
             except Exception:
                 pass
 
+        # ★ SOOP 头像缓存兜底：只要历史上成功获取过一次，下次即使代理失败也能从缓存中恢复
+        if avatar:
+            SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
+        else:
+            cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
+            if cached_avatar and cached_avatar["expire"] > time.time():
+                avatar = cached_avatar["avatar"]
+
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -1006,7 +1016,6 @@ async def parse_soop(url, cookie: str = ""):
             streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
 
         result = {"streams": streams, "title": nickname, "avatar": avatar, "isLive": True}
-        # 在线状态缓存时间更短，便于关注列表更快检测到开播
         M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 15}
         return result
     except Exception as e:
@@ -1037,7 +1046,6 @@ async def parse_panda_manual(url):
         bj_info = info_json.get('bjInfo', {})
         anchor_name = bj_info.get('nick', user_id)
 
-        # PandaTV API 字段名不稳定，穷举所有已知变体
         _IMG_FIELDS = (
             'thumbUrl', 'profileImg', 'profileImage', 'img', 'userImg', 'thumbImg',
             'bjImg', 'thumb', 'photo', 'avatar', 'iconImg', 'userPic',
@@ -1045,11 +1053,9 @@ async def parse_panda_manual(url):
         )
         avatar = next((bj_info[k] for k in _IMG_FIELDS if bj_info.get(k)), '')
 
-        # isImgProfile=false 表示主播未设置自定义头像，thumbUrl 为 PandaTV 默认占位图（属正常情况）
         if not bj_info.get('isImgProfile', True):
             logging.info(f"[PandaTV] 主播 {anchor_name} 未设置自定义头像 (isImgProfile=False)，将使用默认占位头像")
 
-        # 诊断日志：首次上线时可确认实际字段名，稳定后可改为 DEBUG 级别
         logging.info(f"[PandaTV] bjInfo 字段列表: {list(bj_info.keys())} | 头像原始值: {avatar!r}")
 
         if 'media' not in info_json:
@@ -1071,7 +1077,6 @@ async def parse_panda_manual(url):
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
 
-        # ── 头像兜底：play_json 通常比 member/bj 返回更完整的 bjInfo ──
         if not avatar or 'default' in avatar.lower() or 'no_image' in avatar.lower():
             for _section in ('bjInfo', 'userInfo', 'bjProfile', 'channelInfo', 'mediaInfo'):
                 _d = play_json.get(_section)
@@ -1082,7 +1087,6 @@ async def parse_panda_manual(url):
                         logging.info(f"[PandaTV] 从 play_json[{_section}] 获取到头像")
                         break
 
-        # 统一补全协议前缀
         def _fix_avatar_url(u):
             if not u: return ''
             if u.startswith('//'): return 'https:' + u
@@ -1120,10 +1124,6 @@ async def parse_panda_manual(url):
 @app.post("/api/follows/batch")
 @limiter.limit("20/minute")
 async def api_follows_batch(request: Request):
-    """批量查询关注列表的直播状态，避免前端逐条调用 /api/parse。
-    请求体: {"items": [{"url": "...", "cookie": "..."}, ...]}
-    返回: {"results": [{"url": "...", ...parse结果}, ...]}（顺序与输入一致）
-    """
     try:
         body = await request.json()
     except Exception:
@@ -1135,7 +1135,6 @@ async def api_follows_batch(request: Request):
     if len(items) > 30:
         raise HTTPException(400, "单次最多查询 30 个")
 
-    # 限制并发，避免一次性把代理池/上游接口打爆
     sem = asyncio.Semaphore(5)
 
     async def _one(item):
@@ -1227,9 +1226,6 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
                         await ws_conn.send_json({"type": "chat", "nick": m.group(1), "content": m.group(2)})
 
             async def listen_to_frontend():
-                # 持续监听前端消息：
-                # 1) 及时响应前端 ping/pong（避免老的 15s 轮询造成的延迟）
-                # 2) 利用 receive 自身检测前端断开连接，断开后退出 gather 结束本次会话
                 while True:
                     data = await ws_conn.receive_text()
                     if data == "ping":
