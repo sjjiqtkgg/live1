@@ -31,10 +31,6 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-# httpx 默认会在 INFO 级别打印每一次请求（包括所有上游平台 API 调用），
-# 这些日志量极大且对排查代理问题没有帮助，统一降级为 WARNING。
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 try:
     from streamget.platforms.soop.live_stream import SoopLiveStream
@@ -147,7 +143,6 @@ async def get_client(proxy=None, timeout=None):
 
 STREAM_PROXY_MAP: dict = {}
 M3U8_CACHE: dict = {}
-SOOP_AVATAR_CACHE: dict = {}  # {bj_id: {"avatar": url, "expire": ts}} 长期缓存，避免代理偶发失败导致头像时有时无
 
 def get_fixed_proxy_list(proxy_pool):
     if not proxy_pool or proxy_pool[0] is None:
@@ -156,38 +151,18 @@ def get_fixed_proxy_list(proxy_pool):
     rest = [p for p in proxy_pool if p != primary]
     return [primary] + rest
 
-def _proxy_label(proxy):
-    """从代理 URL 里提取一个简短可读的标签，便于日志里快速辨认是哪个代理 IP。"""
-    if not proxy:
-        return "直连"
-    try:
-        netloc = proxy.split("://", 1)[-1]
-        if "@" in netloc:
-            netloc = netloc.split("@", 1)[1]
-        return netloc
-    except Exception:
-        return proxy
-
-def _target_host(url):
-    try:
-        return urlparse(url).hostname or url
-    except Exception:
-        return url
-
 async def request_with_retry(method, url, **kwargs):
     last_error = None
     timeout = kwargs.pop("timeout", 15)
-    host = _target_host(url)
     for idx, proxy in enumerate(PROXY_URLS):
         try:
+            logging.debug(f"[请求重试] 尝试代理 [{idx+1}/{len(PROXY_URLS)}]: {proxy or '直连'}")
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
-            logging.debug(f"[代理] {_proxy_label(proxy)} -> {host} 成功 (HTTP {resp.status_code})")
             return resp
         except Exception as e:
             last_error = e
-            reason = e.__class__.__name__ + (f": {e}" if str(e) else "")
-            logging.warning(f"[代理] {_proxy_label(proxy)} -> {host} 失败: {reason}")
+            logging.warning(f"[请求重试] 失败: {e}")
             await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
 
@@ -195,7 +170,6 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     shuffle_proxy = kwargs.pop("shuffle_proxy", False)
-    host = _target_host(url)
 
     targets = proxy_list[:]
     if shuffle_proxy and targets:
@@ -203,22 +177,13 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
 
     for idx, proxy in enumerate(targets):
         try:
+            logging.debug(f"[分组请求] 使用代理 [{idx+1}/{len(targets)}]: {proxy or '直连'}")
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
-            # 仅在"代理池轮询"场景（拉流用，shuffle_proxy=True）记录成功日志，
-            # 便于判断当前是哪个代理 IP 在工作；其余接口调用过多会刷屏，降为 DEBUG。
-            if shuffle_proxy:
-                logging.info(f"[代理池] {_proxy_label(proxy)} -> {host} 成功 (HTTP {resp.status_code})")
-            else:
-                logging.debug(f"[代理] {_proxy_label(proxy)} -> {host} 成功 (HTTP {resp.status_code})")
             return resp
         except Exception as e:
             last_error = e
-            reason = e.__class__.__name__ + (f": {e}" if str(e) else "")
-            if shuffle_proxy:
-                logging.warning(f"[代理池] {_proxy_label(proxy)} -> {host} 失败: {reason}")
-            else:
-                logging.warning(f"[代理] {_proxy_label(proxy)} -> {host} 失败: {reason}")
+            logging.warning(f"[分组请求] 失败: {e}")
             await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
 
