@@ -195,6 +195,59 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
             await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
 
+
+async def request_race(method, url, proxy_list, **kwargs):
+    """并发所有代理，取最快成功的响应并取消其余。
+    仅适用于 API/M3U8 等小负载请求，勿用于 TS 切片。"""
+    timeout = kwargs.pop("timeout", 15)
+    log_tag = kwargs.pop("log_tag", None)
+    kwargs.pop("shuffle_proxy", None)
+
+    if not proxy_list:
+        proxy_list = [None]
+
+    # 单代理直接请求，无需竞速
+    if len(proxy_list) == 1:
+        client = await get_client(proxy_list[0], timeout)
+        resp = await client.request(method, url, **kwargs)
+        if log_tag:
+            logging.info(f"[{log_tag}] {proxy_list[0] or '直连'} → HTTP {resp.status_code} {url.split('?')[0][-50:]}")
+        return resp
+
+    async def _try(proxy):
+        client = await get_client(proxy, timeout)
+        return proxy, await client.request(method, url, **kwargs)
+
+    task_proxy: dict = {asyncio.create_task(_try(p)): p for p in proxy_list}
+    pending: set = set(task_proxy)
+    errors = []
+    winner = None
+
+    while pending and winner is None:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            proxy = task_proxy[task]
+            try:
+                _, resp = task.result()
+                if winner is None:
+                    winner = (proxy, resp)
+            except Exception as e:
+                errors.append(e)
+                logging.warning(f"[竞速] {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
+
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    if winner:
+        proxy, resp = winner
+        if log_tag:
+            logging.info(f"[{log_tag}] {proxy or '直连'} 竞速胜出 → HTTP {resp.status_code} {url.split('?')[0][-50:]}")
+        return resp
+
+    raise errors[-1] if errors else Exception("所有代理均失败")
+
 # ------------------ 代理接口 -----------------
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 @limiter.limit("60/minute")
