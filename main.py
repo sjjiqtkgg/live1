@@ -855,7 +855,7 @@ async def parse_twitch(url, cookie: str = ""):
         logging.exception("[Twitch] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== SOOP（最终修复：BJPIC 优先 + station_info 跟随重定向） ====================
+# ==================== SOOP====================
 async def parse_soop(url, cookie: str = ""):
     try:
         eff_cookie = cookie or SOOP_COOKIE
@@ -876,7 +876,7 @@ async def parse_soop(url, cookie: str = ""):
             headers_pc['cookie'] = eff_cookie
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # 唯一必需的 live API
+        # 唯一的 live API 请求
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -893,55 +893,38 @@ async def parse_soop(url, cookie: str = ""):
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
 
+        # ---------- 调试：打印 CHANNEL 所有键，以便发现真实头像字段 ----------
+        logging.info(f"[SOOP] {bj_id} CHANNEL keys: {list(channel.keys())}")
+
         # ---------- 昵称 ----------
-        nickname = channel.get('BJ_NM') or f'BJ-{bj_id}'
+        nickname = channel.get('BJ_NM') or channel.get('BJ_NICK') or f'BJ-{bj_id}'
 
-        # ---------- 头像获取（两步走） ----------
+        # ---------- 头像获取（多字段尝试） ----------
         avatar = ''
-        # 第一步：从 live API 的 BJPIC 字段提取
-        bjpic = channel.get('BJPIC') or channel.get('BJ_PIC') or ''
-        if bjpic:
-            if bjpic.startswith('//'):
-                avatar = 'https:' + bjpic
-            elif bjpic.startswith('http'):
-                avatar = bjpic
-            else:
-                avatar = 'https://' + bjpic.lstrip('/')
-            logging.info(f"[SOOP] {bj_id} 头像来自 live API BJPIC")
+        # 已知可能的头像字段，按优先级尝试
+        avatar_fields = ['BJPIC', 'BJ_PIC', 'BJ_IMG', 'PIC', 'IMG', 'THUMB', 'AVATAR']
+        for field in avatar_fields:
+            val = channel.get(field) or ''
+            if val:
+                if val.startswith('//'):
+                    avatar = 'https:' + val
+                elif val.startswith('http'):
+                    avatar = val
+                else:
+                    avatar = 'https://' + val.lstrip('/')
+                logging.info(f"[SOOP] {bj_id} 头像来自字段 {field}")
+                break
 
-        # 第二步：BJPIC 缺失时，回退到 station_info 接口（跟随重定向）
-        if not avatar:
-            logging.info(f"[SOOP] {bj_id} BJPIC 缺失，尝试 station_info")
-            try:
-                station_url = f'https://st.sooplive.co.kr/api/get_station_info.php?szBjId={bj_id}'
-                # ★ 关键修复：添加 follow_redirects=True
-                station_resp = await request_smart("GET", station_url, proxy_list=proxylist,
-                    headers=headers_pc, hedge_delay=1.5, log_tag="SOOP-station",
-                    follow_redirects=True)
-                if station_resp.status_code == 200:
-                    si = station_resp.json()
-                    station = si.get('station', {})
-                    si_avatar = station.get('profile_image') or station.get('profile_img') or ''
-                    if si_avatar:
-                        if si_avatar.startswith('//'):
-                            si_avatar = 'https:' + si_avatar
-                        elif not si_avatar.startswith('http'):
-                            si_avatar = 'https://' + si_avatar.lstrip('/')
-                        avatar = si_avatar
-                        logging.info(f"[SOOP] {bj_id} 头像来自 station_info")
-            except Exception as e:
-                logging.warning(f"[SOOP] {bj_id} station_info 请求失败: {e}")
-
-        # 第三步：仍然没有，尝试缓存
+        # 若仍未找到，尝试从缓存中恢复
         if not avatar:
             cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
             if cached_avatar and cached_avatar["expire"] > time.time():
                 avatar = cached_avatar["avatar"]
                 logging.info(f"[SOOP] {bj_id} 头像来自缓存")
             else:
-                logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存")
+                logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存，CHANNEL 中无可用头像字段")
 
-        # 最终写入缓存
+        # 写入缓存
         if avatar:
             SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
 
