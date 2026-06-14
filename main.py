@@ -64,7 +64,6 @@ PROXY_HEALTH_LOCK = asyncio.Lock()
 def _record(proxy, success, latency=None):
     """记录代理健康状态（指数移动平均延迟）"""
     key = proxy or "direct"
-    # 简单异步保护，实际高并发下可用独立统计任务
     h = PROXY_HEALTH.setdefault(key, {"ok": 0, "fail": 0, "last_latency": 999.0})
     if success:
         h["ok"] += 1
@@ -78,7 +77,6 @@ def _ranked_proxies(proxy_list, limit=2):
     """
     按健康分排序，返回 (top_limit, rest)。
     分数越低越好（失败率*100 + 平均延迟）。
-    新代理初始分数偏高，但有一定探索机会。
     """
     def score(p):
         key = p or "direct"
@@ -391,7 +389,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         proxies_to_use = proxy_list
         shuffle_proxy = True
 
-    # 对 M3U8/TS 使用原始串行（已经通过 STREAM_PROXY_MAP 固定代理）
     resp = await request_with_proxy_group(
         request.method, url,
         proxy_list=proxies_to_use,
@@ -837,7 +834,7 @@ async def parse_douyin(url):
         logging.exception("[抖音] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== Twitch（优化后的智能请求） ====================
+# ==================== Twitch（优化后） ====================
 TWITCH_CLIENT_IDS = [
     "kimne78kx3ncx6brgo4mv6wki5h1ko",
     "ue666xxq81dq0l30715w03p3h3a6h",
@@ -853,7 +850,7 @@ async def parse_twitch(url, cookie: str = ""):
         eff_cookie = cookie or TWITCH_COOKIE
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # 并行获取头像（不敏感，用短窗口智能请求）
+        # 并行获取头像（不敏感，短窗口）
         nickname = channel
         avatar = ""
         for client_id in TWITCH_CLIENT_IDS:
@@ -879,7 +876,7 @@ async def parse_twitch(url, cookie: str = ""):
             except Exception:
                 continue
 
-        # 获取 token（敏感，用长窗口几乎串行）
+        # 获取 token（敏感，长窗口）
         token, sig = None, None
         for client_id in TWITCH_CLIENT_IDS:
             gql_headers = {"Client-ID": client_id, "Content-Type": "application/json", "User-Agent": UA}
@@ -933,7 +930,7 @@ async def parse_twitch(url, cookie: str = ""):
         logging.exception("[Twitch] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== SOOP（优化） ====================
+# ==================== SOOP（修复头像 + 智能请求） ====================
 async def parse_soop(url, cookie: str = ""):
     try:
         eff_cookie = cookie or SOOP_COOKIE
@@ -954,50 +951,7 @@ async def parse_soop(url, cookie: str = ""):
             headers_pc['cookie'] = eff_cookie
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # 头像/昵称（不敏感，短窗口对冲）
-        nickname = f'BJ-{bj_id}'
-        avatar = ''
-        try:
-            info_apis = [
-                f'https://st.sooplive.co.kr/api/get_station_info.php?szBjId={bj_id}',
-                f'https://st.sooplive.com/api/get_station_info.php?szBjId={bj_id}'
-            ]
-            for info_api in info_apis:
-                info_resp = await request_smart("GET", info_api, proxy_list=proxylist,
-                    headers=headers_pc, hedge_delay=0.8, log_tag="SOOP-info")
-                if info_resp.status_code == 200:
-                    si = info_resp.json()
-                    station = si.get('station', {})
-                    nickname = station.get('user_nick') or station.get('bj_nick') or nickname
-                    avatar = station.get('profile_image') or station.get('profile_img') or ''
-                    if avatar:
-                        if avatar.startswith('//'): avatar = 'https:' + avatar
-                        break
-        except Exception:
-            pass
-        if not avatar:
-            try:
-                home_url = f'https://play.sooplive.com/{bj_id}'
-                home_resp = await request_smart("GET", home_url, proxy_list=proxylist,
-                    headers=headers_pc, hedge_delay=0.8, log_tag="SOOP-home")
-                if home_resp.status_code == 200:
-                    m = re.search(r'<meta\s+(?:property|name)="og:image"\s+content="([^"]+)"', home_resp.text)
-                    if not m:
-                        m = re.search(r'"profile_image"\s*:\s*"([^"]+)"', home_resp.text)
-                    if m:
-                        avatar = m.group(1).replace('\\u002F', '/').replace('\\/', '/')
-                        if avatar.startswith('//'): avatar = 'https:' + avatar
-            except Exception:
-                pass
-        # 头像缓存
-        if avatar:
-            SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
-        else:
-            cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
-            if cached_avatar and cached_avatar["expire"] > time.time():
-                avatar = cached_avatar["avatar"]
-
-        # 核心 API（认证敏感，长窗口）
+        # 核心直播状态请求（只需一次，同时获取头像、昵称、开播状态）
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -1007,11 +961,38 @@ async def parse_soop(url, cookie: str = ""):
         live_resp = await request_smart("POST", live_api, proxy_list=proxylist,
             headers=headers_pc, data=live_data_form, hedge_delay=4.0, log_tag="SOOP-live")
         if live_resp.status_code != 200:
-            result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
+            result = {"streams": [], "isLive": False, "title": "", "avatar": ""}
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
+
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
+
+        # ---------- 头像和昵称直接从 CHANNEL 提取 ----------
+        nickname = channel.get('BJ_NM') or f'BJ-{bj_id}'
+        avatar = ''
+        bjpic = channel.get('BJPIC') or channel.get('BJ_PIC') or ''
+        if bjpic:
+            # 统一补全协议，存到缓存
+            if bjpic.startswith('//'):
+                avatar = 'https:' + bjpic
+            elif bjpic.startswith('http'):
+                avatar = bjpic
+            else:
+                avatar = 'https://' + bjpic.lstrip('/')
+            # 写入缓存
+            SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
+            logging.info(f"[SOOP] {bj_id} 头像从 CHANNEL.BJPIC 获取成功: {avatar[:60]}...")
+        else:
+            # 无 BJPIC，尝试从历史缓存兜底
+            cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
+            if cached_avatar and cached_avatar["expire"] > time.time():
+                avatar = cached_avatar["avatar"]
+                logging.info(f"[SOOP] {bj_id} 头像缺失，使用缓存")
+            else:
+                logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存")
+
+        # ---------- 判断直播状态 ----------
         result_code = channel.get('RESULT', -1)
         if result_code == -6:
             return {"streams": [], "isLive": False,
@@ -1021,12 +1002,14 @@ async def parse_soop(url, cookie: str = ""):
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
+
         broad_no = channel.get('BNO', '')
         if not broad_no:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
+        # 获取 CDN 和 aid
         ts_now = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
