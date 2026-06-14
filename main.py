@@ -877,7 +877,7 @@ async def parse_soop(url, cookie: str = ""):
 
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # 1. 直播状态 API（获取昵称、直播状态）
+        # 1. 直播状态 API（获取昵称、状态）
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -895,21 +895,83 @@ async def parse_soop(url, cookie: str = ""):
         channel = live_json.get('CHANNEL', {})
         nickname = channel.get('BJ_NM') or f'BJ-{bj_id}'
 
-        # ---------- 头像：直接拼接，零额外请求 ----------
+        # ---------- 头像：主页正则 + 智能过滤 ----------
         avatar = ''
-        if len(bj_id) >= 2:
-            prefix = bj_id[:2].lower()
-            avatar = f'https://stimg.sooplive.com/LOGO/{prefix}/{bj_id}.jpg'
+        try:
+            home_url = f'https://play.sooplive.com/{bj_id}'
+            home_resp = await request_with_proxy_group("GET", home_url, proxy_list=proxylist,
+                                                       headers=headers_pc, shuffle_proxy=False)
+            if home_resp.status_code == 200:
+                candidates = []
+                # 收集 JSON 内 profile_image 和 og:image
+                for m in re.finditer(r'"(?:profile_image|og:image)"\s*:\s*"([^"]+)"', home_resp.text):
+                    candidates.append(m.group(1))
+                # 收集 meta og:image
+                og = re.search(r'<meta\s+(?:property|name)="og:image"\s+content="([^"]+)"', home_resp.text)
+                if og:
+                    candidates.append(og.group(1))
 
-        # 如果 ID 异常（极短），使用缓存兜底
-        if not avatar:
+                # 智能过滤
+                def is_valid_avatar(u):
+                    u = u.replace('\\u002F', '/').replace('\\/', '/')
+                    # 1. 域名级过滤：只信任 stimg / profile 等头像专用域名，排除 liveimg / snapshot
+                    host = urlparse(u).hostname if 'http' in u else ''
+                    trusted_hosts = ['stimg.sooplive.com', 'profile.sooplive.com', 'file.sooplive.com']
+                    bad_hosts = ['liveimg.sooplive.com', 'snapshot', 'thumb_big']
+                    if host:
+                        if any(t in host for t in trusted_hosts):
+                            pass
+                        elif any(b in host for b in bad_hosts):
+                            return False
+                    # 2. 路径关键词过滤：排除明显的封面/横幅
+                    for bad in ['cover', 'banner', 'poster', 'snapshot', 'thumb_big']:
+                        if bad in u.lower():
+                            return False
+                    return True
+
+                # 按优先级：先取 profile_image（JSON 中的），再取 og:image
+                for u in candidates:
+                    u = u.replace('\\u002F', '/').replace('\\/', '/')
+                    if u.startswith('//'): u = 'https:' + u
+                    elif not u.startswith('http'): u = 'https://' + u.lstrip('/')
+                    if is_valid_avatar(u):
+                        avatar = u
+                        break
+        except Exception as e:
+            logging.warning(f"[SOOP] {bj_id} 主页解析异常: {e}")
+
+        # 如果主页仍未拿到或拿到可疑图片，用 Worker Station API 兜底
+        if not avatar or 'cover' in avatar.lower():
+            if CF_WORKER:
+                try:
+                    info_url = f"{CF_WORKER}/soop_info?bjid={bj_id}"
+                    info_resp = await request_with_proxy_group("GET", info_url, proxy_list=[None],
+                                                               headers={"User-Agent": UA}, shuffle_proxy=False)
+                    if info_resp.status_code == 200:
+                        si = info_resp.json()
+                        station = si.get('station', {})
+                        nickname = station.get('user_nick') or station.get('bj_nick') or nickname
+                        si_avatar = station.get('profile_image') or station.get('profile_img') or ''
+                        if si_avatar:
+                            if si_avatar.startswith('//'): si_avatar = 'https:' + si_avatar
+                            elif not si_avatar.startswith('http'): si_avatar = 'https://' + si_avatar.lstrip('/')
+                            avatar = si_avatar
+                except Exception:
+                    pass
+
+        # 旧域名替换
+        if avatar and 'afreecatv.com' in avatar:
+            avatar = avatar.replace('afreecatv.com', 'sooplive.com')
+
+        # 缓存
+        if avatar:
+            SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
+        else:
             cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
             if cached_avatar and cached_avatar["expire"] > time.time():
                 avatar = cached_avatar["avatar"]
             else:
-                logging.warning(f"[SOOP] {bj_id} 无法构造头像地址且无缓存")
-        else:
-            SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
+                logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存")
 
         # ---------- 直播状态判断 ----------
         result_code = channel.get('RESULT', -1)
@@ -928,7 +990,7 @@ async def parse_soop(url, cookie: str = ""):
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
-        # ---------- CDN / aid 流程保持不变 ----------
+        # ---------- 后续流获取保持不变 ----------
         ts_now = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
@@ -985,6 +1047,7 @@ async def parse_soop(url, cookie: str = ""):
     except Exception as e:
         logging.exception("[SOOP] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
+        
 # ==================== PandaTV ====================
 async def parse_panda_manual(url):
     try:
