@@ -874,10 +874,8 @@ async def parse_soop(url, cookie: str = ""):
         }
         if eff_cookie:
             headers_pc['cookie'] = eff_cookie
-
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # ---------- 1. 直播状态 API（同时尝试提取 BJPIC 头像和昵称） ----------
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -895,7 +893,7 @@ async def parse_soop(url, cookie: str = ""):
         channel = live_json.get('CHANNEL', {})
         nickname = channel.get('BJ_NM') or f'BJ-{bj_id}'
 
-        # 尝试从 BJPIC 获取头像
+        # 头像提取：BJPIC 优先（零额外请求），失败则主页正则兜底
         avatar = ''
         bjpic = channel.get('BJPIC') or channel.get('BJ_PIC') or ''
         if bjpic:
@@ -907,7 +905,6 @@ async def parse_soop(url, cookie: str = ""):
                 avatar = 'https://' + bjpic.lstrip('/')
             logging.info(f"[SOOP] {bj_id} 头像来自 BJPIC")
 
-        # ---------- 2. BJPIC 缺失时，走旧版主页正则兜底 ----------
         if not avatar:
             logging.info(f"[SOOP] {bj_id} BJPIC 缺失，尝试主页正则")
             try:
@@ -915,10 +912,8 @@ async def parse_soop(url, cookie: str = ""):
                 home_resp = await request_with_proxy_group("GET", home_url, proxy_list=proxylist,
                                                            headers=headers_pc, shuffle_proxy=False)
                 if home_resp.status_code == 200:
-                    # 先匹配内嵌 JSON 中的 profile_image（真实头像概率更高）
                     m = re.search(r'"profile_image"\s*:\s*"([^"]+)"', home_resp.text)
                     if not m:
-                        # 再匹配 og:image（可能是封面，但至少不会空）
                         m = re.search(r'<meta\s+(?:property|name)="og:image"\s+content="([^"]+)"', home_resp.text)
                     if m:
                         avatar = m.group(1).replace('\\u002F', '/').replace('\\/', '/')
@@ -930,11 +925,11 @@ async def parse_soop(url, cookie: str = ""):
             except Exception as e:
                 logging.warning(f"[SOOP] {bj_id} 主页请求失败: {e}")
 
-        # ---------- 3. 旧域名替换 ----------
+        # 兼容旧域名
         if avatar and 'afreecatv.com' in avatar:
             avatar = avatar.replace('afreecatv.com', 'sooplive.com')
 
-        # ---------- 4. 缓存 ----------
+        # 缓存
         if avatar:
             SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
         else:
@@ -945,7 +940,7 @@ async def parse_soop(url, cookie: str = ""):
             else:
                 logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存")
 
-        # ---------- 直播状态判断 ----------
+        # 直播状态判断
         result_code = channel.get('RESULT', -1)
         if result_code == -6:
             return {"streams": [], "isLive": False,
@@ -962,7 +957,7 @@ async def parse_soop(url, cookie: str = ""):
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
-        # ---------- 后续流获取逻辑保持不变 ----------
+        # ---------- 后续 CDN / aid 获取逻辑保持不变 ----------
         ts_now = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
