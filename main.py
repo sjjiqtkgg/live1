@@ -855,7 +855,7 @@ async def parse_twitch(url, cookie: str = ""):
         logging.exception("[Twitch] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== SOOP（最终修复：BJPIC 优先 + station_info 备用） ====================
+# ==================== SOOP（最终修复：BJPIC 优先 + station_info 跟随重定向） ====================
 async def parse_soop(url, cookie: str = ""):
     try:
         eff_cookie = cookie or SOOP_COOKIE
@@ -909,14 +909,15 @@ async def parse_soop(url, cookie: str = ""):
                 avatar = 'https://' + bjpic.lstrip('/')
             logging.info(f"[SOOP] {bj_id} 头像来自 live API BJPIC")
 
-        # 第二步：BJPIC 缺失时，回退到 station_info 接口（顺序请求，不并发）
+        # 第二步：BJPIC 缺失时，回退到 station_info 接口（跟随重定向）
         if not avatar:
             logging.info(f"[SOOP] {bj_id} BJPIC 缺失，尝试 station_info")
             try:
                 station_url = f'https://st.sooplive.co.kr/api/get_station_info.php?szBjId={bj_id}'
-                # 使用短窗口对冲，确保不堵塞主流程
+                # ★ 关键修复：添加 follow_redirects=True
                 station_resp = await request_smart("GET", station_url, proxy_list=proxylist,
-                    headers=headers_pc, hedge_delay=1.5, log_tag="SOOP-station")
+                    headers=headers_pc, hedge_delay=1.5, log_tag="SOOP-station",
+                    follow_redirects=True)
                 if station_resp.status_code == 200:
                     si = station_resp.json()
                     station = si.get('station', {})
