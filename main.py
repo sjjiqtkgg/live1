@@ -855,7 +855,7 @@ async def parse_twitch(url, cookie: str = ""):
         logging.exception("[Twitch] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== SOOP（最终修复版） ====================
+# ==================== SOOP（已修复头像） ====================
 async def parse_soop(url, cookie: str = ""):
     try:
         eff_cookie = cookie or SOOP_COOKIE
@@ -876,7 +876,7 @@ async def parse_soop(url, cookie: str = ""):
             headers_pc['cookie'] = eff_cookie
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # ---------- 唯一请求：player_live_api.php ----------
+        # 仅一次 live API 请求
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -893,10 +893,10 @@ async def parse_soop(url, cookie: str = ""):
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
 
-        # ---------- 昵称 ----------
+        # 昵称
         nickname = channel.get('BJ_NM') or f'BJ-{bj_id}'
 
-        # ---------- 头像：直接从 BJPIC 提取，零额外请求 ----------
+        # 头像直接从 BJPIC 提取（零额外请求，离线主播也有此字段）
         avatar = ''
         bjpic = channel.get('BJPIC') or channel.get('BJ_PIC') or ''
         if bjpic:
@@ -906,11 +906,9 @@ async def parse_soop(url, cookie: str = ""):
                 avatar = bjpic
             else:
                 avatar = 'https://' + bjpic.lstrip('/')
-            # 写入长期缓存
             SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
-            logging.info(f"[SOOP] {bj_id} 头像从 live API 获取并写入缓存")
+            logging.info(f"[SOOP] {bj_id} 头像已从 live API 写入缓存")
         else:
-            # 如果 API 没有返回，尝试历史缓存
             cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
             if cached_avatar and cached_avatar["expire"] > time.time():
                 avatar = cached_avatar["avatar"]
@@ -918,7 +916,7 @@ async def parse_soop(url, cookie: str = ""):
             else:
                 logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存")
 
-        # ---------- 直播状态 ----------
+        # 直播状态
         result_code = channel.get('RESULT', -1)
         if result_code == -6:
             return {"streams": [], "isLive": False,
@@ -935,7 +933,7 @@ async def parse_soop(url, cookie: str = ""):
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
-        # 获取 CDN 和 aid
+        # CDN & aid
         ts_now = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
