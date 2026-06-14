@@ -874,10 +874,8 @@ async def parse_soop(url, cookie: str = ""):
         }
         if eff_cookie:
             headers_pc['cookie'] = eff_cookie
-
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # 1. 直播状态 API（同时提取 BJPIC 和昵称）
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -895,7 +893,7 @@ async def parse_soop(url, cookie: str = ""):
         channel = live_json.get('CHANNEL', {})
         nickname = channel.get('BJ_NM') or f'BJ-{bj_id}'
 
-        # 尝试 BJPIC（很少有效）
+        # 头像提取：BJPIC 优先（零额外请求），失败则主页正则兜底
         avatar = ''
         bjpic = channel.get('BJPIC') or channel.get('BJ_PIC') or ''
         if bjpic:
@@ -905,83 +903,44 @@ async def parse_soop(url, cookie: str = ""):
                 avatar = bjpic
             else:
                 avatar = 'https://' + bjpic.lstrip('/')
+            logging.info(f"[SOOP] {bj_id} 头像来自 BJPIC")
 
-        # 2. 主页正则提取 + 智能过滤封面/截图
         if not avatar:
+            logging.info(f"[SOOP] {bj_id} BJPIC 缺失，尝试主页正则")
             try:
                 home_url = f'https://play.sooplive.com/{bj_id}'
                 home_resp = await request_with_proxy_group("GET", home_url, proxy_list=proxylist,
                                                            headers=headers_pc, shuffle_proxy=False)
                 if home_resp.status_code == 200:
-                    candidates = []
-                    # 收集所有可能的图片 URL（包括 profile_image 和 og:image meta）
-                    for m in re.finditer(r'"(?:profile_image|og:image)"\s*:\s*"([^"]+)"', home_resp.text):
-                        candidates.append(m.group(1))
-                    og_match = re.search(r'<meta\s+(?:property|name)="og:image"\s+content="([^"]+)"', home_resp.text)
-                    if og_match:
-                        candidates.append(og_match.group(1))
-
-                    # 清洗：去重、补全协议、过滤封面关键词
-                    def is_likely_avatar(u):
-                        u = u.replace('\\u002F', '/').replace('\\/', '/')
-                        # 排除明显非头像的图片
-                        for bad in ['cover', 'banner', 'poster', 'snapshot', 'thumb_big', 'thumbnail']:
-                            if bad in u.lower():
-                                return False
-                        return True
-
-                    best = ''
-                    for u in candidates:
-                        u = u.replace('\\u002F', '/').replace('\\/', '/')
-                        if u.startswith('//'):
-                            u = 'https:' + u
-                        elif not u.startswith('http'):
-                            u = 'https://' + u.lstrip('/')
-                        if is_likely_avatar(u):
-                            best = u
-                            break      # 第一个不含坏词的就作为头像
-                    if best:
-                        avatar = best
+                    m = re.search(r'"profile_image"\s*:\s*"([^"]+)"', home_resp.text)
+                    if not m:
+                        m = re.search(r'<meta\s+(?:property|name)="og:image"\s+content="([^"]+)"', home_resp.text)
+                    if m:
+                        avatar = m.group(1).replace('\\u002F', '/').replace('\\/', '/')
+                        if avatar.startswith('//'):
+                            avatar = 'https:' + avatar
+                        elif not avatar.startswith('http'):
+                            avatar = 'https://' + avatar.lstrip('/')
+                        logging.info(f"[SOOP] {bj_id} 头像来自主页正则")
             except Exception as e:
-                logging.warning(f"[SOOP] {bj_id} 主页解析异常: {e}")
+                logging.warning(f"[SOOP] {bj_id} 主页请求失败: {e}")
 
-        # 3. 如果仍未拿到，或拿到的仍然可疑，通过 Worker 代理 station_info 兜底
-        if not avatar or any(bad in avatar.lower() for bad in ['cover', 'banner', 'poster', 'snapshot']):
-            if CF_WORKER:
-                try:
-                    worker_info_url = f"{CF_WORKER}/soop_info?bjid={bj_id}"
-                    info_resp = await request_with_proxy_group("GET", worker_info_url, proxy_list=[None],
-                                                               headers={"User-Agent": UA}, shuffle_proxy=False)
-                    if info_resp.status_code == 200:
-                        si = info_resp.json()
-                        station = si.get('station', {})
-                        nickname = station.get('user_nick') or station.get('bj_nick') or nickname
-                        si_avatar = station.get('profile_image') or station.get('profile_img') or ''
-                        if si_avatar:
-                            if si_avatar.startswith('//'):
-                                si_avatar = 'https:' + si_avatar
-                            elif not si_avatar.startswith('http'):
-                                si_avatar = 'https://' + si_avatar.lstrip('/')
-                            avatar = si_avatar
-                            logging.info(f"[SOOP] {bj_id} 头像来自 Worker /soop_info")
-                except Exception as e:
-                    logging.warning(f"[SOOP] Worker /soop_info 失败: {e}")
-
-        # 4. 旧域名替换
+        # 兼容旧域名
         if avatar and 'afreecatv.com' in avatar:
             avatar = avatar.replace('afreecatv.com', 'sooplive.com')
 
-        # 5. 写入缓存或读取缓存
+        # 缓存
         if avatar:
             SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
         else:
             cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
             if cached_avatar and cached_avatar["expire"] > time.time():
                 avatar = cached_avatar["avatar"]
+                logging.info(f"[SOOP] {bj_id} 头像来自缓存")
             else:
                 logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存")
 
-        # ---------- 直播状态判断 ----------
+        # 直播状态判断
         result_code = channel.get('RESULT', -1)
         if result_code == -6:
             return {"streams": [], "isLive": False,
@@ -998,7 +957,7 @@ async def parse_soop(url, cookie: str = ""):
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
-        # ---------- 流获取 ----------
+        # ---------- 后续 CDN / aid 获取逻辑保持不变 ----------
         ts_now = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
