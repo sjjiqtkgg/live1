@@ -874,8 +874,10 @@ async def parse_soop(url, cookie: str = ""):
         }
         if eff_cookie:
             headers_pc['cookie'] = eff_cookie
+
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
+        # 1. 直播状态 API（获取昵称、直播状态）
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -893,54 +895,23 @@ async def parse_soop(url, cookie: str = ""):
         channel = live_json.get('CHANNEL', {})
         nickname = channel.get('BJ_NM') or f'BJ-{bj_id}'
 
-        # 头像提取：BJPIC 优先（零额外请求），失败则主页正则兜底
+        # ---------- 头像：直接拼接，零额外请求 ----------
         avatar = ''
-        bjpic = channel.get('BJPIC') or channel.get('BJ_PIC') or ''
-        if bjpic:
-            if bjpic.startswith('//'):
-                avatar = 'https:' + bjpic
-            elif bjpic.startswith('http'):
-                avatar = bjpic
-            else:
-                avatar = 'https://' + bjpic.lstrip('/')
-            logging.info(f"[SOOP] {bj_id} 头像来自 BJPIC")
+        if len(bj_id) >= 2:
+            prefix = bj_id[:2].lower()
+            avatar = f'https://stimg.sooplive.com/LOGO/{prefix}/{bj_id}.jpg'
 
+        # 如果 ID 异常（极短），使用缓存兜底
         if not avatar:
-            logging.info(f"[SOOP] {bj_id} BJPIC 缺失，尝试主页正则")
-            try:
-                home_url = f'https://play.sooplive.com/{bj_id}'
-                home_resp = await request_with_proxy_group("GET", home_url, proxy_list=proxylist,
-                                                           headers=headers_pc, shuffle_proxy=False)
-                if home_resp.status_code == 200:
-                    m = re.search(r'"profile_image"\s*:\s*"([^"]+)"', home_resp.text)
-                    if not m:
-                        m = re.search(r'<meta\s+(?:property|name)="og:image"\s+content="([^"]+)"', home_resp.text)
-                    if m:
-                        avatar = m.group(1).replace('\\u002F', '/').replace('\\/', '/')
-                        if avatar.startswith('//'):
-                            avatar = 'https:' + avatar
-                        elif not avatar.startswith('http'):
-                            avatar = 'https://' + avatar.lstrip('/')
-                        logging.info(f"[SOOP] {bj_id} 头像来自主页正则")
-            except Exception as e:
-                logging.warning(f"[SOOP] {bj_id} 主页请求失败: {e}")
-
-        # 兼容旧域名
-        if avatar and 'afreecatv.com' in avatar:
-            avatar = avatar.replace('afreecatv.com', 'sooplive.com')
-
-        # 缓存
-        if avatar:
-            SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
-        else:
             cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
             if cached_avatar and cached_avatar["expire"] > time.time():
                 avatar = cached_avatar["avatar"]
-                logging.info(f"[SOOP] {bj_id} 头像来自缓存")
             else:
-                logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存")
+                logging.warning(f"[SOOP] {bj_id} 无法构造头像地址且无缓存")
+        else:
+            SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
 
-        # 直播状态判断
+        # ---------- 直播状态判断 ----------
         result_code = channel.get('RESULT', -1)
         if result_code == -6:
             return {"streams": [], "isLive": False,
@@ -957,7 +928,7 @@ async def parse_soop(url, cookie: str = ""):
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
-        # ---------- 后续 CDN / aid 获取逻辑保持不变 ----------
+        # ---------- CDN / aid 流程保持不变 ----------
         ts_now = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
@@ -1014,7 +985,6 @@ async def parse_soop(url, cookie: str = ""):
     except Exception as e:
         logging.exception("[SOOP] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
-
 # ==================== PandaTV ====================
 async def parse_panda_manual(url):
     try:
