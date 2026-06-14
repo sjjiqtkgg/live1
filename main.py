@@ -855,7 +855,7 @@ async def parse_twitch(url, cookie: str = ""):
         logging.exception("[Twitch] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== SOOP（已修复头像） ====================
+# ==================== SOOP（最终修复：BJPIC 优先 + station_info 备用） ====================
 async def parse_soop(url, cookie: str = ""):
     try:
         eff_cookie = cookie or SOOP_COOKIE
@@ -876,7 +876,7 @@ async def parse_soop(url, cookie: str = ""):
             headers_pc['cookie'] = eff_cookie
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # 仅一次 live API 请求
+        # 唯一必需的 live API
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -893,11 +893,12 @@ async def parse_soop(url, cookie: str = ""):
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
 
-        # 昵称
+        # ---------- 昵称 ----------
         nickname = channel.get('BJ_NM') or f'BJ-{bj_id}'
 
-        # 头像直接从 BJPIC 提取（零额外请求，离线主播也有此字段）
+        # ---------- 头像获取（两步走） ----------
         avatar = ''
+        # 第一步：从 live API 的 BJPIC 字段提取
         bjpic = channel.get('BJPIC') or channel.get('BJ_PIC') or ''
         if bjpic:
             if bjpic.startswith('//'):
@@ -906,17 +907,44 @@ async def parse_soop(url, cookie: str = ""):
                 avatar = bjpic
             else:
                 avatar = 'https://' + bjpic.lstrip('/')
-            SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
-            logging.info(f"[SOOP] {bj_id} 头像已从 live API 写入缓存")
-        else:
+            logging.info(f"[SOOP] {bj_id} 头像来自 live API BJPIC")
+
+        # 第二步：BJPIC 缺失时，回退到 station_info 接口（顺序请求，不并发）
+        if not avatar:
+            logging.info(f"[SOOP] {bj_id} BJPIC 缺失，尝试 station_info")
+            try:
+                station_url = f'https://st.sooplive.co.kr/api/get_station_info.php?szBjId={bj_id}'
+                # 使用短窗口对冲，确保不堵塞主流程
+                station_resp = await request_smart("GET", station_url, proxy_list=proxylist,
+                    headers=headers_pc, hedge_delay=1.5, log_tag="SOOP-station")
+                if station_resp.status_code == 200:
+                    si = station_resp.json()
+                    station = si.get('station', {})
+                    si_avatar = station.get('profile_image') or station.get('profile_img') or ''
+                    if si_avatar:
+                        if si_avatar.startswith('//'):
+                            si_avatar = 'https:' + si_avatar
+                        elif not si_avatar.startswith('http'):
+                            si_avatar = 'https://' + si_avatar.lstrip('/')
+                        avatar = si_avatar
+                        logging.info(f"[SOOP] {bj_id} 头像来自 station_info")
+            except Exception as e:
+                logging.warning(f"[SOOP] {bj_id} station_info 请求失败: {e}")
+
+        # 第三步：仍然没有，尝试缓存
+        if not avatar:
             cached_avatar = SOOP_AVATAR_CACHE.get(bj_id)
             if cached_avatar and cached_avatar["expire"] > time.time():
                 avatar = cached_avatar["avatar"]
-                logging.info(f"[SOOP] {bj_id} 头像缺失，使用缓存")
+                logging.info(f"[SOOP] {bj_id} 头像来自缓存")
             else:
                 logging.warning(f"[SOOP] {bj_id} 头像获取失败且无缓存")
 
-        # 直播状态
+        # 最终写入缓存
+        if avatar:
+            SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
+
+        # ---------- 直播状态 ----------
         result_code = channel.get('RESULT', -1)
         if result_code == -6:
             return {"streams": [], "isLive": False,
@@ -933,7 +961,7 @@ async def parse_soop(url, cookie: str = ""):
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
             return result
 
-        # CDN & aid
+        # CDN / aid
         ts_now = time.time()
         cdn_params = {
             'return_type': 'gcp_cdn',
