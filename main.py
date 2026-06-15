@@ -55,6 +55,7 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app):
     async def _cache_cleanup():
+        _last_cleanup_hour = -1
         while True:
             await asyncio.sleep(60)
             now = time.time()
@@ -70,12 +71,17 @@ async def lifespan(app):
                 for k in keys[:250]:
                     STREAM_PROXY_MAP.pop(k, None)
                 logging.info(f"[缓存] STREAM_PROXY_MAP 超限，已清理至 {len(STREAM_PROXY_MAP)} 条")
-            # 清理 SOOP 头像缓存（过期时间 1 年，实际相当于长期保留，只清理过期条目）
-            expired_avatar = [k for k, v in list(SOOP_AVATAR_CACHE.items()) if v.get('expire', 0) < now]
-            for k in expired_avatar:
-                SOOP_AVATAR_CACHE.pop(k, None)
-            if expired_avatar:
-                logging.info(f"[头像缓存] 清理 {len(expired_avatar)} 条过期 SOOP 头像，剩余 {len(SOOP_AVATAR_CACHE)} 条")
+            # 每小时重建连接池，清理 stale 连接
+            hour = int(now // 3600)
+            if hour != _last_cleanup_hour:
+                _last_cleanup_hour = hour
+                for key in list(CLIENT_POOL.keys()):
+                    try:
+                        client = CLIENT_POOL.pop(key)
+                        await client.aclose()
+                    except Exception:
+                        pass
+                logging.info(f"[连接池] 已重建，当前连接数: {len(CLIENT_POOL)}")
     task = asyncio.create_task(_cache_cleanup())
     yield
     task.cancel()
@@ -87,8 +93,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # ==================== API 限流 ====================
+def get_real_ip(request: Request):
+    return request.headers.get("X-Forwarded-For", request.client.host).split(",")[0].strip()
+
 if SLOWAPI_AVAILABLE:
-    limiter = Limiter(key_func=get_remote_address)
+    limiter = Limiter(key_func=get_real_ip)
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 else:
@@ -149,14 +158,20 @@ async def get_client(proxy=None, timeout=None):
 
 STREAM_PROXY_MAP: dict = {}
 M3U8_CACHE: dict = {}
-SOOP_AVATAR_CACHE: dict = {}   # { bj_id: {"avatar": url, "expire": ts } }
+_OFFLINE_COUNTER: dict = {}   # 记录连续离线次数
+_PROXY_COUNTER = 0
 
-def get_fixed_proxy_list(proxy_pool):
-    if not proxy_pool or proxy_pool[0] is None:
+# 轮询代理列表
+def get_fixed_proxy_list(proxy_list, count=None):
+    global _PROXY_COUNTER
+    if not proxy_list:
         return [None]
-    primary = random.choice(proxy_pool)
-    rest = [p for p in proxy_pool if p != primary]
-    return [primary] + rest
+    n = count or len(proxy_list)
+    result = []
+    for i in range(n):
+        result.append(proxy_list[(_PROXY_COUNTER + i) % len(proxy_list)])
+    _PROXY_COUNTER = (_PROXY_COUNTER + n) % len(proxy_list)
+    return result
 
 async def request_with_retry(method, url, **kwargs):
     last_error = None
@@ -482,6 +497,9 @@ async def parse_huya(url):
             live_data.get("avatar180") or live_data.get("sAvatar180") or
             live_data.get("sAvatar") or live_data.get("avatar") or ""
         )
+
+        if not avatar:
+            logging.warning(f"[虎牙] {room_id} 网页抓取失败，页面结构可能已变更")
 
         if live.get("realLiveStatus") != "ON":
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
@@ -892,9 +910,18 @@ async def parse_twitch(url, cookie: str = ""):
                             token, sig = t.get("value"), t.get("signature")
                             if token and sig:
                                 break
-                logging.warning(f"[Twitch] Client-ID {client_id} 失效，尝试下一个...")
-            except Exception:
-                logging.warning(f"[Twitch] Client-ID {client_id} 请求异常")
+                            else:
+                                logging.warning(f"[Twitch] Client-ID {client_id} 返回空 token，跳过")
+                                continue
+                        else:
+                            logging.warning(f"[Twitch] Client-ID {client_id} 无 token 字段，跳过")
+                            continue
+                    else:
+                        logging.warning(f"[Twitch] Client-ID {client_id} 返回数据格式异常")
+                        continue
+                logging.warning(f"[Twitch] Client-ID {client_id} 请求失败或非200: {resp.status_code}")
+            except Exception as e:
+                logging.warning(f"[Twitch] Client-ID {client_id} 请求异常: {e}")
         if not token or not sig:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
 
@@ -949,9 +976,11 @@ async def parse_soop(url, cookie: str = ""):
 
         nickname = f'BJ-{bj_id}'
         # 头像 URL 规律：https://stimg.sooplive.com/LOGO/{bj_id前两位}/{bj_id}/{bj_id}.jpg
-        # 无需任何 HTTP 请求，从 bj_id 直接推导，零延迟、零依赖
         avatar = f'https://stimg.sooplive.com/LOGO/{bj_id[:2]}/{bj_id}/{bj_id}.jpg'
-        SOOP_AVATAR_CACHE[bj_id] = {"avatar": avatar, "expire": time.time() + 86400 * 365}
+
+        # 离线退避计数器
+        offline_key = f"offline_{bj_id}"
+        offline_count = _OFFLINE_COUNTER.get(offline_key, 0)
 
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
@@ -964,25 +993,34 @@ async def parse_soop(url, cookie: str = ""):
                                                    log_tag="SOOP-live")
         if live_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
+            _OFFLINE_COUNTER[offline_key] = offline_count + 1
+            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
             return result
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
-        # 从 live API 响应补全昵称（比 bj_id 更友好）
         nickname = channel.get('BJ_NM') or channel.get('BJNICK') or nickname
         result_code = channel.get('RESULT', -1)
         if result_code == -6:
-            return {"streams": [], "isLive": False, "error": "19+成年直播间，请在设置中填入SOOP登录Cookie",
+            result = {"streams": [], "isLive": False, "error": "19+成年直播间，请在设置中填入SOOP登录Cookie",
                     "title": nickname, "avatar": avatar}
+            _OFFLINE_COUNTER[offline_key] = offline_count + 1
+            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
+            return result
         if result_code not in [0, 1]:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
+            _OFFLINE_COUNTER[offline_key] = offline_count + 1
+            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
             return result
 
         broad_no = channel.get('BNO', '')
         if not broad_no:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
+            _OFFLINE_COUNTER[offline_key] = offline_count + 1
+            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
             return result
 
         ts_now = time.time()
@@ -999,13 +1037,17 @@ async def parse_soop(url, cookie: str = ""):
             log_tag="SOOP-cdn")
         if cdn_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
+            _OFFLINE_COUNTER[offline_key] = offline_count + 1
+            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
             return result
         cdn_json = cdn_resp.json()
         view_url = cdn_json.get('view_url')
         if not view_url:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
+            _OFFLINE_COUNTER[offline_key] = offline_count + 1
+            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
             return result
 
         aid_form = live_data_form.copy()
@@ -1014,13 +1056,17 @@ async def parse_soop(url, cookie: str = ""):
                                                   headers=headers_pc, data=aid_form, shuffle_proxy=False)
         if aid_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
+            _OFFLINE_COUNTER[offline_key] = offline_count + 1
+            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
             return result
         aid_json = aid_resp.json()
         aid = aid_json.get('CHANNEL', {}).get('AID', '')
         if not aid:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 60}
+            _OFFLINE_COUNTER[offline_key] = offline_count + 1
+            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
             return result
 
         m3u8_url = f'{view_url}?aid={aid}'
@@ -1037,6 +1083,8 @@ async def parse_soop(url, cookie: str = ""):
             streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
 
         result = {"streams": streams, "title": nickname, "avatar": avatar, "isLive": True}
+        # 直播成功时清除离线计数，TTL 15秒
+        _OFFLINE_COUNTER.pop(offline_key, None)
         M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 15}
         return result
     except Exception as e:
