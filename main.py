@@ -159,15 +159,19 @@ async def get_client(proxy=None, timeout=None):
 STREAM_PROXY_MAP: dict = {}
 M3U8_CACHE: dict = {}
 _OFFLINE_COUNTER: dict = {}   # 记录连续离线次数
+_PROXY_COUNTER = 0
 
-# ==================== 临时：改回随机代理分配（用于验证 PandaTV 头像缓存问题） ====================
+# 轮询代理列表
 def get_fixed_proxy_list(proxy_list, count=None):
-    """临时恢复为随机选择模式，以测试代理缓存是否导致头像错误"""
+    global _PROXY_COUNTER
     if not proxy_list:
         return [None]
-    primary = random.choice(proxy_list)
-    rest = [p for p in proxy_list if p != primary]
-    return [primary] + rest
+    n = count or len(proxy_list)
+    result = []
+    for i in range(n):
+        result.append(proxy_list[(_PROXY_COUNTER + i) % len(proxy_list)])
+    _PROXY_COUNTER = (_PROXY_COUNTER + n) % len(proxy_list)
+    return result
 
 async def request_with_retry(method, url, **kwargs):
     last_error = None
