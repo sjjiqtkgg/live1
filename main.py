@@ -1115,12 +1115,12 @@ async def parse_panda_manual(url):
         bj_info = info_json.get('bjInfo', {})
         anchor_name = bj_info.get('nick', user_id)
 
-        _IMG_FIELDS = (
-            'thumbUrl', 'profileImg', 'profileImage', 'img', 'userImg', 'thumbImg',
-            'bjImg', 'thumb', 'photo', 'avatar', 'iconImg', 'userPic',
-            'thumbnail', 'profile', 'profileThumb',
+        # ⬇️ 关键修复：真实头像字段优先，封面字段靠后
+        PRIORITY_AVATAR_FIELDS = (
+            'profileImg', 'profileImage', 'avatar', 'iconImg', 'userImg', 'profileThumb',
+            'thumbUrl', 'thumbImg', 'bjImg', 'thumbnail', 'profile', 'userPic', 'photo', 'thumb'
         )
-        avatar = next((bj_info[k] for k in _IMG_FIELDS if bj_info.get(k)), '')
+        avatar = next((bj_info[k] for k in PRIORITY_AVATAR_FIELDS if bj_info.get(k)), '')
 
         if 'media' not in info_json:
             result = {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
@@ -1141,11 +1141,12 @@ async def parse_panda_manual(url):
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
 
+        # 兜底：如果头像仍为默认值，从 play_json 的其他区块再次查找（同样使用优先级字段）
         if not avatar or 'default' in avatar.lower() or 'no_image' in avatar.lower():
             for _section in ('bjInfo', 'userInfo', 'bjProfile', 'channelInfo', 'mediaInfo'):
                 _d = play_json.get(_section)
                 if isinstance(_d, dict):
-                    _candidate = next((str(_d[k]) for k in _IMG_FIELDS if _d.get(k)), '')
+                    _candidate = next((str(_d[k]) for k in PRIORITY_AVATAR_FIELDS if _d.get(k)), '')
                     if _candidate:
                         avatar = _candidate
                         logging.info(f"[PandaTV] 从 play_json[{_section}] 获取到头像")
