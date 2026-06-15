@@ -159,19 +159,15 @@ async def get_client(proxy=None, timeout=None):
 STREAM_PROXY_MAP: dict = {}
 M3U8_CACHE: dict = {}
 _OFFLINE_COUNTER: dict = {}   # 记录连续离线次数
-_PROXY_COUNTER = 0
 
-# 轮询代理列表
+# ==================== 临时：改回随机代理分配（用于验证 PandaTV 头像缓存问题） ====================
 def get_fixed_proxy_list(proxy_list, count=None):
-    global _PROXY_COUNTER
+    """临时恢复为随机选择模式，以测试代理缓存是否导致头像错误"""
     if not proxy_list:
         return [None]
-    n = count or len(proxy_list)
-    result = []
-    for i in range(n):
-        result.append(proxy_list[(_PROXY_COUNTER + i) % len(proxy_list)])
-    _PROXY_COUNTER = (_PROXY_COUNTER + n) % len(proxy_list)
-    return result
+    primary = random.choice(proxy_list)
+    rest = [p for p in proxy_list if p != primary]
+    return [primary] + rest
 
 async def request_with_retry(method, url, **kwargs):
     last_error = None
@@ -1099,19 +1095,10 @@ async def parse_panda_manual(url):
             return cached["data"]
 
         user_id = url.split('?')[0].rstrip('/').split('/')[-1]
-        # 基础请求头，增加防缓存字段
-        headers = {
-            'origin': 'https://www.pandalive.co.kr',
-            'referer': 'https://www.pandalive.co.kr/',
-            'user-agent': UA,
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-            'Expires': '0'
-        }
+        headers = {'origin': 'https://www.pandalive.co.kr', 'referer': 'https://www.pandalive.co.kr/', 'user-agent': UA}
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        # 请求主播信息，追加时间戳防缓存
-        info_url = f'https://api.pandalive.co.kr/v1/member/bj?_t={int(time.time()*1000)}'
+        info_url = 'https://api.pandalive.co.kr/v1/member/bj'
         resp = await request_with_proxy_group("POST", info_url, proxy_list=proxylist,
                                               headers=headers,
                                               data={'userId': user_id, 'info': 'media fanGrade'},
@@ -1124,19 +1111,19 @@ async def parse_panda_manual(url):
         bj_info = info_json.get('bjInfo', {})
         anchor_name = bj_info.get('nick', user_id)
 
-        PRIORITY_AVATAR_FIELDS = (
-            'profileImg', 'profileImage', 'avatar', 'iconImg', 'userImg', 'profileThumb',
-            'thumbUrl', 'thumbImg', 'bjImg', 'thumbnail', 'profile', 'userPic', 'photo', 'thumb'
+        _IMG_FIELDS = (
+            'thumbUrl', 'profileImg', 'profileImage', 'img', 'userImg', 'thumbImg',
+            'bjImg', 'thumb', 'photo', 'avatar', 'iconImg', 'userPic',
+            'thumbnail', 'profile', 'profileThumb',
         )
-        avatar = next((bj_info[k] for k in PRIORITY_AVATAR_FIELDS if bj_info.get(k)), '')
+        avatar = next((bj_info[k] for k in _IMG_FIELDS if bj_info.get(k)), '')
 
         if 'media' not in info_json:
             result = {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
             M3U8_CACHE[url] = {"data": result, "expire": time.time() + 60}
             return result
 
-        # 请求播放地址，同样追加时间戳
-        play_url = f'https://api.pandalive.co.kr/v1/live/play?_t={int(time.time()*1000)}'
+        play_url = 'https://api.pandalive.co.kr/v1/live/play'
         resp2 = await request_with_proxy_group("POST", play_url, proxy_list=proxylist,
                                                headers=headers,
                                                data={'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''},
@@ -1150,12 +1137,11 @@ async def parse_panda_manual(url):
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
 
-        # 兜底查找头像
         if not avatar or 'default' in avatar.lower() or 'no_image' in avatar.lower():
             for _section in ('bjInfo', 'userInfo', 'bjProfile', 'channelInfo', 'mediaInfo'):
                 _d = play_json.get(_section)
                 if isinstance(_d, dict):
-                    _candidate = next((str(_d[k]) for k in PRIORITY_AVATAR_FIELDS if _d.get(k)), '')
+                    _candidate = next((str(_d[k]) for k in _IMG_FIELDS if _d.get(k)), '')
                     if _candidate:
                         avatar = _candidate
                         logging.info(f"[PandaTV] 从 play_json[{_section}] 获取到头像")
@@ -1194,6 +1180,7 @@ async def parse_panda_manual(url):
     except Exception as e:
         logging.exception("[PandaTV] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
+
 @app.post("/api/follows/batch")
 @limiter.limit("20/minute")
 async def api_follows_batch(request: Request):
