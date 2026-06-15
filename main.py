@@ -1099,10 +1099,19 @@ async def parse_panda_manual(url):
             return cached["data"]
 
         user_id = url.split('?')[0].rstrip('/').split('/')[-1]
-        headers = {'origin': 'https://www.pandalive.co.kr', 'referer': 'https://www.pandalive.co.kr/', 'user-agent': UA}
+        # 基础请求头，增加防缓存字段
+        headers = {
+            'origin': 'https://www.pandalive.co.kr',
+            'referer': 'https://www.pandalive.co.kr/',
+            'user-agent': UA,
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
+        }
         proxylist = get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
-        info_url = 'https://api.pandalive.co.kr/v1/member/bj'
+        # 请求主播信息，追加时间戳防缓存
+        info_url = f'https://api.pandalive.co.kr/v1/member/bj?_t={int(time.time()*1000)}'
         resp = await request_with_proxy_group("POST", info_url, proxy_list=proxylist,
                                               headers=headers,
                                               data={'userId': user_id, 'info': 'media fanGrade'},
@@ -1115,7 +1124,6 @@ async def parse_panda_manual(url):
         bj_info = info_json.get('bjInfo', {})
         anchor_name = bj_info.get('nick', user_id)
 
-        # ⬇️ 关键修复：真实头像字段优先，封面字段靠后
         PRIORITY_AVATAR_FIELDS = (
             'profileImg', 'profileImage', 'avatar', 'iconImg', 'userImg', 'profileThumb',
             'thumbUrl', 'thumbImg', 'bjImg', 'thumbnail', 'profile', 'userPic', 'photo', 'thumb'
@@ -1127,7 +1135,8 @@ async def parse_panda_manual(url):
             M3U8_CACHE[url] = {"data": result, "expire": time.time() + 60}
             return result
 
-        play_url = 'https://api.pandalive.co.kr/v1/live/play'
+        # 请求播放地址，同样追加时间戳
+        play_url = f'https://api.pandalive.co.kr/v1/live/play?_t={int(time.time()*1000)}'
         resp2 = await request_with_proxy_group("POST", play_url, proxy_list=proxylist,
                                                headers=headers,
                                                data={'action': 'watch', 'userId': user_id, 'password': '', 'shareLinkType': ''},
@@ -1141,7 +1150,7 @@ async def parse_panda_manual(url):
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
         real_m3u8 = play_json['PlayList']['hls'][0]['url']
 
-        # 兜底：如果头像仍为默认值，从 play_json 的其他区块再次查找（同样使用优先级字段）
+        # 兜底查找头像
         if not avatar or 'default' in avatar.lower() or 'no_image' in avatar.lower():
             for _section in ('bjInfo', 'userInfo', 'bjProfile', 'channelInfo', 'mediaInfo'):
                 _d = play_json.get(_section)
@@ -1185,7 +1194,6 @@ async def parse_panda_manual(url):
     except Exception as e:
         logging.exception("[PandaTV] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
-
 @app.post("/api/follows/batch")
 @limiter.limit("20/minute")
 async def api_follows_batch(request: Request):
