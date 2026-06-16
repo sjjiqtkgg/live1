@@ -87,6 +87,11 @@ async def lifespan(app):
                             pass
                 if stale_keys:
                     logging.info(f"[连接池] 已重建，清理 {len(stale_keys)} 个旧连接")
+            # 每 6 小时重置一次代理健康统计，避免长期累积的终身平均数掩盖近期的新问题
+            if int(now) % (6 * 3600) < 60:
+                if _PROXY_HEALTH:
+                    logging.info(f"[代理健康] 周期性重置统计，重置前共 {len(_PROXY_HEALTH)} 个代理记录")
+                    _PROXY_HEALTH.clear()
     task = asyncio.create_task(_cache_cleanup())
     yield
     task.cancel()
@@ -170,6 +175,37 @@ STREAM_PROXY_MAP: dict = {}
 M3U8_CACHE: dict = {}
 _SOOP_OFFLINE_COUNT: dict = {}   # { bj_id: 连续离线检测次数 }，用于离线退避 TTL
 
+# ==================== 代理健康统计（用于 /health 监控） ====================
+_PROXY_HEALTH: dict = {}
+# { proxy_key: {
+#     "success": int, "fail": int,
+#     "last_success_ts": float|None, "last_fail_ts": float|None,
+#     "last_error": str|None,
+#     "by_tag": { tag: {"success": int, "fail": int} }
+# } }
+
+def _record_proxy_health(proxy, ok: bool, tag: str = None, error: str = None):
+    key = proxy or "直连"
+    h = _PROXY_HEALTH.setdefault(key, {
+        "success": 0, "fail": 0,
+        "last_success_ts": None, "last_fail_ts": None,
+        "last_error": None, "by_tag": {}
+    })
+    if ok:
+        h["success"] += 1
+        h["last_success_ts"] = time.time()
+    else:
+        h["fail"] += 1
+        h["last_fail_ts"] = time.time()
+        h["last_error"] = error
+    if tag:
+        t = h["by_tag"].setdefault(tag, {"success": 0, "fail": 0})
+        t["success" if ok else "fail"] += 1
+
+# 拉流相关的 tag 前缀，用于 /health 里单独高亮"能不能拉到流"
+_STREAM_TAGS = ("SOOP-live", "SOOP-cdn", "SOOP-master", "SOOP-aid",
+                 "Twitch-m3u8", "Twitch-token", "PandaTV-play")
+
 _PROXY_RR_COUNTER = 0
 
 def get_fixed_proxy_list(proxy_pool):
@@ -186,12 +222,15 @@ def get_fixed_proxy_list(proxy_pool):
 async def request_with_retry(method, url, **kwargs):
     last_error = None
     timeout = kwargs.pop("timeout", 15)
+    log_tag = kwargs.pop("log_tag", None)
     for idx, proxy in enumerate(PROXY_URLS):
         try:
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
+            _record_proxy_health(proxy, True, tag=log_tag)
             return resp
         except Exception as e:
+            _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
             last_error = e
             logging.warning(f"[请求重试] {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
             await asyncio.sleep(0.5)
@@ -211,10 +250,12 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
         try:
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
+            _record_proxy_health(proxy, True, tag=log_tag)
             if log_tag:
                 logging.info(f"[{log_tag}] {proxy or '直连'} → HTTP {resp.status_code} {url.split('?')[0][-60:]}")
             return resp
         except Exception as e:
+            _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
             last_error = e
             logging.warning(f"[分组请求] {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
             await asyncio.sleep(0.5)
@@ -235,6 +276,7 @@ async def request_race(method, url, proxy_list, **kwargs):
     if len(proxy_list) == 1:
         client = await get_client(proxy_list[0], timeout)
         resp = await client.request(method, url, **kwargs)
+        _record_proxy_health(proxy_list[0], True, tag=log_tag)
         if log_tag:
             logging.info(f"[{log_tag}] {proxy_list[0] or '直连'} → HTTP {resp.status_code} {url.split('?')[0][-50:]}")
         return resp
@@ -254,9 +296,11 @@ async def request_race(method, url, proxy_list, **kwargs):
             proxy = task_proxy[task]
             try:
                 _, resp = task.result()
+                _record_proxy_health(proxy, True, tag=log_tag)
                 if winner is None:
                     winner = (proxy, resp)
             except Exception as e:
+                _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
                 errors.append(e)
                 logging.warning(f"[竞速] {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
 
@@ -1298,7 +1342,39 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
 def root(): return {"status":"ok"}
 
 @app.api_route("/health", methods=["GET","HEAD"])
-async def health(): return {"status":"alive"}
+async def health():
+    now = time.time()
+    proxies = []
+    for proxy, h in _PROXY_HEALTH.items():
+        total = h["success"] + h["fail"]
+        # 拉流相关 tag 单独汇总，专门回答"这个代理能不能拉到流"
+        stream_ok = sum(v["success"] for t, v in h["by_tag"].items() if t in _STREAM_TAGS)
+        stream_fail = sum(v["fail"] for t, v in h["by_tag"].items() if t in _STREAM_TAGS)
+        proxies.append({
+            "proxy": proxy,
+            "success": h["success"],
+            "fail": h["fail"],
+            "success_rate": f"{round(h['success']/total*100, 1)}%" if total else "N/A",
+            "last_success_secs_ago": round(now - h["last_success_ts"], 1) if h["last_success_ts"] else None,
+            "last_fail_secs_ago": round(now - h["last_fail_ts"], 1) if h["last_fail_ts"] else None,
+            "last_error": h["last_error"],
+            "stream_pull": {
+                "success": stream_ok,
+                "fail": stream_fail,
+                "can_pull_stream": stream_ok > 0 and (stream_fail == 0 or stream_ok >= stream_fail),
+            },
+            "by_tag": h["by_tag"],
+        })
+    # 拉流成功次数最少、失败最多的排前面，方便一眼揪出问题代理
+    proxies.sort(key=lambda p: (-p["stream_pull"]["fail"], p["stream_pull"]["success"]))
+
+    return {
+        "status": "alive",
+        "client_pool_size": len(CLIENT_POOL),
+        "m3u8_cache_size": len(M3U8_CACHE),
+        "soop_offline_tracked": len(_SOOP_OFFLINE_COUNT),
+        "proxies": proxies,
+    }
 
 if __name__ == "__main__":
     import uvicorn
