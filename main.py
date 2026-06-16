@@ -55,7 +55,6 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app):
     async def _cache_cleanup():
-        _last_cleanup_hour = -1
         while True:
             await asyncio.sleep(60)
             now = time.time()
@@ -71,17 +70,23 @@ async def lifespan(app):
                 for k in keys[:250]:
                     STREAM_PROXY_MAP.pop(k, None)
                 logging.info(f"[缓存] STREAM_PROXY_MAP 超限，已清理至 {len(STREAM_PROXY_MAP)} 条")
-            # 每小时重建连接池，清理 stale 连接
-            hour = int(now // 3600)
-            if hour != _last_cleanup_hour:
-                _last_cleanup_hour = hour
-                for key in list(CLIENT_POOL.keys()):
-                    try:
-                        client = CLIENT_POOL.pop(key)
-                        await client.aclose()
-                    except Exception:
-                        pass
-                logging.info(f"[连接池] 已重建，当前连接数: {len(CLIENT_POOL)}")
+            # 清理 SOOP 离线退避计数器（避免长期挂着的主播 id 无限堆积）
+            if len(_SOOP_OFFLINE_COUNT) > 1000:
+                keys = list(_SOOP_OFFLINE_COUNT.keys())
+                for k in keys[:500]:
+                    _SOOP_OFFLINE_COUNT.pop(k, None)
+            # 每小时重建连接池一次，回收长时间运行积累的 stale 连接
+            if int(now) % 3600 < 60:
+                stale_keys = list(CLIENT_POOL.keys())
+                for k in stale_keys:
+                    client = CLIENT_POOL.pop(k, None)
+                    if client:
+                        try:
+                            await client.aclose()
+                        except Exception:
+                            pass
+                if stale_keys:
+                    logging.info(f"[连接池] 已重建，清理 {len(stale_keys)} 个旧连接")
     task = asyncio.create_task(_cache_cleanup())
     yield
     task.cancel()
@@ -92,10 +97,15 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
-# ==================== API 限流 ====================
-def get_real_ip(request: Request):
-    return request.headers.get("X-Forwarded-For", request.client.host).split(",")[0].strip()
+def get_real_ip(request: Request) -> str:
+    """Render 等反代环境下，request.client.host 是负载均衡器内网 IP，
+    所有用户会共享同一限流计数器。优先读取 X-Forwarded-For 第一段。"""
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
+# ==================== API 限流 ====================
 if SLOWAPI_AVAILABLE:
     limiter = Limiter(key_func=get_real_ip)
     app.state.limiter = limiter
@@ -158,20 +168,20 @@ async def get_client(proxy=None, timeout=None):
 
 STREAM_PROXY_MAP: dict = {}
 M3U8_CACHE: dict = {}
-_OFFLINE_COUNTER: dict = {}   # 记录连续离线次数
-_PROXY_COUNTER = 0
+_SOOP_OFFLINE_COUNT: dict = {}   # { bj_id: 连续离线检测次数 }，用于离线退避 TTL
 
-# 轮询代理列表
-def get_fixed_proxy_list(proxy_list, count=None):
-    global _PROXY_COUNTER
-    if not proxy_list:
+_PROXY_RR_COUNTER = 0
+
+def get_fixed_proxy_list(proxy_pool):
+    """轮询分配代理，而非每次随机挑选，避免并发批量请求集中打到同一个代理。
+    返回值仍是该次调用要尝试的代理优先级列表（首位优先，其余作为 fallback）。"""
+    global _PROXY_RR_COUNTER
+    if not proxy_pool or proxy_pool[0] is None:
         return [None]
-    n = count or len(proxy_list)
-    result = []
-    for i in range(n):
-        result.append(proxy_list[(_PROXY_COUNTER + i) % len(proxy_list)])
-    _PROXY_COUNTER = (_PROXY_COUNTER + n) % len(proxy_list)
-    return result
+    n = len(proxy_pool)
+    start = _PROXY_RR_COUNTER % n
+    _PROXY_RR_COUNTER = (_PROXY_RR_COUNTER + 1) % n
+    return [proxy_pool[(start + i) % n] for i in range(n)]
 
 async def request_with_retry(method, url, **kwargs):
     last_error = None
@@ -487,8 +497,10 @@ async def parse_huya(url):
                 m = re.search(r'"nick":"([^"]+)"', mob_html) or re.search(r'<title>([^_<]+)', mob_html)
                 if m:
                     anchor_name = m.group(1).strip()
+                else:
+                    logging.warning(f"[虎牙] {room_id} 网页抓取未匹配到昵称，m.huya.com 页面结构可能已变更")
             except Exception:
-                pass
+                logging.warning(f"[虎牙] {room_id} 网页抓取请求失败，无法补全昵称")
         anchor_name = anchor_name or "虎牙主播"
 
         avatar = (
@@ -497,9 +509,6 @@ async def parse_huya(url):
             live_data.get("avatar180") or live_data.get("sAvatar180") or
             live_data.get("sAvatar") or live_data.get("avatar") or ""
         )
-
-        if not avatar:
-            logging.warning(f"[虎牙] {room_id} 网页抓取失败，页面结构可能已变更")
 
         if live.get("realLiveStatus") != "ON":
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
@@ -789,6 +798,7 @@ async def parse_douyin(url):
                 streams.append({"cdn": f"抖音-{label}", "url": m3u8, "type": "m3u8"})
 
         if not streams:
+            logging.warning(f"[抖音] {url} 未获取到任何画质流，可能主播未开播，也可能 a_bogus 签名已失效")
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
         quality_order = {"原画": 0, "蓝光": 1, "超清": 2, "高清": 3, "标清": 4}
@@ -885,8 +895,10 @@ async def parse_twitch(url, cookie: str = ""):
                         user_info = av_data[0]["data"]["user"]
                         avatar = user_info.get("profileImageURL", "")
                         nickname = user_info.get("displayName", channel)
-                break
+                        break  # 只在成功取到头像时停止，否则继续尝试下一个 Client-ID
+                logging.warning(f"[Twitch] Client-ID {client_id} 头像查询返回空数据，尝试下一个...")
             except Exception:
+                logging.warning(f"[Twitch] Client-ID {client_id} 头像查询异常，尝试下一个...")
                 continue
 
         token, sig = None, None
@@ -910,18 +922,9 @@ async def parse_twitch(url, cookie: str = ""):
                             token, sig = t.get("value"), t.get("signature")
                             if token and sig:
                                 break
-                            else:
-                                logging.warning(f"[Twitch] Client-ID {client_id} 返回空 token，跳过")
-                                continue
-                        else:
-                            logging.warning(f"[Twitch] Client-ID {client_id} 无 token 字段，跳过")
-                            continue
-                    else:
-                        logging.warning(f"[Twitch] Client-ID {client_id} 返回数据格式异常")
-                        continue
-                logging.warning(f"[Twitch] Client-ID {client_id} 请求失败或非200: {resp.status_code}")
-            except Exception as e:
-                logging.warning(f"[Twitch] Client-ID {client_id} 请求异常: {e}")
+                logging.warning(f"[Twitch] Client-ID {client_id} 失效，尝试下一个...")
+            except Exception:
+                logging.warning(f"[Twitch] Client-ID {client_id} 请求异常")
         if not token or not sig:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
 
@@ -952,6 +955,16 @@ async def parse_twitch(url, cookie: str = ""):
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
 # ==================== SOOP ====================
+def _soop_offline_ttl(bj_id: str) -> int:
+    """连续离线检测次数越多，TTL 越长：60s → 120 → 240 → 300s 封顶。
+    避免长期不开播的主播每分钟被重复查询。"""
+    count = _SOOP_OFFLINE_COUNT.get(bj_id, 0)
+    _SOOP_OFFLINE_COUNT[bj_id] = count + 1
+    return min(60 * (2 ** min(count, 4)), 300)
+
+def _soop_reset_offline(bj_id: str):
+    _SOOP_OFFLINE_COUNT.pop(bj_id, None)
+
 async def parse_soop(url, cookie: str = ""):
     try:
         eff_cookie = cookie or SOOP_COOKIE
@@ -976,11 +989,8 @@ async def parse_soop(url, cookie: str = ""):
 
         nickname = f'BJ-{bj_id}'
         # 头像 URL 规律：https://stimg.sooplive.com/LOGO/{bj_id前两位}/{bj_id}/{bj_id}.jpg
+        # 无需任何 HTTP 请求，从 bj_id 直接推导，零延迟、零依赖
         avatar = f'https://stimg.sooplive.com/LOGO/{bj_id[:2]}/{bj_id}/{bj_id}.jpg'
-
-        # 离线退避计数器
-        offline_key = f"offline_{bj_id}"
-        offline_count = _OFFLINE_COUNTER.get(offline_key, 0)
 
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
@@ -993,34 +1003,25 @@ async def parse_soop(url, cookie: str = ""):
                                                    log_tag="SOOP-live")
         if live_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            _OFFLINE_COUNTER[offline_key] = offline_count + 1
-            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
             return result
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
+        # 从 live API 响应补全昵称（比 bj_id 更友好）
         nickname = channel.get('BJ_NM') or channel.get('BJNICK') or nickname
         result_code = channel.get('RESULT', -1)
         if result_code == -6:
-            result = {"streams": [], "isLive": False, "error": "19+成年直播间，请在设置中填入SOOP登录Cookie",
+            return {"streams": [], "isLive": False, "error": "19+成年直播间，请在设置中填入SOOP登录Cookie",
                     "title": nickname, "avatar": avatar}
-            _OFFLINE_COUNTER[offline_key] = offline_count + 1
-            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
-            return result
         if result_code not in [0, 1]:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            _OFFLINE_COUNTER[offline_key] = offline_count + 1
-            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
             return result
 
         broad_no = channel.get('BNO', '')
         if not broad_no:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            _OFFLINE_COUNTER[offline_key] = offline_count + 1
-            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
             return result
 
         ts_now = time.time()
@@ -1037,17 +1038,13 @@ async def parse_soop(url, cookie: str = ""):
             log_tag="SOOP-cdn")
         if cdn_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            _OFFLINE_COUNTER[offline_key] = offline_count + 1
-            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
             return result
         cdn_json = cdn_resp.json()
         view_url = cdn_json.get('view_url')
         if not view_url:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            _OFFLINE_COUNTER[offline_key] = offline_count + 1
-            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
             return result
 
         aid_form = live_data_form.copy()
@@ -1056,17 +1053,13 @@ async def parse_soop(url, cookie: str = ""):
                                                   headers=headers_pc, data=aid_form, shuffle_proxy=False)
         if aid_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            _OFFLINE_COUNTER[offline_key] = offline_count + 1
-            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
             return result
         aid_json = aid_resp.json()
         aid = aid_json.get('CHANNEL', {}).get('AID', '')
         if not aid:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            _OFFLINE_COUNTER[offline_key] = offline_count + 1
-            ttl = min(60 * (2 ** min(offline_count, 4)), 300)
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + ttl}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
             return result
 
         m3u8_url = f'{view_url}?aid={aid}'
@@ -1083,8 +1076,7 @@ async def parse_soop(url, cookie: str = ""):
             streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
 
         result = {"streams": streams, "title": nickname, "avatar": avatar, "isLive": True}
-        # 直播成功时清除离线计数，TTL 15秒
-        _OFFLINE_COUNTER.pop(offline_key, None)
+        _soop_reset_offline(bj_id)
         M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 15}
         return result
     except Exception as e:
