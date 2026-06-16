@@ -1343,38 +1343,21 @@ def root(): return {"status":"ok"}
 
 @app.api_route("/health", methods=["GET","HEAD"])
 async def health():
-    now = time.time()
     proxies = []
     for proxy, h in _PROXY_HEALTH.items():
-        total = h["success"] + h["fail"]
-        # 拉流相关 tag 单独汇总，专门回答"这个代理能不能拉到流"
         stream_ok = sum(v["success"] for t, v in h["by_tag"].items() if t in _STREAM_TAGS)
         stream_fail = sum(v["fail"] for t, v in h["by_tag"].items() if t in _STREAM_TAGS)
+        is_bad = stream_fail > 0 and stream_fail >= stream_ok
         proxies.append({
             "proxy": proxy,
-            "success": h["success"],
-            "fail": h["fail"],
-            "success_rate": f"{round(h['success']/total*100, 1)}%" if total else "N/A",
-            "last_success_secs_ago": round(now - h["last_success_ts"], 1) if h["last_success_ts"] else None,
-            "last_fail_secs_ago": round(now - h["last_fail_ts"], 1) if h["last_fail_ts"] else None,
-            "last_error": h["last_error"],
-            "stream_pull": {
-                "success": stream_ok,
-                "fail": stream_fail,
-                "can_pull_stream": stream_ok > 0 and (stream_fail == 0 or stream_ok >= stream_fail),
-            },
-            "by_tag": h["by_tag"],
+            "status": "bad" if is_bad else "ok",
+            "stream_success": stream_ok,
+            "stream_fail": stream_fail,
         })
-    # 拉流成功次数最少、失败最多的排前面，方便一眼揪出问题代理
-    proxies.sort(key=lambda p: (-p["stream_pull"]["fail"], p["stream_pull"]["success"]))
+    # 坏的排前面
+    proxies.sort(key=lambda p: p["status"] != "bad")
 
-    return {
-        "status": "alive",
-        "client_pool_size": len(CLIENT_POOL),
-        "m3u8_cache_size": len(M3U8_CACHE),
-        "soop_offline_tracked": len(_SOOP_OFFLINE_COUNT),
-        "proxies": proxies,
-    }
+    return {"status": "alive", "proxies": proxies}
 
 if __name__ == "__main__":
     import uvicorn
