@@ -75,6 +75,11 @@ async def lifespan(app):
                 keys = list(_SOOP_OFFLINE_COUNT.keys())
                 for k in keys[:500]:
                     _SOOP_OFFLINE_COUNT.pop(k, None)
+            # 清理抖音"无画质流"日志去重记录（同理，避免无限堆积）
+            if len(_DOUYIN_NO_STREAM_LOGGED) > 1000:
+                keys = list(_DOUYIN_NO_STREAM_LOGGED.keys())
+                for k in keys[:500]:
+                    _DOUYIN_NO_STREAM_LOGGED.pop(k, None)
             # 每小时重建连接池一次，回收长时间运行积累的 stale 连接
             if int(now) % 3600 < 60:
                 stale_keys = list(CLIENT_POOL.keys())
@@ -174,6 +179,7 @@ async def get_client(proxy=None, timeout=None):
 STREAM_PROXY_MAP: dict = {}
 M3U8_CACHE: dict = {}
 _SOOP_OFFLINE_COUNT: dict = {}   # { bj_id: 连续离线检测次数 }，用于离线退避 TTL
+_DOUYIN_NO_STREAM_LOGGED: dict = {}  # { url: last_log_ts }，避免离线主播每次轮询都刷一条 WARNING
 
 # ==================== 代理健康统计（用于 /health 监控） ====================
 _PROXY_HEALTH: dict = {}
@@ -205,6 +211,12 @@ def _record_proxy_health(proxy, ok: bool, tag: str = None, error: str = None):
 # 拉流相关的 tag 前缀，用于 /health 里单独高亮"能不能拉到流"
 _STREAM_TAGS = ("SOOP-live", "SOOP-cdn", "SOOP-master", "SOOP-aid",
                  "Twitch-m3u8", "Twitch-token", "PandaTV-play")
+
+def _short_url(url: str, length: int = 60) -> str:
+    """截断 URL 用于日志展示。从左边保留协议+域名，避免像 [-60:] 那样从右边硬切掉
+    'https://' 前缀导致日志里显示成 'p://...' 这种误导性的残缺 URL。"""
+    path = url.split('?')[0]
+    return path if len(path) <= length else path[:length] + "…"
 
 _PROXY_RR_COUNTER = 0
 
@@ -252,7 +264,7 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
             resp = await client.request(method, url, **kwargs)
             _record_proxy_health(proxy, True, tag=log_tag)
             if log_tag:
-                logging.info(f"[{log_tag}] {proxy or '直连'} → HTTP {resp.status_code} {url.split('?')[0][-60:]}")
+                logging.info(f"[{log_tag}] {proxy or '直连'} → HTTP {resp.status_code} {_short_url(url)}")
             return resp
         except Exception as e:
             _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
@@ -278,7 +290,7 @@ async def request_race(method, url, proxy_list, **kwargs):
         resp = await client.request(method, url, **kwargs)
         _record_proxy_health(proxy_list[0], True, tag=log_tag)
         if log_tag:
-            logging.info(f"[{log_tag}] {proxy_list[0] or '直连'} → HTTP {resp.status_code} {url.split('?')[0][-50:]}")
+            logging.info(f"[{log_tag}] {proxy_list[0] or '直连'} → HTTP {resp.status_code} {_short_url(url)}")
         return resp
 
     async def _try(proxy):
@@ -312,7 +324,7 @@ async def request_race(method, url, proxy_list, **kwargs):
     if winner:
         proxy, resp = winner
         if log_tag:
-            logging.info(f"[{log_tag}] {proxy or '直连'} 竞速胜出 → HTTP {resp.status_code} {url.split('?')[0][-50:]}")
+            logging.info(f"[{log_tag}] {proxy or '直连'} 竞速胜出 → HTTP {resp.status_code} {_short_url(url)}")
         return resp
 
     raise errors[-1] if errors else Exception("所有代理均失败")
@@ -842,7 +854,12 @@ async def parse_douyin(url):
                 streams.append({"cdn": f"抖音-{label}", "url": m3u8, "type": "m3u8"})
 
         if not streams:
-            logging.warning(f"[抖音] {url} 未获取到任何画质流，可能主播未开播，也可能 a_bogus 签名已失效")
+            # 主播长期不开播时，多个客户端轮询会导致这条警告每分钟刷一遍。
+            # 同一房间 10 分钟内只记一次，避免淹没真正有用的日志。
+            last_logged = _DOUYIN_NO_STREAM_LOGGED.get(url, 0)
+            if time.time() - last_logged > 600:
+                logging.warning(f"[抖音] {url} 未获取到任何画质流，可能主播未开播，也可能 a_bogus 签名已失效")
+                _DOUYIN_NO_STREAM_LOGGED[url] = time.time()
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
         quality_order = {"原画": 0, "蓝光": 1, "超清": 2, "高清": 3, "标清": 4}
