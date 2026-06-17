@@ -244,7 +244,7 @@ async def request_with_retry(method, url, **kwargs):
         except Exception as e:
             _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
             last_error = e
-            logging.warning(f"[请求重试] {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
+            logging.warning(f"[请求重试]{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
             await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
 
@@ -269,7 +269,7 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
         except Exception as e:
             _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
             last_error = e
-            logging.warning(f"[分组请求] {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
+            logging.warning(f"[分组请求]{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
             await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
 
@@ -314,7 +314,7 @@ async def request_race(method, url, proxy_list, **kwargs):
             except Exception as e:
                 _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
                 errors.append(e)
-                logging.warning(f"[竞速] {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
+                logging.warning(f"[竞速]{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
 
     for t in pending:
         t.cancel()
