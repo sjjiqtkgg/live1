@@ -210,7 +210,7 @@ def _record_proxy_health(proxy, ok: bool, tag: str = None, error: str = None):
 
 # 拉流相关的 tag 前缀，用于 /health 里单独高亮"能不能拉到流"
 _STREAM_TAGS = ("SOOP-live", "SOOP-cdn", "SOOP-master", "SOOP-aid",
-                 "Twitch-m3u8", "Twitch-token", "PandaTV-play")
+                 "Twitch-m3u8", "Twitch-token", "PandaTV-play", "PandaTV-master")
 
 def _short_url(url: str, length: int = 60) -> str:
     """截断 URL 用于日志展示。从左边保留协议+域名，避免像 [-60:] 那样从右边硬切掉
@@ -949,7 +949,8 @@ async def parse_twitch(url, cookie: str = ""):
                 if eff_cookie:
                     gql_headers["Cookie"] = eff_cookie
                 avatar_resp = await request_with_proxy_group("POST", "https://gql.twitch.tv/gql",
-                    proxy_list=proxylist, json=gql_avatar_payload, headers=gql_headers, shuffle_proxy=False)
+                    proxy_list=proxylist, json=gql_avatar_payload, headers=gql_headers, shuffle_proxy=False,
+                    log_tag="Twitch-avatar")
                 if avatar_resp.status_code == 200:
                     av_data = avatar_resp.json()
                     if isinstance(av_data, list) and av_data[0].get("data", {}).get("user"):
@@ -1111,7 +1112,8 @@ async def parse_soop(url, cookie: str = ""):
         aid_form = live_data_form.copy()
         aid_form['type'] = 'aid'
         aid_resp = await request_with_proxy_group("POST", live_api, proxy_list=proxylist,
-                                                  headers=headers_pc, data=aid_form, shuffle_proxy=False)
+                                                  headers=headers_pc, data=aid_form, shuffle_proxy=False,
+                                                  log_tag="SOOP-aid")
         if aid_resp.status_code != 200:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
@@ -1128,7 +1130,7 @@ async def parse_soop(url, cookie: str = ""):
         try:
             master_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=proxylist,
                                                          headers={"User-Agent": UA, "Referer": "https://play.sooplive.com"},
-                                                         shuffle_proxy=False)
+                                                         shuffle_proxy=False, log_tag="SOOP-master")
             if master_resp.status_code == 200:
                 streams = parse_multivariant_m3u8(master_resp.text, m3u8_url, "SOOP")
         except Exception:
@@ -1159,7 +1161,7 @@ async def parse_panda_manual(url):
         resp = await request_with_proxy_group("POST", info_url, proxy_list=proxylist,
                                               headers=headers,
                                               data={'userId': user_id, 'info': 'media fanGrade'},
-                                              shuffle_proxy=False)
+                                              shuffle_proxy=False, log_tag="PandaTV-info")
         if resp.status_code != 200:
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
         info_json = resp.json()
@@ -1218,12 +1220,13 @@ async def parse_panda_manual(url):
             if cf_worker:
                 fetch_url = f"{cf_worker}?url={quote(real_m3u8, safe='')}&referer={quote('https://www.pandalive.co.kr/', safe='')}"
                 master_resp = await request_with_proxy_group("GET", fetch_url, proxy_list=[None],
-                                                             headers={"User-Agent": UA}, shuffle_proxy=False)
+                                                             headers={"User-Agent": UA}, shuffle_proxy=False,
+                                                             log_tag="PandaTV-master")
             else:
                 master_resp = await request_with_proxy_group("GET", real_m3u8, proxy_list=proxylist,
                                                              headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/",
                                                                       "Origin": "https://www.pandalive.co.kr"},
-                                                             shuffle_proxy=False)
+                                                             shuffle_proxy=False, log_tag="PandaTV-master")
             if master_resp.status_code == 200:
                 streams = parse_multivariant_m3u8(master_resp.text, real_m3u8, "PandaTV")
         except Exception:
