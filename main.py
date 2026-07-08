@@ -1318,7 +1318,10 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                 while True:
                     data = await go_ws.recv()
                     if isinstance(data, bytes): data = data.decode("utf-8")
-                    await websocket.send_text(data)
+                    try:
+                        await websocket.send_text(data)
+                    except Exception:
+                        break  # 前端已断开，停止转发
             await asyncio.gather(forward_to_go(), forward_to_frontend(), return_exceptions=True)
     except Exception as e:
         logging.warning(f"[WS] 抖音代理异常: {e}")
@@ -1343,13 +1346,19 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
                         continue
                     m = re.match(r":(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)", msg)
                     if m:
-                        await ws_conn.send_json({"type": "chat", "nick": m.group(1), "content": m.group(2)})
+                        try:
+                            await ws_conn.send_json({"type": "chat", "nick": m.group(1), "content": m.group(2)})
+                        except Exception:
+                            break  # 前端已断开，停止转发
 
             async def listen_to_frontend():
                 while True:
                     data = await ws_conn.receive_text()
                     if data == "ping":
-                        await ws_conn.send_text("pong")
+                        try:
+                            await ws_conn.send_text("pong")
+                        except Exception:
+                            break  # 前端已断开
 
             await asyncio.gather(forward_to_frontend(), listen_to_frontend())
     except Exception as e:
