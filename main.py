@@ -1303,7 +1303,6 @@ async def _parse_dispatch(url: str, cookie: str = ""):
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
     go_ws_url = f"ws://localhost:1088/ws/{room_id}"
-    go_ws = None
     try:
         async with websockets.connect(go_ws_url, ping_interval=None) as go_ws:
             async def forward_to_go():
@@ -1319,15 +1318,13 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                         elif go_ws.state.name == 'OPEN':
                             await go_ws.send(data)
                 except WebSocketDisconnect:
-                    # 前端主动断开，退出循环，触发 finally 清理
-                    pass
+                    pass  # 前端断开，正常退出
                 except Exception as e:
                     logging.debug(f"[WS] forward_to_go 异常: {e}")
 
             async def forward_to_frontend():
                 try:
                     while True:
-                        # 可选超时保护，防止 Go 服务僵死连接永久挂起
                         data = await asyncio.wait_for(go_ws.recv(), timeout=60)
                         if isinstance(data, bytes):
                             data = data.decode("utf-8")
@@ -1337,9 +1334,11 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                 except Exception as e:
                     logging.debug(f"[WS] forward_to_frontend 异常: {e}")
 
-            # 并发运行两个转发协程，任何一个退出都会取消另一个
+            # 关键修复：用 create_task 把协程包装成 Task
+            task_go = asyncio.create_task(forward_to_go())
+            task_fe = asyncio.create_task(forward_to_frontend())
             done, pending = await asyncio.wait(
-                [forward_to_go(), forward_to_frontend()],
+                [task_go, task_fe],
                 return_when=asyncio.FIRST_COMPLETED
             )
             for task in pending:
@@ -1349,7 +1348,6 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     except Exception as e:
         logging.warning(f"[WS] 抖音代理异常: {e}")
     finally:
-        # 确保无论如何都关闭与 Go 的连接（go_ws 由 async with 自动关闭）
         try:
             if websocket.client_state.name == 'OPEN':
                 await websocket.close()
