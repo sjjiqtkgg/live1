@@ -700,7 +700,6 @@ async def parse_huya(url):
         if live.get("realLiveStatus") != "ON":
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
 
-        live_source_info = live.get("liveSourceInfo", {})
         bitrate_list = live.get("liveBitRateInfo", [])
 
         quality_map = {}
@@ -1038,7 +1037,6 @@ async def parse_douyin(url):
                 resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
                 m_render = re.search(r'<script id="RENDER_DATA" type="application/json">([^<]+)</script>', resp.text)
                 if m_render:
-                    from urllib.parse import unquote
                     render_json = json.loads(unquote(m_render.group(1)))
                     avatar = find_avatar_in_dict(render_json) or ""
             except Exception:
@@ -1170,6 +1168,8 @@ async def parse_soop(url, cookie: str = ""):
 
         parts = url.rstrip('/').split('/')
         bj_id = parts[3].split('?')[0] if len(parts) > 3 else parts[-1].split('?')[0]
+        if not bj_id:
+            return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
         headers_pc = {
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
@@ -1429,11 +1429,20 @@ async def _parse_dispatch(url: str, cookie: str = ""):
         raise HTTPException(500, str(e))
 
 # ==================== 弹幕代理 ====================
+
+def _reset_go_service_check(mark_unavailable: bool = False):
+    """将 Go 服务探测时间戳清零，触发下次连接时重探。
+    用 helper 封装是为了让嵌套异步函数能修改全局变量而无需在内层写 global 声明
+    （Python 不允许 global 声明出现在赋值之后的同一作用域）。"""
+    global _GO_SERVICE_AVAILABLE, _GO_SERVICE_LAST_CHECK
+    _GO_SERVICE_LAST_CHECK = 0
+    if mark_unavailable:
+        _GO_SERVICE_AVAILABLE = False
+
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
     await websocket.accept()
 
-    # 【修复3】连接前先检查 Go 服务是否可用，不可用时直接返回错误，不进行无效连接
     if not await _check_go_service():
         try:
             await websocket.send_text(json.dumps({
@@ -1473,9 +1482,8 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                             data = data.decode("utf-8")
                         await websocket.send_text(data)
                 except asyncio.TimeoutError:
-                    # 【修复5】超时后标记 Go 服务可能有问题，触发下次重探
-                    global _GO_SERVICE_LAST_CHECK
-                    _GO_SERVICE_LAST_CHECK = 0
+                    # 超时说明 Go 服务可能有问题，清零时间戳触发下次重探
+                    _reset_go_service_check()
                     logging.warning(f"[WS] 从 Go 服务接收超时 (room={room_id})，关闭连接")
                 except Exception as e:
                     logging.debug(f"[WS] forward_to_frontend 异常: {e}")
@@ -1488,20 +1496,14 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
             )
             for task in pending:
                 task.cancel()
-            # 等待取消完成，确保 Go 连接在 async with 退出时已无挂起的协程
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
     except websockets.exceptions.ConnectionClosed:
         logging.info(f"[WS] Go 服务连接已关闭 (room={room_id})")
-        # 标记 Go 服务可能不稳定，触发下次重探
-        global _GO_SERVICE_LAST_CHECK
-        _GO_SERVICE_LAST_CHECK = 0
+        _reset_go_service_check()
     except OSError as e:
-        # Go 服务端口不可达（Connection refused 等）
-        # 【修复】补上 global 声明，否则 Python 将赋值视为局部变量，全局状态不会被修改
-        global _GO_SERVICE_AVAILABLE, _GO_SERVICE_LAST_CHECK
-        _GO_SERVICE_AVAILABLE = False
-        _GO_SERVICE_LAST_CHECK = 0
+        # Go 服务端口不可达（Connection refused 等），标记为不可用
+        _reset_go_service_check(mark_unavailable=True)
         logging.warning(f"[WS] 抖音代理无法连接 Go 服务: {e}")
     except Exception as e:
         logging.warning(f"[WS] 抖音代理异常: {e}")
