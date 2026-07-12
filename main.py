@@ -54,41 +54,52 @@ except ImportError:
 from contextlib import asynccontextmanager
 
 # ==================== Go 弹幕服务配置 ====================
-# 【修复3】Go 服务地址改为环境变量，方便部署时配置
 GO_DANMAKU_HOST = os.getenv("GO_DANMAKU_HOST", "localhost")
 GO_DANMAKU_PORT = os.getenv("GO_DANMAKU_PORT", "1088")
 GO_DANMAKU_BASE = f"ws://{GO_DANMAKU_HOST}:{GO_DANMAKU_PORT}"
 
-# 【修复3】Go 服务可用性标志 + 退避控制
-_GO_SERVICE_AVAILABLE = False          # 启动时探测，运行时动态维护
-_GO_SERVICE_LAST_CHECK = 0.0          # 上次探测时间戳
-_GO_SERVICE_CHECK_INTERVAL = 30.0     # 不可用时每 30 秒重试一次探测
+_GO_SERVICE_AVAILABLE = False
+_GO_SERVICE_LAST_CHECK = 0.0
+_GO_SERVICE_CHECK_INTERVAL = 30.0
+# 【修复】用 Lock 串行化探测协程，防止 Go 不可用时多个 WS 连接并发触发探测风暴
+_GO_SERVICE_CHECK_LOCK = asyncio.Lock()
 
 async def _check_go_service() -> bool:
-    """TCP 探测 Go 弹幕服务是否在线，结果写入全局标志。"""
+    """TCP 探测 Go 弹幕服务是否在线，结果写入全局标志。
+    【修复1】冷却判断改为：30 秒内无论可用与否都直接返回缓存结果，不重探。
+    【修复2】用 asyncio.Lock 确保同一时刻只有一个协程在做 TCP 探测，
+            消除多 WS 并发时的探测风暴。
+    """
     global _GO_SERVICE_AVAILABLE, _GO_SERVICE_LAST_CHECK
     now = time.time()
-    if now - _GO_SERVICE_LAST_CHECK < _GO_SERVICE_CHECK_INTERVAL and _GO_SERVICE_AVAILABLE:
+    # 快速路径：冷却期内直接返回上次结果，不需要加锁
+    if now - _GO_SERVICE_LAST_CHECK < _GO_SERVICE_CHECK_INTERVAL:
         return _GO_SERVICE_AVAILABLE
-    _GO_SERVICE_LAST_CHECK = now
-    try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(GO_DANMAKU_HOST, int(GO_DANMAKU_PORT)),
-            timeout=2.0
-        )
-        writer.close()
+    # 慢路径：需要真正探测，加锁串行化
+    async with _GO_SERVICE_CHECK_LOCK:
+        # 双重检查：拿到锁时可能已经被前一个协程探测过了
+        now = time.time()
+        if now - _GO_SERVICE_LAST_CHECK < _GO_SERVICE_CHECK_INTERVAL:
+            return _GO_SERVICE_AVAILABLE
+        _GO_SERVICE_LAST_CHECK = now
         try:
-            await writer.wait_closed()
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(GO_DANMAKU_HOST, int(GO_DANMAKU_PORT)),
+                timeout=2.0
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            if not _GO_SERVICE_AVAILABLE:
+                logging.info(f"[Go弹幕] 服务已恢复: {GO_DANMAKU_BASE}")
+            _GO_SERVICE_AVAILABLE = True
         except Exception:
-            pass
-        if not _GO_SERVICE_AVAILABLE:
-            logging.info(f"[Go弹幕] 服务已恢复: {GO_DANMAKU_BASE}")
-        _GO_SERVICE_AVAILABLE = True
-    except Exception:
-        if _GO_SERVICE_AVAILABLE:
-            logging.warning(f"[Go弹幕] 服务不可达: {GO_DANMAKU_BASE}，将停止接受抖音弹幕连接")
-        _GO_SERVICE_AVAILABLE = False
-    return _GO_SERVICE_AVAILABLE
+            if _GO_SERVICE_AVAILABLE:
+                logging.warning(f"[Go弹幕] 服务不可达: {GO_DANMAKU_BASE}，将停止接受抖音弹幕连接")
+            _GO_SERVICE_AVAILABLE = False
+        return _GO_SERVICE_AVAILABLE
 
 @asynccontextmanager
 async def lifespan(app):
@@ -1487,6 +1498,8 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         _GO_SERVICE_LAST_CHECK = 0
     except OSError as e:
         # Go 服务端口不可达（Connection refused 等）
+        # 【修复】补上 global 声明，否则 Python 将赋值视为局部变量，全局状态不会被修改
+        global _GO_SERVICE_AVAILABLE, _GO_SERVICE_LAST_CHECK
         _GO_SERVICE_AVAILABLE = False
         _GO_SERVICE_LAST_CHECK = 0
         logging.warning(f"[WS] 抖音代理无法连接 Go 服务: {e}")
