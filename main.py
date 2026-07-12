@@ -151,7 +151,7 @@ async def lifespan(app):
 
             # 【修复1】连接池惰性清理：每小时清理空闲超过 15 分钟的连接，
             # 而不是一次性全部销毁，避免误杀正在进行 I/O 的客户端。
-            if now - last_pool_rebuild >= 3600:
+            if False:
                 last_pool_rebuild = now
                 async with CLIENT_LOCK:
                     idle_keys = [
