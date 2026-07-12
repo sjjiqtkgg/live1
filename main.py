@@ -61,23 +61,15 @@ GO_DANMAKU_BASE = f"ws://{GO_DANMAKU_HOST}:{GO_DANMAKU_PORT}"
 _GO_SERVICE_AVAILABLE = False
 _GO_SERVICE_LAST_CHECK = 0.0
 _GO_SERVICE_CHECK_INTERVAL = 30.0
-# 【修复】用 Lock 串行化探测协程，防止 Go 不可用时多个 WS 连接并发触发探测风暴
 _GO_SERVICE_CHECK_LOCK = asyncio.Lock()
 
 async def _check_go_service() -> bool:
-    """TCP 探测 Go 弹幕服务是否在线，结果写入全局标志。
-    【修复1】冷却判断改为：30 秒内无论可用与否都直接返回缓存结果，不重探。
-    【修复2】用 asyncio.Lock 确保同一时刻只有一个协程在做 TCP 探测，
-            消除多 WS 并发时的探测风暴。
-    """
+    """TCP 探测 Go 弹幕服务是否在线，结果写入全局标志。"""
     global _GO_SERVICE_AVAILABLE, _GO_SERVICE_LAST_CHECK
     now = time.time()
-    # 快速路径：冷却期内直接返回上次结果，不需要加锁
     if now - _GO_SERVICE_LAST_CHECK < _GO_SERVICE_CHECK_INTERVAL:
         return _GO_SERVICE_AVAILABLE
-    # 慢路径：需要真正探测，加锁串行化
     async with _GO_SERVICE_CHECK_LOCK:
-        # 双重检查：拿到锁时可能已经被前一个协程探测过了
         now = time.time()
         if now - _GO_SERVICE_LAST_CHECK < _GO_SERVICE_CHECK_INTERVAL:
             return _GO_SERVICE_AVAILABLE
@@ -103,10 +95,8 @@ async def _check_go_service() -> bool:
 
 @asynccontextmanager
 async def lifespan(app):
-    # 【修复3】启动时探测 Go 服务
     await _check_go_service()
 
-    # 【修复1/2】记录连接池上次清理时间，避免依赖 time % interval 导致启动即清理
     last_pool_rebuild = time.time()
     last_health_reset = time.time()
 
@@ -123,11 +113,9 @@ async def lifespan(app):
             if expired:
                 logging.info(f"[缓存] 清理 {len(expired)} 条过期条目，剩余 {len(M3U8_CACHE)} 条")
 
-            # 【修复4】清理 STREAM_PROXY_MAP 时跳过距上次写入不足 60 秒的 key，
-            # 避免误删正在服务中的 TS 切片流映射。
+            # 清理 STREAM_PROXY_MAP
             if len(STREAM_PROXY_MAP) > 500:
                 now_ts = time.time()
-                # stream_proxy_map_ts 存储每个 key 的写入时间
                 safe_to_remove = [
                     k for k in list(STREAM_PROXY_MAP.keys())
                     if now_ts - STREAM_PROXY_MAP_TS.get(k, 0) > 60
@@ -149,14 +137,14 @@ async def lifespan(app):
                 for k in keys[:500]:
                     _DOUYIN_NO_STREAM_LOGGED.pop(k, None)
 
-            # 【修复1】连接池惰性清理：每小时清理空闲超过 15 分钟的连接，
-            # 而不是一次性全部销毁，避免误杀正在进行 I/O 的客户端。
-            if False:
+            # 连接池惰性清理 (已临时禁用，避免误杀 PandaTV 连接)
+            # 可改为更大的超时或完全重建，当前使用 False 跳过
+            if False:  # 原条件: now - last_pool_rebuild >= 3600
                 last_pool_rebuild = now
                 async with CLIENT_LOCK:
                     idle_keys = [
                         k for k, (client, last_use) in list(CLIENT_POOL.items())
-                        if now - last_use > 900  # 空闲超过 15 分钟
+                        if now - last_use > 900
                     ]
                     for k in idle_keys:
                         entry = CLIENT_POOL.pop(k, None)
@@ -176,7 +164,7 @@ async def lifespan(app):
                     logging.info(f"[代理健康] 周期性重置统计，重置前共 {len(_PROXY_HEALTH)} 个代理记录")
                     _PROXY_HEALTH.clear()
 
-            # 【修复3】定期重探 Go 服务可用性
+            # 定期重探 Go 服务
             if not _GO_SERVICE_AVAILABLE:
                 await _check_go_service()
 
@@ -187,7 +175,6 @@ async def lifespan(app):
         await task
     except asyncio.CancelledError:
         pass
-    # 关闭所有连接池中的客户端
     async with CLIENT_LOCK:
         for k, (client, _) in list(CLIENT_POOL.items()):
             try:
@@ -201,20 +188,17 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 def get_real_ip(request: Request) -> str:
-    """Render 等反代环境下，request.client.host 是负载均衡器内网 IP，
-    所有用户会共享同一限流计数器。优先读取 X-Forwarded-For 第一段。"""
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
         return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
-# ==================== API 限流 ====================
 if SLOWAPI_AVAILABLE:
     limiter = Limiter(key_func=get_real_ip)
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 else:
-    logging.warning("[限流] slowapi 未安装，/api/parse 与 /api/proxy 不受限流保护，建议 pip install slowapi")
+    logging.warning("[限流] slowapi 未安装")
     class _NoopLimiter:
         def limit(self, *args, **kwargs):
             def decorator(func):
@@ -225,7 +209,6 @@ else:
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
 
-# ==================== 代理配置 ====================
 PROXY_LIST_STR = os.getenv("PROXY_LIST", "")
 PROXY_URLS = [p.strip() for p in PROXY_LIST_STR.split(",") if p.strip()] if PROXY_LIST_STR else [None]
 logging.info(f"[代理] 国内代理 {len(PROXY_URLS)} 个: {PROXY_URLS}")
@@ -242,11 +225,9 @@ BILI_COOKIE = os.getenv("BILI_COOKIE", "").strip()
 if CF_WORKER:
     logging.info(f"[CF Worker] 已配置: {CF_WORKER}")
 else:
-    logging.info("[CF Worker] 未配置，海外平台 m3u8 将走外网代理")
+    logging.info("[CF Worker] 未配置")
 
-# ==================== 全局连接池 ====================
-# 【修复1】CLIENT_POOL 存储 (client, last_use_ts) 元组，以便惰性清理时判断空闲时长
-CLIENT_POOL: dict = {}   # key -> (httpx.AsyncClient, last_use_timestamp)
+CLIENT_POOL: dict = {}
 CLIENT_LOCK = asyncio.Lock()
 DEFAULT_TIMEOUT = 15
 
@@ -254,15 +235,12 @@ async def get_client(proxy=None, timeout=None):
     if timeout is None:
         timeout = DEFAULT_TIMEOUT
     key = f"{proxy or 'direct'}_t{timeout}"
-    # 【修复1】先在锁外做快速路径检查；读 tuple[0] 是原子操作，不会撕裂
     entry = CLIENT_POOL.get(key)
     if entry is not None:
         client, _ = entry
-        # 更新最后使用时间（允许并发写，Python dict 赋值是 GIL 保护的原子操作）
         CLIENT_POOL[key] = (client, time.time())
         return client
     async with CLIENT_LOCK:
-        # 双重检查，防止并发时重复创建
         entry = CLIENT_POOL.get(key)
         if entry is not None:
             client, _ = entry
@@ -281,13 +259,12 @@ async def get_client(proxy=None, timeout=None):
         CLIENT_POOL[key] = (client, time.time())
         return client
 
-STREAM_PROXY_MAP: dict = {}       # stream_key -> proxy
-STREAM_PROXY_MAP_TS: dict = {}    # 【修复4】stream_key -> 写入时间戳，用于安全清理
+STREAM_PROXY_MAP: dict = {}
+STREAM_PROXY_MAP_TS: dict = {}
 M3U8_CACHE: dict = {}
-_SOOP_OFFLINE_COUNT: dict = {}    # { bj_id: 连续离线检测次数 }
-_DOUYIN_NO_STREAM_LOGGED: dict = {}  # { url: last_log_ts }
+_SOOP_OFFLINE_COUNT: dict = {}
+_DOUYIN_NO_STREAM_LOGGED: dict = {}
 
-# ==================== 代理健康统计（用于 /health 监控） ====================
 _PROXY_HEALTH: dict = {}
 
 def _record_proxy_health(proxy, ok: bool, tag: str = None, error: str = None):
@@ -308,31 +285,23 @@ def _record_proxy_health(proxy, ok: bool, tag: str = None, error: str = None):
         t = h["by_tag"].setdefault(tag, {"success": 0, "fail": 0})
         t["success" if ok else "fail"] += 1
 
-# 拉流相关的 tag 前缀，用于 /health 里单独高亮"能不能拉到流"
 _STREAM_TAGS = ("SOOP-live", "SOOP-cdn", "SOOP-master", "SOOP-aid",
                  "Twitch-m3u8", "Twitch-token", "PandaTV-play", "PandaTV-master")
 
 def _short_url(url: str, length: int = 60) -> str:
-    """截断 URL 用于日志展示，保留协议+域名部分，避免截成残缺的 'p://...'。"""
     path = url.split('?')[0]
     return path if len(path) <= length else path[:length] + "…"
 
-# 【修复2】用 itertools.cycle + asyncio.Lock 实现真正线程安全的轮询分配
-# 当代理列表变化时（目前不会，保留扩展性），重建 cycle 即可。
 _PROXY_RR_LOCK = asyncio.Lock()
-_PROXY_RR_CYCLES: dict = {}   # pool_id -> itertools.cycle
+_PROXY_RR_CYCLES: dict = {}
 
 def _get_rr_cycle(proxy_pool):
-    """获取/初始化指定代理池的 cycle 对象。"""
     pool_id = id(proxy_pool)
     if pool_id not in _PROXY_RR_CYCLES:
         _PROXY_RR_CYCLES[pool_id] = itertools.cycle(range(len(proxy_pool)))
     return _PROXY_RR_CYCLES[pool_id]
 
 async def get_fixed_proxy_list(proxy_pool):
-    """轮询分配代理，返回该次调用要尝试的代理优先级列表（首位优先，其余作为 fallback）。
-    【修复2】用 asyncio.Lock 保护 cycle.next()，确保并发下轮询严格均匀。
-    【修复2】增加空列表和 [None] 的防御性检查，避免 IndexError / ZeroDivisionError。"""
     if not proxy_pool:
         return [None]
     if len(proxy_pool) == 1 and proxy_pool[0] is None:
@@ -344,7 +313,6 @@ async def get_fixed_proxy_list(proxy_pool):
     return [proxy_pool[(start + i) % n] for i in range(n)]
 
 async def request_with_retry(method, url, **kwargs):
-    """顺序遍历国内代理池，失败后间隔 0.5s 重试下一个。"""
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     log_tag = kwargs.pop("log_tag", None)
@@ -362,7 +330,6 @@ async def request_with_retry(method, url, **kwargs):
     raise last_error or Exception("所有代理均失败")
 
 async def request_with_proxy_group(method, url, proxy_list, **kwargs):
-    """顺序遍历指定代理列表，失败后间隔 0.5s 重试下一个。"""
     last_error = None
     timeout = kwargs.pop("timeout", 15)
     shuffle_proxy = kwargs.pop("shuffle_proxy", False)
@@ -387,10 +354,7 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
             await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
 
-
 async def request_race(method, url, proxy_list, **kwargs):
-    """并发所有代理，取最快成功的响应并取消其余。
-    仅适用于 API/M3U8 等小负载请求，勿用于 TS 切片。"""
     timeout = kwargs.pop("timeout", 15)
     log_tag = kwargs.pop("log_tag", None)
     kwargs.pop("shuffle_proxy", None)
@@ -398,7 +362,6 @@ async def request_race(method, url, proxy_list, **kwargs):
     if not proxy_list:
         proxy_list = [None]
 
-    # 单代理直接请求，无需竞速
     if len(proxy_list) == 1:
         client = await get_client(proxy_list[0], timeout)
         resp = await client.request(method, url, **kwargs)
@@ -411,8 +374,8 @@ async def request_race(method, url, proxy_list, **kwargs):
         client = await get_client(proxy, timeout)
         return proxy, await client.request(method, url, **kwargs)
 
-    task_proxy: dict = {asyncio.create_task(_try(p)): p for p in proxy_list}
-    pending: set = set(task_proxy)
+    task_proxy = {asyncio.create_task(_try(p)): p for p in proxy_list}
+    pending = set(task_proxy)
     errors = []
     winner = None
 
@@ -443,7 +406,6 @@ async def request_race(method, url, proxy_list, **kwargs):
 
     raise errors[-1] if errors else Exception("所有代理均失败")
 
-# ------------------ 代理接口 -----------------
 @app.api_route("/api/proxy", methods=["GET", "POST"])
 @limiter.limit("60/minute")
 async def api_proxy(request: Request, url: str = Query(...), referer: str = Query(""), ua: str = Query(""), cookie: str = Query("")):
@@ -491,7 +453,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
 
     if is_ts:
         stream_key = hashlib.md5(url.encode()).hexdigest()[:16]
-        # 【修复4】写入 STREAM_PROXY_MAP 时同步记录时间戳
         if stream_key not in STREAM_PROXY_MAP:
             if proxy_list and proxy_list[0] is not None:
                 STREAM_PROXY_MAP[stream_key] = random.choice(proxy_list)
@@ -499,7 +460,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
                 STREAM_PROXY_MAP[stream_key] = None
             STREAM_PROXY_MAP_TS[stream_key] = time.time()
         else:
-            # 每次访问刷新时间戳，避免活跃流被误清理
             STREAM_PROXY_MAP_TS[stream_key] = time.time()
         fixed_proxy = STREAM_PROXY_MAP[stream_key]
         proxies_to_use = [fixed_proxy] if fixed_proxy else proxy_list
@@ -556,8 +516,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         return Response(content=body_out, status_code=resp.status_code, headers=out_headers)
 
     if is_ts:
-        # 【修复4（TS流连接释放）】使用异步生成器确保 resp 在流传输结束或客户端断开后被关闭，
-        # 释放 httpx keepalive 连接，避免连接池耗尽。
         async def _stream_and_close():
             try:
                 async for chunk in resp.aiter_bytes():
@@ -579,7 +537,6 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": content_type or "application/json"}
     return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
 
-
 def build_streams(flv, m3u8):
     s = []
     if flv and flv.startswith("http"):
@@ -589,7 +546,6 @@ def build_streams(flv, m3u8):
     return s
 
 def parse_multivariant_m3u8(text, base_url, cdn_prefix):
-    """解析 HLS multivariant playlist，提取各画质子播放列表 URL。"""
     streams = []
     lines = text.splitlines()
     for i, line in enumerate(lines):
@@ -685,9 +641,9 @@ async def parse_huya(url):
                 if m:
                     anchor_name = m.group(1).strip()
                 else:
-                    logging.warning(f"[虎牙] {room_id} 网页抓取未匹配到昵称，m.huya.com 页面结构可能已变更")
+                    logging.warning(f"[虎牙] {room_id} 网页抓取未匹配到昵称")
             except Exception:
-                logging.warning(f"[虎牙] {room_id} 网页抓取请求失败，无法补全昵称")
+                logging.warning(f"[虎牙] {room_id} 网页抓取请求失败")
         anchor_name = anchor_name or "虎牙主播"
 
         avatar = (
@@ -701,20 +657,13 @@ async def parse_huya(url):
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
 
         bitrate_list = live.get("liveBitRateInfo", [])
-
         quality_map = {}
         if bitrate_list:
             for item in bitrate_list:
                 bitrate = item.get("bitrate", "")
                 name = item.get("name", "") or f"{bitrate}K"
                 quality_map[str(bitrate)] = name
-        default_qualities = {
-            "0": "原画",
-            "4000": "蓝光",
-            "2000": "超清",
-            "1000": "高清",
-            "500": "标清"
-        }
+        default_qualities = {"0": "原画", "4000": "蓝光", "2000": "超清", "1000": "高清", "500": "标清"}
         for k, v in default_qualities.items():
             if k not in quality_map:
                 quality_map[k] = v
@@ -727,7 +676,6 @@ async def parse_huya(url):
         streams = []
         seen_urls = set()
         seen_qualities = set()
-
         for cdn in cdn_list:
             flv_url = cdn.get("sFlvUrl", "")
             base_stream_name = cdn.get("sStreamName", "")
@@ -735,34 +683,23 @@ async def parse_huya(url):
             suffix = cdn.get("sFlvUrlSuffix", "flv")
             cdn_type = cdn.get("sCdnType", "")
             cdn_label = CDN_NAMES.get(cdn_type, cdn_type or "CDN")
-
             if not (flv_url and base_stream_name and anti_code):
                 continue
-
             for bitrate, quality_name in quality_map.items():
                 if bitrate == "0":
                     stream_name = base_stream_name
                 else:
                     stream_name = f"{base_stream_name}_{bitrate}"
-
                 built = huya_build_anticode(anti_code, stream_name)
                 full_url = f"{flv_url}/{stream_name}.{suffix}?{built}"
                 full_url = full_url.replace("http://", "https://")
-
                 if full_url in seen_urls:
                     continue
                 seen_urls.add(full_url)
-
                 if quality_name in seen_qualities:
                     continue
                 seen_qualities.add(quality_name)
-
-                streams.append({
-                    "cdn": f"{cdn_label}-{quality_name}",
-                    "url": full_url,
-                    "type": "flv"
-                })
-
+                streams.append({"cdn": f"{cdn_label}-{quality_name}", "url": full_url, "type": "flv"})
         if not streams:
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
 
@@ -791,7 +728,6 @@ async def parse_douyu(url):
 
         name = "斗鱼主播"
         avatar = ""
-
         try:
             open_api = f"https://open.douyucdn.cn/api/RoomApi/room/{room_id}"
             open_resp = await request_with_retry("GET", open_api, headers={"User-Agent": UA})
@@ -812,7 +748,6 @@ async def parse_douyu(url):
                 avatar = avatar_obj.get("big") or avatar_obj.get("middle") or avatar_obj.get("small") or avatar
             else:
                 avatar = room.get("avatar") or room.get("room_pic") or avatar
-
         if avatar and avatar.startswith("//"):
             avatar = "https:" + avatar
 
@@ -820,7 +755,6 @@ async def parse_douyu(url):
             return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
 
         real_id = str(room["room_id"])
-        # 【修复】did 改为每次随机生成，避免所有用户共用同一 did 触发斗鱼风控
         did = hashlib.md5(f"douyu_{real_id}_{int(time.time() // 3600)}_{random.randint(0, 9999)}".encode()).hexdigest()[:32].ljust(32, "0")
         enc_resp = await request_with_retry("GET", f"https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did={did}",
                                             headers={"User-Agent": UA})
@@ -864,10 +798,6 @@ async def parse_douyu(url):
                         info = d["data"]
                         flv_url = f"{info['rtmp_url']}/{info['rtmp_live']}"
                         return rate_val, flv_url
-                    else:
-                        logging.warning(f"[斗鱼] 画质 rate={rate_val} 接口返回错误: {d.get('error')} {d.get('msg','')}")
-                else:
-                    logging.warning(f"[斗鱼] 画质 rate={rate_val} HTTP {r.status_code}")
             except Exception as e:
                 logging.warning(f"[斗鱼] 画质 rate={rate_val} 请求异常: {e}")
             return rate_val, None
@@ -987,7 +917,7 @@ async def parse_douyin(url):
         if not streams:
             last_logged = _DOUYIN_NO_STREAM_LOGGED.get(url, 0)
             if time.time() - last_logged > 600:
-                logging.warning(f"[抖音] {url} 未获取到任何画质流，可能主播未开播，也可能 a_bogus 签名已失效")
+                logging.warning(f"[抖音] {url} 未获取到任何画质流")
                 _DOUYIN_NO_STREAM_LOGGED[url] = time.time()
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
@@ -1005,7 +935,6 @@ async def parse_douyin(url):
                 pass
 
         avatar = ""
-
         def find_avatar_in_dict(d, depth=0):
             if depth > 12:
                 return None
@@ -1041,12 +970,10 @@ async def parse_douyin(url):
                     avatar = find_avatar_in_dict(render_json) or ""
             except Exception:
                 pass
-
         if avatar and avatar.startswith("//"):
             avatar = "https:" + avatar
 
-        return {"streams": streams, "title": anchor_name,
-                "avatar": avatar, "roomId": room_id, "isLive": True}
+        return {"streams": streams, "title": anchor_name, "avatar": avatar, "roomId": room_id, "isLive": True}
     except Exception as e:
         logging.exception("[抖音] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
@@ -1150,7 +1077,6 @@ async def parse_twitch(url, cookie: str = ""):
 
 # ==================== SOOP ====================
 def _soop_offline_ttl(bj_id: str) -> int:
-    """连续离线检测次数越多，TTL 越长：60s → 120 → 240 → 300s 封顶。"""
     count = _SOOP_OFFLINE_COUNT.get(bj_id, 0)
     _SOOP_OFFLINE_COUNT[bj_id] = count + 1
     return min(60 * (2 ** min(count, 4)), 300)
@@ -1203,8 +1129,7 @@ async def parse_soop(url, cookie: str = ""):
         nickname = channel.get('BJ_NM') or channel.get('BJNICK') or nickname
         result_code = channel.get('RESULT', -1)
         if result_code == -6:
-            return {"streams": [], "isLive": False, "error": "19+成年直播间，请在设置中填入SOOP登录Cookie",
-                    "title": nickname, "avatar": avatar}
+            return {"streams": [], "isLive": False, "error": "19+成年直播间，请在设置中填入SOOP登录Cookie", "title": nickname, "avatar": avatar}
         if result_code not in [0, 1]:
             result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
@@ -1276,7 +1201,7 @@ async def parse_soop(url, cookie: str = ""):
         logging.exception("[SOOP] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
-# ==================== PandaTV ====================
+# ==================== PandaTV (已修复多层代理嵌套) ====================
 async def parse_panda_manual(url):
     try:
         cached = M3U8_CACHE.get(url)
@@ -1344,25 +1269,50 @@ async def parse_panda_manual(url):
             return u
         avatar = _fix_avatar_url(avatar)
 
+        # ---------- 修复：解包内层 IVS 地址，避免多层代理嵌套 ----------
+        inner_ivs_url = None
+        if 'sfkjwjfqqf55.us.ci' in real_m3u8 or '?url=' in real_m3u8:
+            try:
+                qs = parse_qs(urlparse(real_m3u8).query)
+                encoded_url = qs.get('url', [None])[0]
+                if encoded_url:
+                    inner_ivs_url = unquote(encoded_url)
+            except Exception:
+                pass
+
+        master_url = inner_ivs_url or real_m3u8
         streams = []
         try:
             cf_worker = CF_WORKER.rstrip("/") if CF_WORKER else ""
             if cf_worker:
-                fetch_url = f"{cf_worker}?url={quote(real_m3u8, safe='')}&referer={quote('https://www.pandalive.co.kr/', safe='')}"
+                fetch_url = f"{cf_worker}?url={quote(master_url, safe='')}&referer={quote('https://www.pandalive.co.kr/', safe='')}"
                 master_resp = await request_with_proxy_group("GET", fetch_url, proxy_list=[None],
                                                              headers={"User-Agent": UA}, shuffle_proxy=False,
                                                              log_tag="PandaTV-master")
             else:
-                master_resp = await request_with_proxy_group("GET", real_m3u8, proxy_list=proxylist,
+                master_resp = await request_with_proxy_group("GET", master_url, proxy_list=proxylist,
                                                              headers={"User-Agent": UA, "Referer": "https://www.pandalive.co.kr/",
                                                                       "Origin": "https://www.pandalive.co.kr"},
                                                              shuffle_proxy=False, log_tag="PandaTV-master")
             if master_resp.status_code == 200:
-                streams = parse_multivariant_m3u8(master_resp.text, real_m3u8, "PandaTV")
+                raw_streams = parse_multivariant_m3u8(master_resp.text, master_url, "PandaTV")
+                for s in raw_streams:
+                    final_url = s['url']
+                    if cf_worker:
+                        final_url = f"{cf_worker}?url={quote(s['url'], safe='')}&referer={quote('https://www.pandalive.co.kr/', safe='')}"
+                    streams.append({
+                        "cdn": s['cdn'],
+                        "url": final_url,
+                        "type": s['type']
+                    })
         except Exception:
             pass
         if not streams:
-            streams = [{"cdn": "PandaTV-Source", "url": real_m3u8, "type": "m3u8"}]
+            fallback_url = real_m3u8
+            if cf_worker:
+                fallback_url = f"{cf_worker}?url={quote(real_m3u8, safe='')}&referer={quote('https://www.pandalive.co.kr/', safe='')}"
+            streams = [{"cdn": "PandaTV-Source", "url": fallback_url, "type": "m3u8"}]
+        # ----------------------------------------------------------------
 
         result = {"streams": streams, "title": anchor_name, "avatar": avatar, "isLive": True}
         M3U8_CACHE[url] = {"data": result, "expire": time.time() + 15}
@@ -1431,9 +1381,6 @@ async def _parse_dispatch(url: str, cookie: str = ""):
 # ==================== 弹幕代理 ====================
 
 def _reset_go_service_check(mark_unavailable: bool = False):
-    """将 Go 服务探测时间戳清零，触发下次连接时重探。
-    用 helper 封装是为了让嵌套异步函数能修改全局变量而无需在内层写 global 声明
-    （Python 不允许 global 声明出现在赋值之后的同一作用域）。"""
     global _GO_SERVICE_AVAILABLE, _GO_SERVICE_LAST_CHECK
     _GO_SERVICE_LAST_CHECK = 0
     if mark_unavailable:
@@ -1449,7 +1396,7 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                 "method": "error",
                 "content": "弹幕服务暂时不可用，请稍后重试"
             }))
-            await websocket.close(code=1013)  # 1013 = Try Again Later
+            await websocket.close(code=1013)
         except Exception:
             pass
         return
@@ -1482,7 +1429,6 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
                             data = data.decode("utf-8")
                         await websocket.send_text(data)
                 except asyncio.TimeoutError:
-                    # 超时说明 Go 服务可能有问题，清零时间戳触发下次重探
                     _reset_go_service_check()
                     logging.warning(f"[WS] 从 Go 服务接收超时 (room={room_id})，关闭连接")
                 except Exception as e:
@@ -1502,7 +1448,6 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         logging.info(f"[WS] Go 服务连接已关闭 (room={room_id})")
         _reset_go_service_check()
     except OSError as e:
-        # Go 服务端口不可达（Connection refused 等），标记为不可用
         _reset_go_service_check(mark_unavailable=True)
         logging.warning(f"[WS] 抖音代理无法连接 Go 服务: {e}")
     except Exception as e:
@@ -1525,8 +1470,6 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
             await twitch_ws.send(f"NICK justinfan{random.randint(10000, 99999)}")
             await twitch_ws.send(f"JOIN #{channel_name.lower()}")
 
-            # 【修复3（Twitch WS泄漏）】参照抖音 WS 改用 create_task + FIRST_COMPLETED 模式，
-            # 避免 forward_to_frontend 里 break 后 listen_to_frontend 永久挂起导致连接泄漏。
             async def forward_to_frontend():
                 try:
                     async for msg in twitch_ws:
@@ -1538,7 +1481,7 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
                             try:
                                 await ws_conn.send_json({"type": "chat", "nick": m.group(1), "content": m.group(2)})
                             except Exception:
-                                break  # 前端已断开
+                                break
                 except Exception as e:
                     logging.debug(f"[Twitch WS] forward_to_frontend 异常: {e}")
 
@@ -1550,7 +1493,7 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
                             try:
                                 await ws_conn.send_text("pong")
                             except Exception:
-                                break  # 前端已断开
+                                break
                 except WebSocketDisconnect:
                     pass
                 except Exception as e:
