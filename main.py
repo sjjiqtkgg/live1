@@ -854,7 +854,9 @@ async def parse_douyu(url):
             params = base_params.copy()
             params['rate'] = str(rate_val)
             try:
-                await asyncio.sleep(0.2 * rate_val + random.uniform(0, 0.3))
+                # 小 jitter 错开并发请求，避免同一毫秒同时打到斗鱼接口触发风控，
+                # 但不再按画质梯度递增延迟（原 0.2*rate 导致标清慢 1s），整体解析更快
+                await asyncio.sleep(random.uniform(0, 0.15))
                 r = await request_with_retry("POST",
                     f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
                     headers=hdrs, data=params, timeout=10)
