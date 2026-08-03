@@ -613,17 +613,7 @@ async def fetch_huya_danmaku_params(room_id):
         ayyuid = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
         top_sid = int((re.search(r'"lChannelId":(\d+)', html) or [None, 0])[1])
         sub_sid = int((re.search(r'"lSubChannelId":(\d+)', html) or [None, 0])[1])
-        # 新增：提取 presenterUid（主播UID），小直播间弹幕订阅必须
-        presenter_uid = int((re.search(r'"lPresenterUid":(\d+)', html) or 
-                            re.search(r'"yyid":(\d+)', html) or 
-                            re.search(r'"presenter_uid":(\d+)', html) or [None, 0])[1])
-        return {
-            "platform": "huya",
-            "ayyuid": ayyuid,
-            "topSid": top_sid,
-            "subSid": sub_sid,
-            "presenterUid": presenter_uid
-        }
+        return {"platform": "huya", "ayyuid": ayyuid, "topSid": top_sid, "subSid": sub_sid}
     except Exception:
         return {}
 
