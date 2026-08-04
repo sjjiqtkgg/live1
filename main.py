@@ -1512,186 +1512,195 @@ async def websocket_huya_danmaku(websocket: WebSocket, room_id: str):
         outer = _pack_int(0, 1) + _pack_bytes(1, inner)
         return outer
 
-    def _read_tars_int(buf: bytes, pos: int):
-        """读取一个 Tars 字段头 + 整数值，返回 (tag, value, new_pos)"""
-        if pos >= len(buf):
-            return None, 0, pos
-        b = buf[pos]; pos += 1
-        t = (b >> 4) & 0xF
-        ty = b & 0xF
-        if t == 15:
-            if pos >= len(buf):
-                return None, 0, pos
-            t = buf[pos]; pos += 1
-        if ty == 12:
-            return t, 0, pos
-        elif ty == 0:
-            v = buf[pos]; pos += 1; return t, v, pos
-        elif ty == 1:
-            v = (buf[pos] << 8) | buf[pos+1]; pos += 2; return t, v, pos
-        elif ty == 2:
-            v = (buf[pos]<<24)|(buf[pos+1]<<16)|(buf[pos+2]<<8)|buf[pos+3]; pos += 4; return t, v, pos
-        elif ty == 3:
-            hi = (buf[pos]<<24)|(buf[pos+1]<<16)|(buf[pos+2]<<8)|buf[pos+3]; pos += 4
-            lo = (buf[pos]<<24)|(buf[pos+1]<<16)|(buf[pos+2]<<8)|buf[pos+3]; pos += 4
-            return t, hi * 4294967296 + (lo & 0xFFFFFFFF), pos
-        return t, 0, pos
-
     def parse_huya_tars(data: bytes):
         """
-        解析虎牙 Tars 弹幕包，返回 (nick, txt) 或 None
-        支持 cmd: 1400/1401/1402/1403/1404/1405/1411/1412
+        解析虎牙 Tars 弹幕包，返回 (nick, txt) 或 None。
+        逻辑完全对照前端 tarsReader 实现，避免字段偏移错误。
         """
         CHAT_CMDS = {1400, 1401, 1402, 1403, 1404, 1405, 1411, 1412}
+
+        class TarsReader:
+            def __init__(self, buf: bytes):
+                self.buf = buf if isinstance(buf, (bytes, bytearray)) else bytes(buf)
+                self.pos = 0
+
+            def _read_head(self):
+                if self.pos >= len(self.buf):
+                    return None, None
+                b = self.buf[self.pos]; self.pos += 1
+                tag = (b >> 4) & 0xF
+                ty  = b & 0xF
+                if tag == 15:
+                    if self.pos >= len(self.buf):
+                        return None, None
+                    tag = self.buf[self.pos]; self.pos += 1
+                return tag, ty
+
+            def _skip_field(self, ty):
+                b = self.buf
+                p = self.pos
+                if   ty == 0:  p += 1
+                elif ty == 1:  p += 2
+                elif ty == 2:  p += 4
+                elif ty == 3:  p += 8
+                elif ty == 4:  p += 4
+                elif ty == 5:  p += 8
+                elif ty == 6:  p += b[p] + 1
+                elif ty == 7:
+                    l = (b[p]<<24)|(b[p+1]<<16)|(b[p+2]<<8)|b[p+3]
+                    p += 4 + l
+                elif ty == 8:
+                    self.pos = p
+                    n = self._read_raw_int()
+                    for _ in range(2 * n):
+                        tg, t2 = self._read_head()
+                        if t2 is not None: self._skip_field(t2)
+                    return
+                elif ty == 9:
+                    self.pos = p
+                    n = self._read_raw_int()
+                    for _ in range(n):
+                        tg, t2 = self._read_head()
+                        if t2 is not None: self._skip_field(t2)
+                    return
+                elif ty == 10:
+                    self.pos = p
+                    self._skip_to_struct_end()
+                    return
+                elif ty == 13:
+                    self.pos = p
+                    self._read_head()  # sub-type
+                    n = self._read_raw_int()
+                    self.pos += n
+                    return
+                self.pos = p
+
+            def _read_raw_int(self):
+                tag, ty = self._read_head()
+                if ty is None: return 0
+                b = self.buf; p = self.pos
+                if ty == 12: return 0
+                elif ty == 0: v = b[p]; self.pos += 1; return v
+                elif ty == 1: v = (b[p]<<8)|b[p+1]; self.pos += 2; return v
+                elif ty == 2: v = (b[p]<<24)|(b[p+1]<<16)|(b[p+2]<<8)|b[p+3]; self.pos += 4; return v
+                elif ty == 3:
+                    hi = (b[p]<<24)|(b[p+1]<<16)|(b[p+2]<<8)|b[p+3]; self.pos += 4
+                    lo = (b[p+4]<<24)|(b[p+5]<<16)|(b[p+6]<<8)|b[p+7]; self.pos += 4
+                    return hi * 4294967296 + (lo & 0xFFFFFFFF)
+                return 0
+
+            def _skip_to_struct_end(self):
+                while self.pos < len(self.buf):
+                    tag, ty = self._read_head()
+                    if tag is None or ty == 11:
+                        return
+                    self._skip_field(ty)
+
+            def _seek_tag(self, want_tag):
+                """顺序查找指定 tag，返回 ty 或 None"""
+                while self.pos < len(self.buf):
+                    saved = self.pos
+                    tag, ty = self._read_head()
+                    if tag is None: return None
+                    if ty == 11: self.pos = saved; return None  # struct end
+                    if tag == want_tag: return ty
+                    if tag > want_tag: self.pos = saved; return None
+                    self._skip_field(ty)
+                return None
+
+            def read_int(self, want_tag):
+                ty = self._seek_tag(want_tag)
+                if ty is None: return 0
+                b = self.buf; p = self.pos
+                if ty == 12: return 0
+                elif ty == 0: v = b[p]; self.pos += 1; return v
+                elif ty == 1: v = (b[p]<<8)|b[p+1]; self.pos += 2; return v
+                elif ty == 2: v = (b[p]<<24)|(b[p+1]<<16)|(b[p+2]<<8)|b[p+3]; self.pos += 4; return v
+                else: self._skip_field(ty); return 0
+
+            def read_bytes(self, want_tag):
+                ty = self._seek_tag(want_tag)
+                if ty is None: return None
+                if ty != 13: self._skip_field(ty); return None
+                self._read_head()  # sub-type byte
+                n = self._read_raw_int()
+                data = self.buf[self.pos:self.pos+n]; self.pos += n
+                return data
+
+            def read_string(self, want_tag):
+                ty = self._seek_tag(want_tag)
+                if ty is None: return ''
+                b = self.buf; p = self.pos
+                if ty == 6:
+                    l = b[p]; self.pos += 1
+                elif ty == 7:
+                    l = (b[p]<<24)|(b[p+1]<<16)|(b[p+2]<<8)|b[p+3]; self.pos += 4
+                else:
+                    self._skip_field(ty); return ''
+                s = self.buf[self.pos:self.pos+l].decode('utf-8', errors='ignore')
+                self.pos += l
+                return s
+
+            def read_struct_begin(self, want_tag):
+                ty = self._seek_tag(want_tag)
+                return ty == 10  # struct begin marker
+
         try:
-            buf = data
-            pos = 0
-
-            # 外层：type=7 是 PushMessage
-            tag, val, pos = _read_tars_int(buf, pos)
-            if val != 7:
+            # ── 外层：PushMessage ──────────────────────────────────────────
+            r = TarsReader(data)
+            if r.read_int(0) != 7:
                 return None
 
-            # 读 bytes（tag=1）— 内层消息体
-            while pos < len(buf):
-                b = buf[pos]; ty = b & 0xF; tg = (b >> 4) & 0xF
-                if tg == 15:
-                    pos += 2; tg = buf[pos-1]
-                else:
-                    pos += 1
-                if tg == 1 and ty == 13:
-                    # bytes 字段
-                    pos += 1  # skip sub-type byte
-                    # 读长度
-                    _, n, pos = _read_tars_int(buf, pos)
-                    inner = buf[pos:pos+n]; pos += n
-                    break
-                else:
-                    # skip
-                    pos += 1
-            else:
+            inner = r.read_bytes(1)
+            if not inner:
                 return None
 
-            # 内层解析 cmd
-            ibuf = inner; ipos = 0
-            cmd = 0
-            body_bytes = None
-            nick_outer = ""
+            # ── 内层：WSPushMessage → 取 cmd 和 body ──────────────────────
+            r2 = TarsReader(inner)
+            r2.read_int(0)          # uri（跳过）
+            cmd = r2.read_int(1)
 
-            while ipos < len(ibuf):
-                if ipos >= len(ibuf):
-                    break
-                b = ibuf[ipos]; ty = b & 0xF; tg = (b >> 4) & 0xF
-                if tg == 15:
-                    ipos += 2; tg = ibuf[ipos-1]
-                else:
-                    ipos += 1
-
-                if tg == 0:  # uri/cmd type
-                    _, cmd_val, ipos = _read_tars_int(ibuf, ipos - (2 if tg >= 15 else 1))
-                    # 重新读，刚才已经移动了，直接读值
-                    if ty == 0: cmd = ibuf[ipos-1] if ipos > 0 else 0
-                    elif ty == 1: cmd = (ibuf[ipos-2]<<8)|ibuf[ipos-1]
-                    elif ty == 2: cmd = (ibuf[ipos-4]<<24)|(ibuf[ipos-3]<<16)|(ibuf[ipos-2]<<8)|ibuf[ipos-1]
-                elif tg == 1:  # cmd int
-                    if ty == 12: cmd = 0
-                    elif ty == 0: cmd = ibuf[ipos]; ipos += 1
-                    elif ty == 1: cmd = (ibuf[ipos]<<8)|ibuf[ipos+1]; ipos += 2
-                    elif ty == 2: cmd = (ibuf[ipos]<<24)|(ibuf[ipos+1]<<16)|(ibuf[ipos+2]<<8)|ibuf[ipos+3]; ipos += 4
-                elif tg == 2 and ty == 13:  # body bytes
-                    ipos += 1  # skip sub-type
-                    n = 0
-                    while ipos < len(ibuf):
-                        hb = ibuf[ipos]; hty = hb & 0xF; ipos += 1
-                        if hty == 12: n = 0; break
-                        elif hty == 0: n = ibuf[ipos]; ipos += 1; break
-                        elif hty == 1: n = (ibuf[ipos]<<8)|ibuf[ipos+1]; ipos += 2; break
-                        elif hty == 2: n = (ibuf[ipos]<<24)|(ibuf[ipos+1]<<16)|(ibuf[ipos+2]<<8)|ibuf[ipos+3]; ipos += 4; break
-                    body_bytes = ibuf[ipos:ipos+n]; ipos += n
-                    break
-                elif tg == 4 and (ty == 6 or ty == 7):  # nick string
-                    if ty == 6:
-                        l = ibuf[ipos]; ipos += 1
-                    else:
-                        l = (ibuf[ipos]<<24)|(ibuf[ipos+1]<<16)|(ibuf[ipos+2]<<8)|ibuf[ipos+3]; ipos += 4
-                    nick_outer = ibuf[ipos:ipos+l].decode("utf-8", errors="ignore"); ipos += l
-                else:
-                    # skip unknown field
-                    ipos += 1
-
-            if cmd not in CHAT_CMDS or not body_bytes:
-                if cmd >= 1400 and cmd < 1500 and cmd not in CHAT_CMDS:
+            if cmd not in CHAT_CMDS:
+                if 1400 <= cmd < 1500:
                     logging.debug(f"[虎牙弹幕] 未知cmd={cmd}")
                 return None
 
-            # 解析 MessageNotice body
-            mbuf = body_bytes; mpos = 0
-            nick = nick_outer
-            txt = ""
-
-            # 尝试从 SenderInfo struct (tag=0) 读昵称
-            while mpos < len(mbuf):
-                b = mbuf[mpos]; ty = b & 0xF; tg = (b >> 4) & 0xF
-                if tg == 15:
-                    mpos += 2; tg = mbuf[mpos-1]
-                else:
-                    mpos += 1
-
-                if tg == 0 and ty == 10:  # struct begin
-                    # 读 struct 内容找 tag=2（昵称）
-                    while mpos < len(mbuf):
-                        sb = mbuf[mpos]; sty = sb & 0xF; stg = (sb >> 4) & 0xF
-                        if stg == 15:
-                            mpos += 2; stg = mbuf[mpos-1]
-                        else:
-                            mpos += 1
-                        if sty == 11:  # struct end
-                            break
-                        if stg == 2 and (sty == 6 or sty == 7):
-                            if sty == 6:
-                                l = mbuf[mpos]; mpos += 1
-                            else:
-                                l = (mbuf[mpos]<<24)|(mbuf[mpos+1]<<16)|(mbuf[mpos+2]<<8)|mbuf[mpos+3]; mpos += 4
-                            s = mbuf[mpos:mpos+l].decode("utf-8", errors="ignore"); mpos += l
-                            if s: nick = s
-                        elif stg == 7 and (sty == 6 or sty == 7):  # userNick
-                            if sty == 6:
-                                l = mbuf[mpos]; mpos += 1
-                            else:
-                                l = (mbuf[mpos]<<24)|(mbuf[mpos+1]<<16)|(mbuf[mpos+2]<<8)|mbuf[mpos+3]; mpos += 4
-                            s = mbuf[mpos:mpos+l].decode("utf-8", errors="ignore"); mpos += l
-                            if s and not nick: nick = s
-                        else:
-                            mpos += 1
-                    break
-                else:
-                    mpos += 1
-
-            # 正文：依次尝试 tag3 → tag2 → tag1
-            for txt_tag in [3, 2, 1]:
-                mpos2 = 0
-                while mpos2 < len(mbuf):
-                    b = mbuf[mpos2]; ty = b & 0xF; tg = (b >> 4) & 0xF
-                    if tg == 15:
-                        mpos2 += 2; tg = mbuf[mpos2-1]
-                    else:
-                        mpos2 += 1
-                    if tg == txt_tag and (ty == 6 or ty == 7):
-                        if ty == 6:
-                            l = mbuf[mpos2]; mpos2 += 1
-                        else:
-                            l = (mbuf[mpos2]<<24)|(mbuf[mpos2+1]<<16)|(mbuf[mpos2+2]<<8)|mbuf[mpos2+3]; mpos2 += 4
-                        txt = mbuf[mpos2:mpos2+l].decode("utf-8", errors="ignore")
-                        break
-                    else:
-                        mpos2 += 1
-                if txt:
-                    break
-
-            if not txt or not txt.strip():
+            body = r2.read_bytes(2)
+            if not body:
                 return None
 
-            return nick or "虎牙网友", txt
+            nick_outer = r2.read_string(4)  # 旧协议昵称字段（部分消息有）
+
+            # ── MessageNotice body：取昵称和正文 ──────────────────────────
+            r3 = TarsReader(body)
+            nick = ''
+
+            # SenderInfo struct（tag=0）里取昵称
+            if r3.read_struct_begin(0):
+                r3.read_int(0)   # lUid
+                r3.read_int(1)   # lImId
+                sn = r3.read_string(2)
+                if sn: nick = sn
+                if not nick:
+                    un = r3.read_string(7)  # userNick（新协议）
+                    if un: nick = un
+                r3._skip_to_struct_end()
+
+            if not nick: nick = nick_outer
+
+            # 正文：依次尝试 tag3 → tag2 → tag1
+            txt = ''
+            for txt_tag in [3, 2, 1]:
+                r3b = TarsReader(body)  # 重新从头读，避免位置污染
+                t = r3b.read_string(txt_tag)
+                if t and t.strip():
+                    txt = t
+                    break
+
+            if not txt:
+                return None
+
+            return nick or '虎牙网友', txt
 
         except Exception as e:
             logging.debug(f"[虎牙弹幕] Tars 解析异常: {e}")
