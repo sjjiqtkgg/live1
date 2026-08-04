@@ -613,7 +613,7 @@ async def fetch_huya_danmaku_params(room_id):
         ayyuid = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
         top_sid = int((re.search(r'"lChannelId":(\d+)', html) or [None, 0])[1])
         sub_sid = int((re.search(r'"lSubChannelId":(\d+)', html) or [None, 0])[1])
-        return {"platform": "huya", "ayyuid": ayyuid, "topSid": top_sid, "subSid": sub_sid}
+        return {"platform": "huya", "roomId": room_id, "ayyuid": ayyuid, "topSid": top_sid, "subSid": sub_sid}
     except Exception:
         return {}
 
@@ -1414,6 +1414,364 @@ def _reset_go_service_check(mark_unavailable: bool = False):
     _GO_SERVICE_LAST_CHECK = 0
     if mark_unavailable:
         _GO_SERVICE_AVAILABLE = False
+
+@app.websocket("/ws/huya/{room_id}")
+async def websocket_huya_danmaku(websocket: WebSocket, room_id: str):
+    """
+    虎牙弹幕后端代理：
+    1. 从 m.huya.com 抓取 ayyuid/topSid/subSid
+    2. 连接 cdnws.api.huya.com，发送 Tars 注册包
+    3. 在后端解析 Tars 二进制，提取昵称和正文
+    4. 以 JSON 推给前端，前端无需任何 Tars 解析逻辑
+    """
+    await websocket.accept()
+
+    # 抓取弹幕参数
+    try:
+        resp = await request_with_retry(
+            "GET", f"https://m.huya.com/{room_id}",
+            headers={"User-Agent": MOBILE_UA, "Referer": "https://www.huya.com/"}
+        )
+        html = resp.text
+        ayyuid = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
+        top_sid = int((re.search(r'"lChannelId":(\d+)', html) or [None, 0])[1])
+        sub_sid = int((re.search(r'"lSubChannelId":(\d+)', html) or [None, 0])[1])
+    except Exception as e:
+        logging.warning(f"[虎牙弹幕] 抓取参数失败 room={room_id}: {e}")
+        try:
+            await websocket.send_text(json.dumps({"method": "error", "content": "获取弹幕参数失败"}))
+            await websocket.close(code=1013)
+        except Exception:
+            pass
+        return
+
+    if not ayyuid:
+        try:
+            await websocket.send_text(json.dumps({"method": "error", "content": "未获取到主播UID，弹幕不可用"}))
+            await websocket.close(code=1013)
+        except Exception:
+            pass
+        return
+
+    def _pack_int(tag: int, val: int) -> bytes:
+        """Tars 编码：整数"""
+        if val == 0:
+            return bytes([(tag << 4) | 12])
+        elif val <= 0xFF:
+            return bytes([(tag << 4) | 0, val & 0xFF])
+        elif val <= 0xFFFF:
+            return bytes([(tag << 4) | 1, (val >> 8) & 0xFF, val & 0xFF])
+        elif val <= 0xFFFFFFFF:
+            return bytes([(tag << 4) | 2,
+                          (val >> 24) & 0xFF, (val >> 16) & 0xFF,
+                          (val >> 8) & 0xFF, val & 0xFF])
+        else:
+            hi = (val >> 32) & 0xFFFFFFFF
+            lo = val & 0xFFFFFFFF
+            return bytes([(tag << 4) | 3,
+                          (hi >> 24) & 0xFF, (hi >> 16) & 0xFF,
+                          (hi >> 8) & 0xFF, hi & 0xFF,
+                          (lo >> 24) & 0xFF, (lo >> 16) & 0xFF,
+                          (lo >> 8) & 0xFF, lo & 0xFF])
+
+    def _pack_bool(tag: int, val: bool) -> bytes:
+        return _pack_int(tag, 1 if val else 0)
+
+    def _pack_str(tag: int, s: str) -> bytes:
+        b = s.encode("utf-8")
+        if len(b) <= 255:
+            return bytes([(tag << 4) | 6, len(b)]) + b
+        else:
+            return bytes([(tag << 4) | 7,
+                          (len(b) >> 24) & 0xFF, (len(b) >> 16) & 0xFF,
+                          (len(b) >> 8) & 0xFF, len(b) & 0xFF]) + b
+
+    def _pack_bytes(tag: int, data: bytes) -> bytes:
+        """Tars bytes 编码：type=13，子类型为 type=0（byte）"""
+        header = bytes([(tag << 4) | 13, 0])  # bytes container header
+        length = _pack_int(0, len(data))
+        return header + length + data
+
+    def _pack_struct(tag: int, body: bytes) -> bytes:
+        """Tars struct 编码：type=10 开始，type=11 结束"""
+        return bytes([(tag << 4) | 10]) + body + bytes([0x0B])
+
+    def build_join_packet(ayyuid: int, top_sid: int, sub_sid: int) -> bytes:
+        """构建虎牙弹幕注册包"""
+        ts = str(int(time.time() * 1000))
+        inner = (
+            _pack_int(0, ayyuid) +
+            _pack_bool(1, ayyuid == 0) +
+            _pack_str(2, f"web_{ts}") +
+            _pack_str(3, "") +
+            _pack_int(4, top_sid) +
+            _pack_int(5, sub_sid) +
+            _pack_int(6, ayyuid) +
+            _pack_int(7, 3)
+        )
+        outer = _pack_int(0, 1) + _pack_bytes(1, inner)
+        return outer
+
+    def _read_tars_int(buf: bytes, pos: int):
+        """读取一个 Tars 字段头 + 整数值，返回 (tag, value, new_pos)"""
+        if pos >= len(buf):
+            return None, 0, pos
+        b = buf[pos]; pos += 1
+        t = (b >> 4) & 0xF
+        ty = b & 0xF
+        if t == 15:
+            if pos >= len(buf):
+                return None, 0, pos
+            t = buf[pos]; pos += 1
+        if ty == 12:
+            return t, 0, pos
+        elif ty == 0:
+            v = buf[pos]; pos += 1; return t, v, pos
+        elif ty == 1:
+            v = (buf[pos] << 8) | buf[pos+1]; pos += 2; return t, v, pos
+        elif ty == 2:
+            v = (buf[pos]<<24)|(buf[pos+1]<<16)|(buf[pos+2]<<8)|buf[pos+3]; pos += 4; return t, v, pos
+        elif ty == 3:
+            hi = (buf[pos]<<24)|(buf[pos+1]<<16)|(buf[pos+2]<<8)|buf[pos+3]; pos += 4
+            lo = (buf[pos]<<24)|(buf[pos+1]<<16)|(buf[pos+2]<<8)|buf[pos+3]; pos += 4
+            return t, hi * 4294967296 + (lo & 0xFFFFFFFF), pos
+        return t, 0, pos
+
+    def parse_huya_tars(data: bytes):
+        """
+        解析虎牙 Tars 弹幕包，返回 (nick, txt) 或 None
+        支持 cmd: 1400/1401/1402/1403/1404/1405/1411/1412
+        """
+        CHAT_CMDS = {1400, 1401, 1402, 1403, 1404, 1405, 1411, 1412}
+        try:
+            buf = data
+            pos = 0
+
+            # 外层：type=7 是 PushMessage
+            tag, val, pos = _read_tars_int(buf, pos)
+            if val != 7:
+                return None
+
+            # 读 bytes（tag=1）— 内层消息体
+            while pos < len(buf):
+                b = buf[pos]; ty = b & 0xF; tg = (b >> 4) & 0xF
+                if tg == 15:
+                    pos += 2; tg = buf[pos-1]
+                else:
+                    pos += 1
+                if tg == 1 and ty == 13:
+                    # bytes 字段
+                    pos += 1  # skip sub-type byte
+                    # 读长度
+                    _, n, pos = _read_tars_int(buf, pos)
+                    inner = buf[pos:pos+n]; pos += n
+                    break
+                else:
+                    # skip
+                    pos += 1
+            else:
+                return None
+
+            # 内层解析 cmd
+            ibuf = inner; ipos = 0
+            cmd = 0
+            body_bytes = None
+            nick_outer = ""
+
+            while ipos < len(ibuf):
+                if ipos >= len(ibuf):
+                    break
+                b = ibuf[ipos]; ty = b & 0xF; tg = (b >> 4) & 0xF
+                if tg == 15:
+                    ipos += 2; tg = ibuf[ipos-1]
+                else:
+                    ipos += 1
+
+                if tg == 0:  # uri/cmd type
+                    _, cmd_val, ipos = _read_tars_int(ibuf, ipos - (2 if tg >= 15 else 1))
+                    # 重新读，刚才已经移动了，直接读值
+                    if ty == 0: cmd = ibuf[ipos-1] if ipos > 0 else 0
+                    elif ty == 1: cmd = (ibuf[ipos-2]<<8)|ibuf[ipos-1]
+                    elif ty == 2: cmd = (ibuf[ipos-4]<<24)|(ibuf[ipos-3]<<16)|(ibuf[ipos-2]<<8)|ibuf[ipos-1]
+                elif tg == 1:  # cmd int
+                    if ty == 12: cmd = 0
+                    elif ty == 0: cmd = ibuf[ipos]; ipos += 1
+                    elif ty == 1: cmd = (ibuf[ipos]<<8)|ibuf[ipos+1]; ipos += 2
+                    elif ty == 2: cmd = (ibuf[ipos]<<24)|(ibuf[ipos+1]<<16)|(ibuf[ipos+2]<<8)|ibuf[ipos+3]; ipos += 4
+                elif tg == 2 and ty == 13:  # body bytes
+                    ipos += 1  # skip sub-type
+                    n = 0
+                    while ipos < len(ibuf):
+                        hb = ibuf[ipos]; hty = hb & 0xF; ipos += 1
+                        if hty == 12: n = 0; break
+                        elif hty == 0: n = ibuf[ipos]; ipos += 1; break
+                        elif hty == 1: n = (ibuf[ipos]<<8)|ibuf[ipos+1]; ipos += 2; break
+                        elif hty == 2: n = (ibuf[ipos]<<24)|(ibuf[ipos+1]<<16)|(ibuf[ipos+2]<<8)|ibuf[ipos+3]; ipos += 4; break
+                    body_bytes = ibuf[ipos:ipos+n]; ipos += n
+                    break
+                elif tg == 4 and (ty == 6 or ty == 7):  # nick string
+                    if ty == 6:
+                        l = ibuf[ipos]; ipos += 1
+                    else:
+                        l = (ibuf[ipos]<<24)|(ibuf[ipos+1]<<16)|(ibuf[ipos+2]<<8)|ibuf[ipos+3]; ipos += 4
+                    nick_outer = ibuf[ipos:ipos+l].decode("utf-8", errors="ignore"); ipos += l
+                else:
+                    # skip unknown field
+                    ipos += 1
+
+            if cmd not in CHAT_CMDS or not body_bytes:
+                if cmd >= 1400 and cmd < 1500 and cmd not in CHAT_CMDS:
+                    logging.debug(f"[虎牙弹幕] 未知cmd={cmd}")
+                return None
+
+            # 解析 MessageNotice body
+            mbuf = body_bytes; mpos = 0
+            nick = nick_outer
+            txt = ""
+
+            # 尝试从 SenderInfo struct (tag=0) 读昵称
+            while mpos < len(mbuf):
+                b = mbuf[mpos]; ty = b & 0xF; tg = (b >> 4) & 0xF
+                if tg == 15:
+                    mpos += 2; tg = mbuf[mpos-1]
+                else:
+                    mpos += 1
+
+                if tg == 0 and ty == 10:  # struct begin
+                    # 读 struct 内容找 tag=2（昵称）
+                    while mpos < len(mbuf):
+                        sb = mbuf[mpos]; sty = sb & 0xF; stg = (sb >> 4) & 0xF
+                        if stg == 15:
+                            mpos += 2; stg = mbuf[mpos-1]
+                        else:
+                            mpos += 1
+                        if sty == 11:  # struct end
+                            break
+                        if stg == 2 and (sty == 6 or sty == 7):
+                            if sty == 6:
+                                l = mbuf[mpos]; mpos += 1
+                            else:
+                                l = (mbuf[mpos]<<24)|(mbuf[mpos+1]<<16)|(mbuf[mpos+2]<<8)|mbuf[mpos+3]; mpos += 4
+                            s = mbuf[mpos:mpos+l].decode("utf-8", errors="ignore"); mpos += l
+                            if s: nick = s
+                        elif stg == 7 and (sty == 6 or sty == 7):  # userNick
+                            if sty == 6:
+                                l = mbuf[mpos]; mpos += 1
+                            else:
+                                l = (mbuf[mpos]<<24)|(mbuf[mpos+1]<<16)|(mbuf[mpos+2]<<8)|mbuf[mpos+3]; mpos += 4
+                            s = mbuf[mpos:mpos+l].decode("utf-8", errors="ignore"); mpos += l
+                            if s and not nick: nick = s
+                        else:
+                            mpos += 1
+                    break
+                else:
+                    mpos += 1
+
+            # 正文：依次尝试 tag3 → tag2 → tag1
+            for txt_tag in [3, 2, 1]:
+                mpos2 = 0
+                while mpos2 < len(mbuf):
+                    b = mbuf[mpos2]; ty = b & 0xF; tg = (b >> 4) & 0xF
+                    if tg == 15:
+                        mpos2 += 2; tg = mbuf[mpos2-1]
+                    else:
+                        mpos2 += 1
+                    if tg == txt_tag and (ty == 6 or ty == 7):
+                        if ty == 6:
+                            l = mbuf[mpos2]; mpos2 += 1
+                        else:
+                            l = (mbuf[mpos2]<<24)|(mbuf[mpos2+1]<<16)|(mbuf[mpos2+2]<<8)|mbuf[mpos2+3]; mpos2 += 4
+                        txt = mbuf[mpos2:mpos2+l].decode("utf-8", errors="ignore")
+                        break
+                    else:
+                        mpos2 += 1
+                if txt:
+                    break
+
+            if not txt or not txt.strip():
+                return None
+
+            return nick or "虎牙网友", txt
+
+        except Exception as e:
+            logging.debug(f"[虎牙弹幕] Tars 解析异常: {e}")
+            return None
+
+    # 构建注册包
+    join_packet = build_join_packet(ayyuid, top_sid, sub_sid)
+    huya_ws_url = "wss://cdnws.api.huya.com"
+
+    try:
+        async with websockets.connect(
+            huya_ws_url,
+            ping_interval=None,
+            extra_headers={"User-Agent": UA, "Origin": "https://www.huya.com"}
+        ) as huya_ws:
+            # 发送注册包
+            await huya_ws.send(join_packet)
+            logging.info(f"[虎牙弹幕] 已连接 room={room_id} ayyuid={ayyuid} topSid={top_sid}")
+
+            async def forward_to_frontend():
+                try:
+                    while True:
+                        raw = await asyncio.wait_for(huya_ws.recv(), timeout=60)
+                        if isinstance(raw, str):
+                            continue
+                        result = parse_huya_tars(raw)
+                        if result:
+                            nick, txt = result
+                            await websocket.send_text(json.dumps(
+                                {"method": "danmaku", "nick": nick, "txt": txt},
+                                ensure_ascii=False
+                            ))
+                except asyncio.TimeoutError:
+                    logging.warning(f"[虎牙弹幕] 接收超时 room={room_id}")
+                except Exception as e:
+                    logging.debug(f"[虎牙弹幕] forward_to_frontend 异常: {e}")
+
+            async def heartbeat():
+                """虎牙 WS 心跳：每 60 秒发一次 ping"""
+                try:
+                    while True:
+                        await asyncio.sleep(60)
+                        hb = _pack_int(0, 2) + _pack_int(1, 1)
+                        await huya_ws.send(hb)
+                except Exception:
+                    pass
+
+            async def listen_frontend():
+                try:
+                    while True:
+                        data = await websocket.receive_text()
+                        if data == "ping":
+                            await websocket.send_text("pong")
+                except WebSocketDisconnect:
+                    pass
+                except Exception as e:
+                    logging.debug(f"[虎牙弹幕] listen_frontend 异常: {e}")
+
+            task_fe = asyncio.create_task(forward_to_frontend())
+            task_hb = asyncio.create_task(heartbeat())
+            task_ls = asyncio.create_task(listen_frontend())
+
+            done, pending = await asyncio.wait(
+                [task_fe, task_hb, task_ls],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    except Exception as e:
+        logging.warning(f"[虎牙弹幕] 连接异常 room={room_id}: {e}")
+    finally:
+        try:
+            if websocket.client_state.name == 'OPEN':
+                await websocket.close()
+        except Exception:
+            pass
+
 
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
