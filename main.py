@@ -610,10 +610,13 @@ async def fetch_huya_danmaku_params(room_id):
         resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
             headers={"User-Agent": MOBILE_UA, "Referer": "https://www.huya.com/"})
         html = resp.text
-        ayyuid = int((re.search(r'"lYyid":(\d+)', html) or re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
-        top_sid = int((re.search(r'"lChannelId":(\d+)', html) or [None, 0])[1])
-        sub_sid = int((re.search(r'"lSubChannelId":(\d+)', html) or [None, 0])[1])
-        return {"platform": "huya", "ayyuid": ayyuid, "topSid": top_sid, "subSid": sub_sid}
+        # 【SlotSun修复】uid 改用 streamDataGameLiveInfo["uid"] 字段，
+        # 原来用 lYyid（yySid）是错误的来源，导致小直播间弹幕不全
+        uid = int((re.search(r'"uid":(\d+)', html) or
+                   re.search(r'"lYyid":(\d+)', html) or
+                   re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
+        # 【SlotSun修复】topSid/subSid 不再传入注册包，改为 0
+        return {"platform": "huya", "uid": uid, "ayyuid": uid}
     except Exception:
         return {}
 
