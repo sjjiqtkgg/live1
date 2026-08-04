@@ -1704,8 +1704,7 @@ async def websocket_huya_danmaku(websocket: WebSocket, room_id: str):
     try:
         async with websockets.connect(
             huya_ws_url,
-            ping_interval=None,
-            extra_headers={"User-Agent": UA, "Origin": "https://www.huya.com"}
+            ping_interval=None
         ) as huya_ws:
             # 发送注册包
             await huya_ws.send(join_packet)
