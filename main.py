@@ -607,16 +607,32 @@ def parse_multivariant_m3u8(text, base_url, cdn_prefix):
 # ==================== 虎牙 ====================
 async def fetch_huya_danmaku_params(room_id):
     try:
-        resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
-            headers={"User-Agent": MOBILE_UA, "Referer": "https://www.huya.com/"})
-        html = resp.text
-        # 【SlotSun修复】uid 改用 streamDataGameLiveInfo["uid"] 字段，
-        # 原来用 lYyid（yySid）是错误的来源，导致小直播间弹幕不全
-        uid = int((re.search(r'"uid":(\d+)', html) or
-                   re.search(r'"lYyid":(\d+)', html) or
-                   re.search(r'ayyuid:\s*["\']?(\d+)', html) or [None, 0])[1])
-        # 【SlotSun修复】topSid/subSid 不再传入注册包，改为 0
-        return {"platform": "huya", "uid": uid, "ayyuid": uid}
+        # 【SlotSun修复】改用 PC 端 API 取 uid，与 parse_huya 同一数据源
+        # uid 来自 streamDataGameLiveInfo["uid"]，原来用 m.huya.com 的 lYyid 是错误字段
+        resp = await request_with_retry("GET",
+            f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}",
+            headers={"User-Agent": UA, "Referer": "https://www.huya.com/"})
+        data = resp.json()
+        if data.get("status") != 200:
+            return {}
+        live = data["data"]
+        profile_info = live.get("profileInfo", {})
+        live_data = live.get("liveData", {})
+
+        # uid 优先从 profileInfo/liveData 取 lUid，其次 uid，最后回退 lYyid
+        uid = int(
+            profile_info.get("lUid") or profile_info.get("uid") or
+            live_data.get("lUid") or live_data.get("uid") or
+            live_data.get("lYyid") or profile_info.get("lYyid") or 0
+        )
+
+        # topSid/subSid 保留作为备用（SlotSun 修复中 tag4/5 传 0，但保留字段以便前端判断）
+        top_sid = int((re.search(r'"lChannelId":(\d+)', str(live)) or [None, 0])[1])
+        sub_sid = int((re.search(r'"lSubChannelId":(\d+)', str(live)) or [None, 0])[1])
+
+        return {"platform": "huya", "uid": uid, "ayyuid": uid, "topSid": top_sid, "subSid": sub_sid}
+    except Exception:
+        return {}
     except Exception:
         return {}
 
