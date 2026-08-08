@@ -313,34 +313,13 @@ async def get_fixed_proxy_list(proxy_pool):
         start = next(cycle)
     return [proxy_pool[(start + i) % n] for i in range(n)]
 
-async def request_with_retry(method, url, **kwargs):
+async def _sequential_request(method, url, proxy_list, fail_log_prefix, timeout, log_tag, **kwargs):
+    """按顺序依次尝试 proxy_list 中的代理，成功即返回，全部失败则抛出最后一次异常。
+    request_with_retry 与 request_with_proxy_group 共用此骨架，二者原有的对外行为
+    （参数、异常类型、日志前缀、健康度记录）保持不变，只是把重复的循环体收敛到一处。
+    """
     last_error = None
-    timeout = kwargs.pop("timeout", 15)
-    log_tag = kwargs.pop("log_tag", None)
-    for proxy in PROXY_URLS:
-        try:
-            client = await get_client(proxy, timeout)
-            resp = await client.request(method, url, **kwargs)
-            _record_proxy_health(proxy, True, tag=log_tag)
-            return resp
-        except Exception as e:
-            _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
-            last_error = e
-            logging.warning(f"[请求重试]{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
-            await asyncio.sleep(0.5)
-    raise last_error or Exception("所有代理均失败")
-
-async def request_with_proxy_group(method, url, proxy_list, **kwargs):
-    last_error = None
-    timeout = kwargs.pop("timeout", 15)
-    shuffle_proxy = kwargs.pop("shuffle_proxy", False)
-    log_tag = kwargs.pop("log_tag", None)
-
-    targets = proxy_list[:]
-    if shuffle_proxy and targets:
-        random.shuffle(targets)
-
-    for proxy in targets:
+    for proxy in proxy_list:
         try:
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
@@ -351,9 +330,25 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
         except Exception as e:
             _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
             last_error = e
-            logging.warning(f"[分组请求]{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
+            logging.warning(f"{fail_log_prefix}{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
             await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
+
+async def request_with_retry(method, url, **kwargs):
+    timeout = kwargs.pop("timeout", 15)
+    log_tag = kwargs.pop("log_tag", None)
+    return await _sequential_request(method, url, PROXY_URLS, "[请求重试]", timeout, log_tag, **kwargs)
+
+async def request_with_proxy_group(method, url, proxy_list, **kwargs):
+    timeout = kwargs.pop("timeout", 15)
+    shuffle_proxy = kwargs.pop("shuffle_proxy", False)
+    log_tag = kwargs.pop("log_tag", None)
+
+    targets = proxy_list[:]
+    if shuffle_proxy and targets:
+        random.shuffle(targets)
+
+    return await _sequential_request(method, url, targets, "[分组请求]", timeout, log_tag, **kwargs)
 
 
 async def request_race(method, url, proxy_list, **kwargs):
@@ -631,8 +626,6 @@ async def fetch_huya_danmaku_params(room_id):
         sub_sid = int((re.search(r'"lSubChannelId":(\d+)', str(live)) or [None, 0])[1])
 
         return {"platform": "huya", "uid": uid, "ayyuid": uid, "topSid": top_sid, "subSid": sub_sid}
-    except Exception:
-        return {}
     except Exception:
         return {}
 
@@ -1183,6 +1176,12 @@ async def parse_soop(url, cookie: str = ""):
         nickname = f'BJ-{bj_id}'
         avatar = f'https://stimg.sooplive.com/LOGO/{bj_id[:2]}/{bj_id}/{bj_id}.jpg'
 
+        def _fail(nick, av):
+            """离线/失败场景的统一返回：写入退避缓存后返回空结果，行为与原来逐处内联代码完全一致。"""
+            result = {"streams": [], "isLive": False, "title": nick, "avatar": av}
+            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
+            return result
+
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={bj_id}'
         live_data_form = {
             'bid': bj_id, 'bno': '', 'type': '', 'pwd': '',
@@ -1193,9 +1192,7 @@ async def parse_soop(url, cookie: str = ""):
                                                    headers=headers_pc, data=live_data_form, shuffle_proxy=False,
                                                    log_tag="SOOP-live")
         if live_resp.status_code != 200:
-            result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
-            return result
+            return _fail(nickname, avatar)
         live_json = live_resp.json()
         channel = live_json.get('CHANNEL', {})
         nickname = channel.get('BJ_NM') or channel.get('BJNICK') or nickname
@@ -1204,15 +1201,11 @@ async def parse_soop(url, cookie: str = ""):
             return {"streams": [], "isLive": False, "error": "19+成年直播间，请在设置中填入SOOP登录Cookie",
                     "title": nickname, "avatar": avatar}
         if result_code not in [0, 1]:
-            result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
-            return result
+            return _fail(nickname, avatar)
 
         broad_no = channel.get('BNO', '')
         if not broad_no:
-            result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
-            return result
+            return _fail(nickname, avatar)
 
         ts_now = time.time()
         cdn_params = {
@@ -1227,15 +1220,11 @@ async def parse_soop(url, cookie: str = ""):
             proxy_list=proxylist, headers=headers_pc, params=cdn_params, shuffle_proxy=False,
             log_tag="SOOP-cdn")
         if cdn_resp.status_code != 200:
-            result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
-            return result
+            return _fail(nickname, avatar)
         cdn_json = cdn_resp.json()
         view_url = cdn_json.get('view_url')
         if not view_url:
-            result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
-            return result
+            return _fail(nickname, avatar)
 
         aid_form = live_data_form.copy()
         aid_form['type'] = 'aid'
@@ -1243,15 +1232,11 @@ async def parse_soop(url, cookie: str = ""):
                                                   headers=headers_pc, data=aid_form, shuffle_proxy=False,
                                                   log_tag="SOOP-aid")
         if aid_resp.status_code != 200:
-            result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
-            return result
+            return _fail(nickname, avatar)
         aid_json = aid_resp.json()
         aid = aid_json.get('CHANNEL', {}).get('AID', '')
         if not aid:
-            result = {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
-            M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
-            return result
+            return _fail(nickname, avatar)
 
         m3u8_url = f'{view_url}?aid={aid}'
         streams = []
