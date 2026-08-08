@@ -600,17 +600,13 @@ def parse_multivariant_m3u8(text, base_url, cdn_prefix):
     return streams
 
 # ==================== 虎牙 ====================
-async def fetch_huya_danmaku_params(room_id):
+def _extract_huya_danmaku_params(live):
+    """从 parse_huya 已经请求过的 mp.huya.com/cache.php 响应（live 对象）中提取弹幕连接参数，
+    不再重复发起 HTTP 请求。提取逻辑与原 fetch_huya_danmaku_params 完全一致。
+    """
     try:
         # 【SlotSun修复】改用 PC 端 API 取 uid，与 parse_huya 同一数据源
         # uid 来自 streamDataGameLiveInfo["uid"]，原来用 m.huya.com 的 lYyid 是错误字段
-        resp = await request_with_retry("GET",
-            f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}",
-            headers={"User-Agent": UA, "Referer": "https://www.huya.com/"})
-        data = resp.json()
-        if data.get("status") != 200:
-            return {}
-        live = data["data"]
         profile_info = live.get("profileInfo", {})
         live_data = live.get("liveData", {})
 
@@ -628,6 +624,7 @@ async def fetch_huya_danmaku_params(room_id):
         return {"platform": "huya", "uid": uid, "ayyuid": uid, "topSid": top_sid, "subSid": sub_sid}
     except Exception:
         return {}
+
 
 def huya_build_anticode(raw_anti, stream_name):
     anti = raw_anti.replace("&amp;", "&")
@@ -765,7 +762,7 @@ async def parse_huya(url):
             return quality_order.get(q_name, 99)
         streams.sort(key=sort_key)
 
-        danmaku = await fetch_huya_danmaku_params(room_id)
+        danmaku = _extract_huya_danmaku_params(live)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
     except Exception as e:
         logging.exception("[虎牙] 解析异常")
