@@ -1365,11 +1365,16 @@ async def api_follows_batch(request: Request):
     if len(items) > 30:
         raise HTTPException(400, "单次最多查询 30 个")
 
-    sem = asyncio.Semaphore(5)
+    # 国内平台（无需外网代理，通常很快）与国外平台（走外网代理，代理不稳时可能很慢）
+    # 分开各自的并发信号量，避免国外平台代理卡顿时占满共用名额，拖慢本该很快返回的国内平台查询
+    _FOREIGN_MARKERS = ("twitch.tv", "sooplive.com", "pandalive.co.kr")
+    sem_domestic = asyncio.Semaphore(5)
+    sem_foreign = asyncio.Semaphore(5)
 
     async def _one(item):
         url = item.get("url", "")
         cookie = item.get("cookie", "")
+        sem = sem_foreign if any(m in url for m in _FOREIGN_MARKERS) else sem_domestic
         async with sem:
             try:
                 result = await _parse_dispatch(url, cookie)
