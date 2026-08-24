@@ -1,5 +1,5 @@
 # ---- Stage 1: 从官方镜像提取 douyinLive 二进制 ----
-FROM ghcr.io/jwwsjlm/douyinlive:v2.2.0 AS douyinlive
+FROM ghcr.io/jwwsjlm/douyinlive:v2.2.1 AS douyinlive
 
 # ---- Stage 2: 构建我们的 Python 服务 ----
 FROM python:3.11-slim
