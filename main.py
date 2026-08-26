@@ -1500,7 +1500,6 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
     twitch_ws_url = "wss://irc-ws.chat.twitch.tv:443"
     try:
         async with websockets.connect(twitch_ws_url, ping_interval=30, ping_timeout=10) as twitch_ws:
-            await twitch_ws.send("CAP REQ :twitch.tv/tags twitch.tv/commands")
             await twitch_ws.send("PASS SCHMOOPIIE")
             await twitch_ws.send(f"NICK justinfan{random.randint(10000, 99999)}")
             await twitch_ws.send(f"JOIN #{channel_name.lower()}")
