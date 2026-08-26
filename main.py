@@ -1111,7 +1111,7 @@ async def parse_twitch(url, cookie: str = ""):
         if not token or not sig:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
 
-        m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true&allow_spectre=true&fast_bread=true&allow_ads=false"
+        m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true&allow_spectre=true&fast_bread=true&allow_ads=false&supported_codecs=av1,h265,h264&playlist_include_framerate=true"
         usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=proxylist,
                                                      headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"},
                                                      shuffle_proxy=False, log_tag="Twitch-m3u8")
@@ -1124,11 +1124,20 @@ async def parse_twitch(url, cookie: str = ""):
                 name = "source"
                 if "RESOLUTION=" in line:
                     name = line.split("RESOLUTION=")[1].split(",")[0].replace("x", "p")
+                # 标注编码格式：HEVC/AV1 编码的高画质档（比如2K/1440p60）不是所有浏览器都能直接解码播放，
+                # 标出来方便前端提示用户，或者未来做兼容性判断/回退
+                codec_suffix = ""
+                if "CODECS=" in line:
+                    codecs_val = line.split("CODECS=")[1].split('"')[1] if '"' in line.split("CODECS=")[1] else ""
+                    if "hev1" in codecs_val or "hvc1" in codecs_val:
+                        codec_suffix = "-HEVC"
+                    elif "av01" in codecs_val:
+                        codec_suffix = "-AV1"
                 if i+1 < len(lines):
                     sub_url = lines[i+1].strip()
                     if not sub_url.startswith("http"):
                         sub_url = urljoin(m3u8_url, sub_url)
-                    streams.append({"cdn": f"Twitch-{name}", "url": sub_url, "type": "m3u8"})
+                    streams.append({"cdn": f"Twitch-{name}{codec_suffix}", "url": sub_url, "type": "m3u8"})
         streams.sort(key=lambda s: (0 if "source" in s["cdn"] else 1, s["cdn"]))
         if not streams:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
@@ -1365,16 +1374,11 @@ async def api_follows_batch(request: Request):
     if len(items) > 30:
         raise HTTPException(400, "单次最多查询 30 个")
 
-    # 国内平台（无需外网代理，通常很快）与国外平台（走外网代理，代理不稳时可能很慢）
-    # 分开各自的并发信号量，避免国外平台代理卡顿时占满共用名额，拖慢本该很快返回的国内平台查询
-    _FOREIGN_MARKERS = ("twitch.tv", "sooplive.com", "pandalive.co.kr")
-    sem_domestic = asyncio.Semaphore(5)
-    sem_foreign = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(5)
 
     async def _one(item):
         url = item.get("url", "")
         cookie = item.get("cookie", "")
-        sem = sem_foreign if any(m in url for m in _FOREIGN_MARKERS) else sem_domestic
         async with sem:
             try:
                 result = await _parse_dispatch(url, cookie)
