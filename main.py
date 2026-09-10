@@ -1129,7 +1129,7 @@ async def parse_twitch(url, cookie: str = ""):
                 gql_headers["Cookie"] = eff_cookie
             gql_url = "https://gql.twitch.tv/gql"
             payload = [{"operationName": "PlaybackAccessToken",
-                         "variables": {"login": channel, "playerType": "site"},
+                         "variables": {"login": channel, "playerType": "embed"},
                          "query": "query PlaybackAccessToken($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: { platform: \"web\", playerType: $playerType, playerBackend: \"mediaplayer\" }) { value signature } }"}]
             try:
                 resp = await request_with_proxy_group("POST", gql_url, proxy_list=proxylist, json=payload,
