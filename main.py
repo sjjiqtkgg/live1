@@ -658,9 +658,6 @@ def _extract_huya_danmaku_params(live):
             live_data.get("lYyid") or profile_info.get("lYyid") or 0
         )
 
-        # topSid/subSid 保留作为备用（SlotSun 修复中 tag4/5 传 0，但保留字段以便前端判断）
-        top_sid = int((re.search(r'"lChannelId":(\d+)', str(live)) or [None, 0])[1])
-        sub_sid = int((re.search(r'"lSubChannelId":(\d+)', str(live)) or [None, 0])[1])
 
         return {"platform": "huya", "uid": uid, "ayyuid": uid, "topSid": top_sid, "subSid": sub_sid}
     except Exception:
