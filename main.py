@@ -186,6 +186,37 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
+# ==================== 安全配置（环境变量，均向后兼容） ====================
+# 【P1修复-CVE-2026-48710】允许的 Host 头白名单，未配置则不校验（保留原行为）。
+# 缓解 Starlette < 1.0.1 的 BadHost 认证绕过漏洞；同时建议升级 starlette>=1.0.1。
+ALLOWED_HOSTS = [h.strip().lower() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()]
+
+# 【P1修复】WebSocket 握手的 Origin 白名单，未配置则不校验（保留原行为）。
+# 例：ALLOWED_WS_ORIGINS=https://your-domain.com,http://localhost:8000
+ALLOWED_WS_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_WS_ORIGINS", "").split(",") if o.strip()]
+
+# 【P1修复】TS 切片单次响应体最大字节数，防止恶意上游返回超大文件耗尽带宽。
+MAX_TS_SIZE = int(os.getenv("MAX_TS_SIZE", str(20 * 1024 * 1024)))  # 默认 20MB
+
+if ALLOWED_HOSTS:
+    logging.info(f"[安全] Host 白名单已启用: {ALLOWED_HOSTS}")
+if ALLOWED_WS_ORIGINS:
+    logging.info(f"[安全] WebSocket Origin 白名单已启用: {ALLOWED_WS_ORIGINS}")
+logging.info(f"[安全] TS 切片大小上限: {MAX_TS_SIZE} 字节")
+
+@app.middleware("http")
+async def host_header_guard(request: Request, call_next):
+    """【P1修复-CVE-2026-48710】Host 头规范化校验。
+    仅当配置了 ALLOWED_HOSTS 时生效，避免影响原有部署。
+    """
+    if ALLOWED_HOSTS:
+        raw_host = request.headers.get("host", "")
+        host = raw_host.split(":")[0].strip().lower()
+        if host and host not in ALLOWED_HOSTS:
+            logging.warning(f"[安全] 拒绝非法 Host 头: {raw_host!r}")
+            return JSONResponse({"error": "invalid host header"}, status_code=400)
+    return await call_next(request)
+
 def get_real_ip(request: Request) -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
@@ -536,15 +567,25 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         return Response(content=body_out, status_code=resp.status_code, headers=out_headers)
 
     if is_ts:
+        # 【P1修复】流式转发时增加响应体大小上限，防止恶意上游返回超大文件耗尽带宽/内存
         async def _stream_and_close():
+            total = 0
+            truncated = False
             try:
                 async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_TS_SIZE:
+                        truncated = True
+                        logging.warning(f"[代理] TS 切片超过 {MAX_TS_SIZE} 字节，提前截断: {_short_url(url)}")
+                        break
                     yield chunk
             finally:
                 try:
                     await resp.aclose()
                 except Exception:
                     pass
+                if truncated:
+                    logging.info(f"[代理] TS 截断完成，共转发 {total} 字节")
 
         return StreamingResponse(
             _stream_and_close(),
@@ -1421,8 +1462,26 @@ def _reset_go_service_check(mark_unavailable: bool = False):
     if mark_unavailable:
         _GO_SERVICE_AVAILABLE = False
 
+def _ws_origin_allowed(websocket: WebSocket) -> bool:
+    """【P1修复】校验 WebSocket 握手的 Origin 头。
+    - 未配置 ALLOWED_WS_ORIGINS 时放行，保持向后兼容。
+    - 非浏览器客户端（无 Origin 头，如 App/脚本）放行，避免误伤。
+    """
+    if not ALLOWED_WS_ORIGINS:
+        return True
+    origin = websocket.headers.get("origin", "")
+    if not origin:
+        return True
+    return origin in ALLOWED_WS_ORIGINS
+
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
+    # 【P1修复】WebSocket Origin 校验（未配置 ALLOWED_WS_ORIGINS 时不校验）
+    if not _ws_origin_allowed(websocket):
+        logging.warning(f"[WS] 抖音弹幕拒绝非法 Origin: {websocket.headers.get('origin')!r}")
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
 
     if not await _check_go_service():
@@ -1496,6 +1555,12 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
 
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
+    # 【P1修复】WebSocket Origin 校验（未配置 ALLOWED_WS_ORIGINS 时不校验）
+    if not _ws_origin_allowed(ws_conn):
+        logging.warning(f"[Twitch WS] 拒绝非法 Origin: {ws_conn.headers.get('origin')!r}")
+        await ws_conn.close(code=1008)
+        return
+
     await ws_conn.accept()
     twitch_ws_url = "wss://irc-ws.chat.twitch.tv:443"
     try:
