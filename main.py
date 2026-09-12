@@ -538,12 +538,13 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     # 【A3修复】原来用 request_with_proxy_group（底层 client.request）会在这里就把
     # 整个响应体读进内存，is_ts 分支的 MAX_TS_SIZE 截断只是"读完之后"才生效，起不到
     # 限制内存的作用。改用真正的流式请求，内容留到下面各分支按需读取/转发。
+    # 注：此处不传 log_tag，避免每个 TS 切片都打一条 INFO（量太大）。
+    # 失败路径的 warning 在 stream_request_with_proxy_group 内部无条件打印，不受影响。
     resp = await stream_request_with_proxy_group(
         request.method, url,
         proxy_list=proxies_to_use,
         headers=headers, content=body,
         shuffle_proxy=shuffle_proxy,
-        log_tag="代理转发",
     )
     content_type = resp.headers.get("content-type", "")
     is_m3u8 = "mpegurl" in content_type.lower() or url.split("?")[0].endswith(".m3u8")
