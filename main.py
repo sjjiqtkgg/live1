@@ -659,7 +659,10 @@ def _extract_huya_danmaku_params(live):
         )
 
 
-        return {"platform": "huya", "uid": uid, "ayyuid": uid, "topSid": top_sid, "subSid": sub_sid}
+        # 【修复】原代码引用了从未赋值的 top_sid/sub_sid，导致每次调用必然抛 NameError，
+        # 被外层 except 吞掉后 danmaku 变成 {}，前端 validate() 失败，弹幕从未真正启动。
+        # 前端已不再使用 topSid/subSid（改用 tag0/6=uid 注册），故直接移除这两个字段。
+        return {"platform": "huya", "uid": uid, "ayyuid": uid}
     except Exception:
         return {}
 
@@ -966,10 +969,15 @@ async def parse_bilibili(url):
                             m = re.search(r"([a-z0-9]+)\.bilivideo", info["host"])
                             streams.append({"cdn": f"{fmt['format_name'].upper()}-{m.group(1) if m else 'cdn'}",
                                            "url": u, "type": "flv" if fmt["format_name"] == "flv" else "m3u8"})
-        streams.sort(key=lambda x: 0 if x["type"] == "flv" else 1)
         if not streams:
             return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
-        return {"streams": streams[:4], "title": name, "avatar": avatar, "isLive": True}
+        # 【修复】原先 flv 优先排序 + 全局截断前4条：如果同一画质有多个 flv CDN 镜像，
+        # 会把仅以 m3u8/hevc 提供的高画质流（如4K）挤出结果。改为按类型分别截断，
+        # 保证 flv 和 m3u8 各自都有代表进入最终列表，而不是被 flv 镜像数量顶掉。
+        flv_streams = [s for s in streams if s["type"] == "flv"][:3]
+        m3u8_streams = [s for s in streams if s["type"] != "flv"][:3]
+        streams = flv_streams + m3u8_streams
+        return {"streams": streams[:6], "title": name, "avatar": avatar, "isLive": True}
     except Exception as e:
         logging.exception("[B站] 解析异常")
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
