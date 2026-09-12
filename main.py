@@ -262,6 +262,9 @@ else:
 CLIENT_POOL: dict = {}
 CLIENT_LOCK = asyncio.Lock()
 DEFAULT_TIMEOUT = 15
+# 【A4】TLS 校验做成可配置：默认关闭（行为不变，兼容个别证书有问题的 CDN），
+# 生产环境可设 VERIFY_TLS=1 一键开回校验。
+VERIFY_TLS = os.getenv("VERIFY_TLS", "0") == "1"
 
 async def get_client(proxy=None, timeout=None):
     if timeout is None:
@@ -282,7 +285,7 @@ async def get_client(proxy=None, timeout=None):
             timeout=timeout,
             proxy=proxy,
             http2=True,
-            verify=False,
+            verify=VERIFY_TLS,
             limits=httpx.Limits(
                 max_connections=100,
                 max_keepalive_connections=20
@@ -350,7 +353,8 @@ async def _sequential_request(method, url, proxy_list, fail_log_prefix, timeout,
     （参数、异常类型、日志前缀、健康度记录）保持不变，只是把重复的循环体收敛到一处。
     """
     last_error = None
-    for proxy in proxy_list:
+    last_index = len(proxy_list) - 1
+    for i, proxy in enumerate(proxy_list):
         try:
             client = await get_client(proxy, timeout)
             resp = await client.request(method, url, **kwargs)
@@ -362,7 +366,9 @@ async def _sequential_request(method, url, proxy_list, fail_log_prefix, timeout,
             _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
             last_error = e
             logging.warning(f"{fail_log_prefix}{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
-            await asyncio.sleep(0.5)
+            # 【A1修复】最后一个代理失败后即将 raise，没必要再多睡 0.5 秒
+            if i != last_index:
+                await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
 
 async def request_with_retry(method, url, **kwargs):
@@ -380,6 +386,38 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
         random.shuffle(targets)
 
     return await _sequential_request(method, url, targets, "[分组请求]", timeout, log_tag, **kwargs)
+
+
+async def stream_request_with_proxy_group(method, url, proxy_list, headers=None, content=None,
+                                           shuffle_proxy=False, timeout=15, log_tag=None):
+    """【A3修复】与 request_with_proxy_group 相同的代理选择/重试逻辑，
+    但用 client.send(..., stream=True) 拿到真正的流式 httpx.Response，
+    响应体不会在这里被整体读入内存——内容留到调用方按需 aiter_bytes()/aread()。
+    专用于 api_proxy 转发直播 TS/FLV 等大体积内容；调用方用完必须自行 await resp.aclose()。
+    普通 JSON/API 调用（request_with_retry 等）体量小，不受此项影响，无需改动。
+    """
+    proxies = proxy_list[:] if proxy_list else [None]
+    if shuffle_proxy and proxies:
+        random.shuffle(proxies)
+
+    last_error = None
+    last_index = len(proxies) - 1
+    for i, proxy in enumerate(proxies):
+        try:
+            client = await get_client(proxy, timeout)
+            req = client.build_request(method, url, headers=headers, content=content)
+            resp = await client.send(req, stream=True)
+            _record_proxy_health(proxy, True, tag=log_tag)
+            if log_tag:
+                logging.info(f"[{log_tag}] {proxy or '直连'} → HTTP {resp.status_code} {_short_url(url)}（流式）")
+            return resp
+        except Exception as e:
+            _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
+            last_error = e
+            logging.warning(f"[流式代理]{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
+            if i != last_index:
+                await asyncio.sleep(0.5)
+    raise last_error or Exception("所有代理均失败（流式）")
 
 
 async def request_race(method, url, proxy_list, **kwargs):
@@ -497,16 +535,25 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         proxies_to_use = proxy_list
         shuffle_proxy = True
 
-    resp = await request_with_proxy_group(
+    # 【A3修复】原来用 request_with_proxy_group（底层 client.request）会在这里就把
+    # 整个响应体读进内存，is_ts 分支的 MAX_TS_SIZE 截断只是"读完之后"才生效，起不到
+    # 限制内存的作用。改用真正的流式请求，内容留到下面各分支按需读取/转发。
+    resp = await stream_request_with_proxy_group(
         request.method, url,
         proxy_list=proxies_to_use,
         headers=headers, content=body,
-        shuffle_proxy=shuffle_proxy
+        shuffle_proxy=shuffle_proxy,
+        log_tag="代理转发",
     )
     content_type = resp.headers.get("content-type", "")
     is_m3u8 = "mpegurl" in content_type.lower() or url.split("?")[0].endswith(".m3u8")
 
     if is_m3u8:
+        # m3u8 文本体积很小，安全地一次性读完再处理（不是我们要防的大体积场景）
+        try:
+            await resp.aread()
+        finally:
+            await resp.aclose()
         base_url = url.rsplit("/", 1)[0] + "/"
         parsed_cdn = urlparse(url)
         cdn_origin = f"{parsed_cdn.scheme}://{parsed_cdn.netloc}"
@@ -595,8 +642,30 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
                 "Content-Type": content_type or "video/mp2t"
             }
         )
+    # 【A3修复】原来的 resp.content 需要先整包读完才能拿到值，本质上和 is_ts 分支
+    # 同样的问题；这里也改成真正的边读边转发，同样套用 MAX_TS_SIZE 上限防御
+    # （这条路径理论上不该承载直播流量，但作为兜底防线，上限保持一致）。
+    async def _stream_and_close_fallback():
+        total = 0
+        truncated = False
+        try:
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > MAX_TS_SIZE:
+                    truncated = True
+                    logging.warning(f"[代理] 响应体超过 {MAX_TS_SIZE} 字节，提前截断: {_short_url(url)}")
+                    break
+                yield chunk
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            if truncated:
+                logging.info(f"[代理] 兜底分支截断完成，共转发 {total} 字节")
+
     out_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": content_type or "application/json"}
-    return StreamingResponse(iter([resp.content]), status_code=resp.status_code, headers=out_headers)
+    return StreamingResponse(_stream_and_close_fallback(), status_code=resp.status_code, headers=out_headers)
 
 
 def build_streams(flv, m3u8):
@@ -1030,15 +1099,6 @@ async def parse_douyin(url):
         streams.sort(key=lambda s: quality_order.get(s["cdn"].replace("抖音-", ""), 99))
 
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
-        if not room_id.isdigit():
-            try:
-                resp = await request_with_retry("GET", url, headers={"User-Agent": UA})
-                match = re.search(r'"room_id":"(\d+)"', resp.text)
-                if match:
-                    room_id = match.group(1)
-            except Exception:
-                pass
-
         avatar = ""
 
         def find_avatar_in_dict(d, depth=0):
@@ -1067,13 +1127,24 @@ async def parse_douyin(url):
         except Exception:
             pass
 
-        if not avatar:
+        # 【A2修复】原来 room_id 兜底和头像兜底各自 GET 一次同一个页面 url，
+        # 合并成一次请求，同时正则 room_id 和 RENDER_DATA。数字房间号+头像已齐全
+        # 的常见路径完全不受影响（下面这段直接跳过）。
+        need_room_id = not room_id.isdigit()
+        need_avatar_fallback = not avatar
+        if need_room_id or need_avatar_fallback:
             try:
                 resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
-                m_render = re.search(r'<script id="RENDER_DATA" type="application/json">([^<]+)</script>', resp.text)
-                if m_render:
-                    render_json = json.loads(unquote(m_render.group(1)))
-                    avatar = find_avatar_in_dict(render_json) or ""
+                page_text = resp.text
+                if need_room_id:
+                    match = re.search(r'"room_id":"(\d+)"', page_text)
+                    if match:
+                        room_id = match.group(1)
+                if need_avatar_fallback:
+                    m_render = re.search(r'<script id="RENDER_DATA" type="application/json">([^<]+)</script>', page_text)
+                    if m_render:
+                        render_json = json.loads(unquote(m_render.group(1)))
+                        avatar = find_avatar_in_dict(render_json) or avatar
             except Exception:
                 pass
 
