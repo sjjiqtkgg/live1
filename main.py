@@ -1771,6 +1771,10 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str):
 
     await ws_conn.accept()
     try:
+        # 【18+房间修复】跟 parse_soop 的视频流一样，SOOP 的 18+ 认证房间需要登录态 cookie
+        # 才能拿到完整的 CHANNEL 信息/聊天权限；之前这里完全没传 cookie，普通房间能连、
+        # 18+ 房间要么 CHATNO 拿不到要么连上也收不到真实弹幕。
+        eff_cookie = ws_conn.query_params.get('cookie', '') or SOOP_COOKIE
         # 第一步：拿 CHANNEL 元数据（跟 parse_soop 用的是同一个接口），
         # 提取弹幕连接需要的 CHATNO / CHDOMAIN(或CHIP) / CHPT
         headers_pc = {
@@ -1779,6 +1783,8 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str):
             'origin': 'https://play.sooplive.com',
             'referer': 'https://play.sooplive.com',
         }
+        if eff_cookie:
+            headers_pc['cookie'] = eff_cookie
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={room_id}'
         live_data_form = {
             'bid': room_id, 'bno': '', 'type': '', 'pwd': '',
