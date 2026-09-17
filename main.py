@@ -1366,7 +1366,8 @@ async def parse_soop(url, cookie: str = ""):
         if not streams:
             streams = [{"cdn": "SOOP-Source", "url": m3u8_url, "type": "m3u8"}]
 
-        result = {"streams": streams, "title": nickname, "avatar": avatar, "isLive": True}
+        result = {"streams": streams, "title": nickname, "avatar": avatar, "isLive": True,
+                   "danmaku": {"platform": "soop", "roomId": bj_id}}
         _soop_reset_offline(bj_id)
         M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + 15}
         return result
@@ -1630,6 +1631,72 @@ async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
         except Exception:
             pass
 
+_SOOP_ESC = b'\x1b\x09'
+_SOOP_F = b'\x0c'
+
+
+def _soop_build_frame(service: int, body: bytes) -> bytes:
+    """SOOP 弹幕帧格式：ESC(2字节) + service(4位ASCII数字) + bodyLength(6位ASCII数字) + 填充(2字节'00') + body"""
+    header = _SOOP_ESC + f"{service:04d}".encode("ascii") + f"{len(body):06d}".encode("ascii") + b"00"
+    return header + body
+
+
+def _soop_connect_packet() -> bytes:
+    """握手包：service=1，body 固定为 3 个分隔符 + "16" + 1 个分隔符（来自实际抓包，含义未知但必需）"""
+    body = _SOOP_F * 3 + b"16" + _SOOP_F
+    return _soop_build_frame(1, body)
+
+
+def _soop_join_packet(chat_no: str) -> bytes:
+    """加入聊天室包：service=2，body = 分隔符 + chatNo + 5个分隔符"""
+    chat_no_bytes = chat_no.encode("utf-8")
+    body = _SOOP_F + chat_no_bytes + _SOOP_F * 5
+    return _soop_build_frame(2, body)
+
+
+def _soop_heartbeat_packet() -> bytes:
+    """心跳包：service=0，body 为单个分隔符字节"""
+    return _soop_build_frame(0, _SOOP_F)
+
+
+def _soop_parse_frames(data: bytes):
+    """从原始二进制数据中切出 (service, body) 帧列表。头部固定 14 字节：
+    ESC(2) + service(4位ASCII) + bodyLength(6位ASCII) + 填充(2字节)。"""
+    frames = []
+    offset = 0
+    header_len = 14
+    while offset + header_len <= len(data):
+        if data[offset:offset + 2] != _SOOP_ESC:
+            break
+        try:
+            service = int(data[offset + 2:offset + 6].decode("ascii", errors="ignore"))
+            body_len = int(data[offset + 6:offset + 12].decode("ascii", errors="ignore"))
+        except ValueError:
+            break
+        if body_len < 0:
+            break
+        packet_end = offset + header_len + body_len
+        if packet_end > len(data):
+            break
+        frames.append((service, data[offset + header_len:packet_end]))
+        offset = packet_end
+    return frames
+
+
+def _soop_decode_chat(body: bytes):
+    """service==5 的弹幕包：按 0x0c 分隔符切字段，fields[1]=正文，fields[6]=昵称。
+    过滤空消息/系统消息（正文为 '-1' 或 '1'）/含 '|' 的控制消息。"""
+    parts = body.split(_SOOP_F)
+    fields = [p.decode("utf-8", errors="ignore") for p in parts]
+    if len(fields) <= 6:
+        return None
+    comment = fields[1].strip()
+    nick = fields[6].strip()
+    if not comment or not nick or comment in ("-1", "1") or "|" in comment:
+        return None
+    return nick, comment
+
+
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
     # 【P1修复】WebSocket Origin 校验（未配置 ALLOWED_WS_ORIGINS 时不校验）
@@ -1693,6 +1760,143 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
             await ws_conn.close()
         except Exception:
             pass
+
+@app.websocket("/ws/soop/{room_id}")
+async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str):
+    # 【安全】WebSocket Origin 校验（未配置 ALLOWED_WS_ORIGINS 时不校验）
+    if not _ws_origin_allowed(ws_conn):
+        logging.warning(f"[SOOP WS] 拒绝非法 Origin: {ws_conn.headers.get('origin')!r}")
+        await ws_conn.close(code=1008)
+        return
+
+    await ws_conn.accept()
+    try:
+        # 第一步：拿 CHANNEL 元数据（跟 parse_soop 用的是同一个接口），
+        # 提取弹幕连接需要的 CHATNO / CHDOMAIN(或CHIP) / CHPT
+        headers_pc = {
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+            'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'origin': 'https://play.sooplive.com',
+            'referer': 'https://play.sooplive.com',
+        }
+        live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={room_id}'
+        live_data_form = {
+            'bid': room_id, 'bno': '', 'type': '', 'pwd': '',
+            'player_type': 'html5', 'stream_type': 'common', 'quality': 'master',
+            'mode': 'landing', 'from_api': '0', 'is_revive': 'false',
+        }
+        proxylist = await get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
+        live_resp = await request_with_proxy_group("POST", live_api, proxy_list=proxylist,
+                                                     headers=headers_pc, data=live_data_form, shuffle_proxy=False,
+                                                     log_tag="SOOP-danmaku-meta")
+        channel = live_resp.json().get('CHANNEL', {})
+        chat_no = str(channel.get('CHATNO', '')).strip()
+        if not chat_no:
+            await ws_conn.send_json({"type": "error", "message": "SOOP 聊天室号获取失败"})
+            await ws_conn.close()
+            return
+
+        # 【注意】CHPT 是明文 WS 端口，实际 WSS 连接要 +1，否则握手会卡死超时而不是直接报错
+        host = str(channel.get('CHDOMAIN', '') or '').strip()
+        if not host:
+            raw_ip = str(channel.get('CHIP', '') or '').strip()
+            octets = raw_ip.split('.')
+            if len(octets) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
+                encoded = ''.join(f'{int(o):02X}' for o in octets)
+                host = f'chat-{encoded}.sooplive.com'
+        try:
+            plain_port = int(channel.get('CHPT', 0))
+        except (ValueError, TypeError):
+            plain_port = 0
+        if not host or plain_port <= 0 or plain_port >= 65535:
+            await ws_conn.send_json({"type": "error", "message": "SOOP 弹幕连接地址解析失败"})
+            await ws_conn.close()
+            return
+
+        soop_ws_url = f"wss://{host}:{plain_port + 1}/Websocket/{room_id}"
+        ws_headers = {
+            "Origin": "https://play.sooplive.co.kr",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        }
+
+        try:
+            soop_ws_ctx = websockets.connect(
+                soop_ws_url, subprotocols=["chat"], additional_headers=ws_headers,
+                ping_interval=None, open_timeout=10,
+            )
+        except TypeError:
+            # 旧版本 websockets 库参数名是 extra_headers，不是 additional_headers
+            soop_ws_ctx = websockets.connect(
+                soop_ws_url, subprotocols=["chat"], extra_headers=ws_headers,
+                ping_interval=None, open_timeout=10,
+            )
+
+        async with soop_ws_ctx as soop_ws:
+            await soop_ws.send(_soop_connect_packet())
+            await asyncio.sleep(0.2)
+            await soop_ws.send(_soop_join_packet(chat_no))
+
+            async def heartbeat():
+                try:
+                    while True:
+                        await asyncio.sleep(20)
+                        await soop_ws.send(_soop_heartbeat_packet())
+                except Exception:
+                    pass
+
+            async def forward_to_frontend():
+                try:
+                    async for msg in soop_ws:
+                        if isinstance(msg, str):
+                            continue  # SOOP 弹幕走二进制帧，文本消息忽略
+                        for service, body in _soop_parse_frames(msg):
+                            if service != 5:
+                                continue
+                            decoded = _soop_decode_chat(body)
+                            if not decoded:
+                                continue
+                            nick, comment = decoded
+                            try:
+                                await ws_conn.send_json({"type": "chat", "nick": nick, "content": comment})
+                            except Exception:
+                                return
+                except Exception as e:
+                    logging.debug(f"[SOOP WS] forward_to_frontend 异常: {e}")
+
+            async def listen_to_frontend():
+                try:
+                    while True:
+                        data = await ws_conn.receive_text()
+                        if data == "ping":
+                            try:
+                                await ws_conn.send_text("pong")
+                            except Exception:
+                                break
+                except WebSocketDisconnect:
+                    pass
+                except Exception as e:
+                    logging.debug(f"[SOOP WS] listen_to_frontend 异常: {e}")
+
+            task_hb = asyncio.create_task(heartbeat())
+            task_fwd = asyncio.create_task(forward_to_frontend())
+            task_lsn = asyncio.create_task(listen_to_frontend())
+            done, pending = await asyncio.wait(
+                [task_hb, task_fwd, task_lsn],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    except Exception as e:
+        logging.warning(f"[SOOP WS] 连接异常: {e}")
+    finally:
+        try:
+            await ws_conn.close()
+        except Exception:
+            pass
+
 
 @app.get("/")
 def root():
