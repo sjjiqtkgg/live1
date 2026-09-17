@@ -187,9 +187,16 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # ==================== 安全配置（环境变量，均向后兼容） ====================
+# 【P1修复-CVE-2026-48710】允许的 Host 头白名单，未配置则不校验（保留原行为）。
+# 缓解 Starlette < 1.0.1 的 BadHost 认证绕过漏洞；同时建议升级 starlette>=1.0.1。
 ALLOWED_HOSTS = [h.strip().lower() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()]
+
+# 【P1修复】WebSocket 握手的 Origin 白名单，未配置则不校验（保留原行为）。
+# 例：ALLOWED_WS_ORIGINS=https://your-domain.com,http://localhost:8000
 ALLOWED_WS_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_WS_ORIGINS", "").split(",") if o.strip()]
-MAX_TS_SIZE = int(os.getenv("MAX_TS_SIZE", str(20 * 1024 * 1024)))
+
+# 【P1修复】TS 切片单次响应体最大字节数，防止恶意上游返回超大文件耗尽带宽。
+MAX_TS_SIZE = int(os.getenv("MAX_TS_SIZE", str(20 * 1024 * 1024)))  # 默认 20MB
 
 if ALLOWED_HOSTS:
     logging.info(f"[安全] Host 白名单已启用: {ALLOWED_HOSTS}")
@@ -199,6 +206,9 @@ logging.info(f"[安全] TS 切片大小上限: {MAX_TS_SIZE} 字节")
 
 @app.middleware("http")
 async def host_header_guard(request: Request, call_next):
+    """【P1修复-CVE-2026-48710】Host 头规范化校验。
+    仅当配置了 ALLOWED_HOSTS 时生效，避免影响原有部署。
+    """
     if ALLOWED_HOSTS:
         raw_host = request.headers.get("host", "")
         host = raw_host.split(":")[0].strip().lower()
@@ -252,6 +262,8 @@ else:
 CLIENT_POOL: dict = {}
 CLIENT_LOCK = asyncio.Lock()
 DEFAULT_TIMEOUT = 15
+# 【A4】TLS 校验做成可配置：默认关闭（行为不变，兼容个别证书有问题的 CDN），
+# 生产环境可设 VERIFY_TLS=1 一键开回校验。
 VERIFY_TLS = os.getenv("VERIFY_TLS", "0") == "1"
 
 async def get_client(proxy=None, timeout=None):
@@ -336,6 +348,10 @@ async def get_fixed_proxy_list(proxy_pool):
     return [proxy_pool[(start + i) % n] for i in range(n)]
 
 async def _sequential_request(method, url, proxy_list, fail_log_prefix, timeout, log_tag, **kwargs):
+    """按顺序依次尝试 proxy_list 中的代理，成功即返回，全部失败则抛出最后一次异常。
+    request_with_retry 与 request_with_proxy_group 共用此骨架，二者原有的对外行为
+    （参数、异常类型、日志前缀、健康度记录）保持不变，只是把重复的循环体收敛到一处。
+    """
     last_error = None
     last_index = len(proxy_list) - 1
     for i, proxy in enumerate(proxy_list):
@@ -350,6 +366,7 @@ async def _sequential_request(method, url, proxy_list, fail_log_prefix, timeout,
             _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
             last_error = e
             logging.warning(f"{fail_log_prefix}{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
+            # 【A1修复】最后一个代理失败后即将 raise，没必要再多睡 0.5 秒
             if i != last_index:
                 await asyncio.sleep(0.5)
     raise last_error or Exception("所有代理均失败")
@@ -373,6 +390,12 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
 
 async def stream_request_with_proxy_group(method, url, proxy_list, headers=None, content=None,
                                            shuffle_proxy=False, timeout=15, log_tag=None):
+    """【A3修复】与 request_with_proxy_group 相同的代理选择/重试逻辑，
+    但用 client.send(..., stream=True) 拿到真正的流式 httpx.Response，
+    响应体不会在这里被整体读入内存——内容留到调用方按需 aiter_bytes()/aread()。
+    专用于 api_proxy 转发直播 TS/FLV 等大体积内容；调用方用完必须自行 await resp.aclose()。
+    普通 JSON/API 调用（request_with_retry 等）体量小，不受此项影响，无需改动。
+    """
     proxies = proxy_list[:] if proxy_list else [None]
     if shuffle_proxy and proxies:
         random.shuffle(proxies)
@@ -512,6 +535,11 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         proxies_to_use = proxy_list
         shuffle_proxy = True
 
+    # 【A3修复】原来用 request_with_proxy_group（底层 client.request）会在这里就把
+    # 整个响应体读进内存，is_ts 分支的 MAX_TS_SIZE 截断只是"读完之后"才生效，起不到
+    # 限制内存的作用。改用真正的流式请求，内容留到下面各分支按需读取/转发。
+    # 注：此处不传 log_tag，避免每个 TS 切片都打一条 INFO（量太大）。
+    # 失败路径的 warning 在 stream_request_with_proxy_group 内部无条件打印，不受影响。
     resp = await stream_request_with_proxy_group(
         request.method, url,
         proxy_list=proxies_to_use,
@@ -522,6 +550,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
     is_m3u8 = "mpegurl" in content_type.lower() or url.split("?")[0].endswith(".m3u8")
 
     if is_m3u8:
+        # m3u8 文本体积很小，安全地一次性读完再处理（不是我们要防的大体积场景）
         try:
             await resp.aread()
         finally:
@@ -546,8 +575,10 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         lines = text.splitlines()
         rewritten = []
 
+        # 扩展：重写 EXT-X-MAP, EXT-X-KEY, EXT-X-MEDIA 中的 URI
         for line in lines:
             stripped = line.strip()
+            # 处理携带 URI 的标签
             if stripped.startswith("#EXT-X-MEDIA:") or stripped.startswith("#EXT-X-MAP:") or stripped.startswith("#EXT-X-KEY:"):
                 def replace_uri(match):
                     uri = match.group(1)
@@ -563,6 +594,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
                 rewritten.append(new_line)
                 continue
 
+            # 普通非注释行：TS 切片或子播放列表
             if stripped and not stripped.startswith("#"):
                 if stripped.startswith("http://") or stripped.startswith("https://"):
                     abs_url = stripped
@@ -583,6 +615,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         return Response(content=body_out, status_code=resp.status_code, headers=out_headers)
 
     if is_ts:
+        # 【P1修复】流式转发时增加响应体大小上限，防止恶意上游返回超大文件耗尽带宽/内存
         async def _stream_and_close():
             total = 0
             truncated = False
@@ -610,6 +643,9 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
                 "Content-Type": content_type or "video/mp2t"
             }
         )
+    # 【A3修复】原来的 resp.content 需要先整包读完才能拿到值，本质上和 is_ts 分支
+    # 同样的问题；这里也改成真正的边读边转发，同样套用 MAX_TS_SIZE 上限防御
+    # （这条路径理论上不该承载直播流量，但作为兜底防线，上限保持一致）。
     async def _stream_and_close_fallback():
         total = 0
         truncated = False
@@ -676,16 +712,26 @@ def parse_multivariant_m3u8(text, base_url, cdn_prefix):
 
 # ==================== 虎牙 ====================
 def _extract_huya_danmaku_params(live):
+    """从 parse_huya 已经请求过的 mp.huya.com/cache.php 响应（live 对象）中提取弹幕连接参数，
+    不再重复发起 HTTP 请求。提取逻辑与原 fetch_huya_danmaku_params 完全一致。
+    """
     try:
+        # 【SlotSun修复】改用 PC 端 API 取 uid，与 parse_huya 同一数据源
+        # uid 来自 streamDataGameLiveInfo["uid"]，原来用 m.huya.com 的 lYyid 是错误字段
         profile_info = live.get("profileInfo", {})
         live_data = live.get("liveData", {})
 
+        # uid 优先从 profileInfo/liveData 取 lUid，其次 uid，最后回退 lYyid
         uid = int(
             profile_info.get("lUid") or profile_info.get("uid") or
             live_data.get("lUid") or live_data.get("uid") or
             live_data.get("lYyid") or profile_info.get("lYyid") or 0
         )
 
+
+        # 【修复】原代码引用了从未赋值的 top_sid/sub_sid，导致每次调用必然抛 NameError，
+        # 被外层 except 吞掉后 danmaku 变成 {}，前端 validate() 失败，弹幕从未真正启动。
+        # 前端已不再使用 topSid/subSid（改用 tag0/6=uid 注册），故直接移除这两个字段。
         return {"platform": "huya", "uid": uid, "ayyuid": uid}
     except Exception:
         return {}
@@ -995,6 +1041,9 @@ async def parse_bilibili(url):
                                            "url": u, "type": "flv" if fmt["format_name"] == "flv" else "m3u8"})
         if not streams:
             return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
+        # 【修复】原先 flv 优先排序 + 全局截断前4条：如果同一画质有多个 flv CDN 镜像，
+        # 会把仅以 m3u8/hevc 提供的高画质流（如4K）挤出结果。改为按类型分别截断，
+        # 保证 flv 和 m3u8 各自都有代表进入最终列表，而不是被 flv 镜像数量顶掉。
         flv_streams = [s for s in streams if s["type"] == "flv"][:3]
         m3u8_streams = [s for s in streams if s["type"] != "flv"][:3]
         streams = flv_streams + m3u8_streams
@@ -1079,6 +1128,9 @@ async def parse_douyin(url):
         except Exception:
             pass
 
+        # 【A2修复】原来 room_id 兜底和头像兜底各自 GET 一次同一个页面 url，
+        # 合并成一次请求，同时正则 room_id 和 RENDER_DATA。数字房间号+头像已齐全
+        # 的常见路径完全不受影响（下面这段直接跳过）。
         need_room_id = not room_id.isdigit()
         need_avatar_fallback = not avatar
         if need_room_id or need_avatar_fallback:
@@ -1240,6 +1292,7 @@ async def parse_soop(url, cookie: str = ""):
         avatar = f'https://stimg.sooplive.com/LOGO/{bj_id[:2]}/{bj_id}/{bj_id}.jpg'
 
         def _fail(nick, av):
+            """离线/失败场景的统一返回：写入退避缓存后返回空结果，行为与原来逐处内联代码完全一致。"""
             result = {"streams": [], "isLive": False, "title": nick, "avatar": av}
             M3U8_CACHE[cache_key] = {"data": result, "expire": time.time() + _soop_offline_ttl(bj_id)}
             return result
@@ -1431,6 +1484,8 @@ async def api_follows_batch(request: Request):
     if len(items) > 30:
         raise HTTPException(400, "单次最多查询 30 个")
 
+    # 国内平台（无需外网代理，通常很快）与国外平台（走外网代理，代理不稳时可能很慢）
+    # 分开各自的并发信号量，避免国外平台代理卡顿时占满共用名额，拖慢本该很快返回的国内平台查询
     _FOREIGN_MARKERS = ("twitch.tv", "sooplive.com", "pandalive.co.kr")
     sem_domestic = asyncio.Semaphore(5)
     sem_foreign = asyncio.Semaphore(5)
@@ -1486,6 +1541,10 @@ def _reset_go_service_check(mark_unavailable: bool = False):
         _GO_SERVICE_AVAILABLE = False
 
 def _ws_origin_allowed(websocket: WebSocket) -> bool:
+    """【P1修复】校验 WebSocket 握手的 Origin 头。
+    - 未配置 ALLOWED_WS_ORIGINS 时放行，保持向后兼容。
+    - 非浏览器客户端（无 Origin 头，如 App/脚本）放行，避免误伤。
+    """
     if not ALLOWED_WS_ORIGINS:
         return True
     origin = websocket.headers.get("origin", "")
@@ -1495,6 +1554,7 @@ def _ws_origin_allowed(websocket: WebSocket) -> bool:
 
 @app.websocket("/ws/douyin/{room_id}")
 async def websocket_douyin_danmaku(websocket: WebSocket, room_id: str):
+    # 【P1修复】WebSocket Origin 校验（未配置 ALLOWED_WS_ORIGINS 时不校验）
     if not _ws_origin_allowed(websocket):
         logging.warning(f"[WS] 抖音弹幕拒绝非法 Origin: {websocket.headers.get('origin')!r}")
         await websocket.close(code=1008)
@@ -1576,26 +1636,96 @@ _SOOP_F = b'\x0c'
 
 
 def _soop_build_frame(service: int, body: bytes) -> bytes:
+    """SOOP 弹幕帧格式：ESC(2字节) + service(4位ASCII数字) + bodyLength(6位ASCII数字) + 填充(2字节'00') + body"""
     header = _SOOP_ESC + f"{service:04d}".encode("ascii") + f"{len(body):06d}".encode("ascii") + b"00"
     return header + body
 
 
-def _soop_connect_packet() -> bytes:
-    body = _SOOP_F * 3 + b"16" + _SOOP_F
+_SOOP_ELEM_START = b'\x11'
+_SOOP_ELEM_END = b'\x12'
+_SOOP_SPACE = b'\x06'
+
+
+def _soop_cookie_field(cookie: str, name: str) -> str:
+    """从 Header String 格式 Cookie（k1=v1; k2=v2）中取指定字段的值。"""
+    if not cookie:
+        return ""
+    for part in cookie.split(";"):
+        if "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        if k.strip() == name:
+            return v.strip()
+    return ""
+
+
+def _soop_connect_packet(auth_ticket: str = "") -> bytes:
+    """握手包：service=1。
+    匿名 body = 3 个分隔符 + "16" + 1 个分隔符（来自实际抓包，含义未知但必需）；
+    登录态 body = 分隔符 + AuthTicket + 2 个分隔符 + "16" + 分隔符（soop-extension 同款）。"""
+    if auth_ticket:
+        body = _SOOP_F + auth_ticket.encode("utf-8") + _SOOP_F * 2 + b"16" + _SOOP_F
+    else:
+        body = _SOOP_F * 3 + b"16" + _SOOP_F
     return _soop_build_frame(1, body)
 
 
-def _soop_join_packet(chat_no: str) -> bytes:
+def _soop_log_query(meta: dict) -> bytes:
+    """JOIN 包的 log 元数据块：条目直接拼接，每条格式为 SPACE & SPACE key SPACE = SPACE value。"""
+    out = b""
+    for k, v in meta.items():
+        out += _SOOP_SPACE + b"&" + _SOOP_SPACE + str(k).encode("utf-8") + _SOOP_SPACE + b"=" + _SOOP_SPACE + str(v).encode("utf-8")
+    return out
+
+
+def _soop_join_packet(chat_no: str, ftk: str = "", _au: str = "", log_meta: dict = None) -> bytes:
+    """加入聊天室包：service=2。
+    匿名 body = 分隔符 + chatNo + 5 个分隔符；
+    登录态 body = 分隔符 + chatNo + 分隔符 + FTK + 分隔符 + "0" + 分隔符
+      + log/pwd/auth_info/pver/access_system 元数据块 + 分隔符（soop-extension 同款）。
+    19+ 直播间聊天室只对登录态放行，匿名 JOIN 拿不到消息。"""
     chat_no_bytes = chat_no.encode("utf-8")
-    body = _SOOP_F + chat_no_bytes + _SOOP_F * 5
+    if ftk:
+        meta = log_meta or {}
+        query = _soop_log_query({
+            "set_bps": meta.get("set_bps", "0"),
+            "view_bps": meta.get("view_bps", "0"),
+            "quality": "normal",
+            "uuid": _au or "",
+            "geo_cc": meta.get("geo_cc", ""),
+            "geo_rc": meta.get("geo_rc", ""),
+            "acpt_lang": meta.get("acpt_lang", ""),
+            "svc_lang": meta.get("svc_lang", ""),
+            "subscribe": 0,
+            "lowlatency": 0,
+            "mode": "landing",
+        })
+        body = (_SOOP_F + chat_no_bytes + _SOOP_F + ftk.encode("utf-8") + _SOOP_F + b"0" + _SOOP_F
+                + b"log" + _SOOP_ELEM_START + query + _SOOP_ELEM_END
+                + b"pwd" + _SOOP_ELEM_START + _SOOP_ELEM_END
+                + b"auth_info" + _SOOP_ELEM_START + b"NULL" + _SOOP_ELEM_END
+                + b"pver" + _SOOP_ELEM_START + b"2" + _SOOP_ELEM_END
+                + b"access_system" + _SOOP_ELEM_START + b"html5" + _SOOP_ELEM_END
+                + _SOOP_F)
+    else:
+        body = _SOOP_F + chat_no_bytes + _SOOP_F * 5
     return _soop_build_frame(2, body)
 
 
+def _soop_enter_info_packet(syn_ack: str) -> bytes:
+    """ENTER_INFO 包：service=12（协议码 "0012"）。登录态在收到 service=2 的 synAck 后回发，完成三步握手。"""
+    body = _SOOP_F + syn_ack.encode("utf-8") + _SOOP_F + b"0" + _SOOP_F
+    return _soop_build_frame(12, body)
+
+
 def _soop_heartbeat_packet() -> bytes:
+    """心跳包：service=0，body 为单个分隔符字节"""
     return _soop_build_frame(0, _SOOP_F)
 
 
 def _soop_parse_frames(data: bytes):
+    """从原始二进制数据中切出 (service, body) 帧列表。头部固定 14 字节：
+    ESC(2) + service(4位ASCII) + bodyLength(6位ASCII) + 填充(2字节)。"""
     frames = []
     offset = 0
     header_len = 14
@@ -1618,6 +1748,8 @@ def _soop_parse_frames(data: bytes):
 
 
 def _soop_decode_chat(body: bytes):
+    """service==5 的弹幕包：按 0x0c 分隔符切字段，fields[1]=正文，fields[6]=昵称。
+    过滤空消息/系统消息（正文为 '-1' 或 '1'）/含 '|' 的控制消息。"""
     parts = body.split(_SOOP_F)
     fields = [p.decode("utf-8", errors="ignore") for p in parts]
     if len(fields) <= 6:
@@ -1631,6 +1763,7 @@ def _soop_decode_chat(body: bytes):
 
 @app.websocket("/ws/twitch/{channel_name}")
 async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
+    # 【P1修复】WebSocket Origin 校验（未配置 ALLOWED_WS_ORIGINS 时不校验）
     if not _ws_origin_allowed(ws_conn):
         logging.warning(f"[Twitch WS] 拒绝非法 Origin: {ws_conn.headers.get('origin')!r}")
         await ws_conn.close(code=1008)
@@ -1694,8 +1827,7 @@ async def websocket_twitch_danmaku(ws_conn: WebSocket, channel_name: str):
 
 @app.websocket("/ws/soop/{room_id}")
 async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str, cookie: str = Query("")):
-    # 【SOOP-18+修复】接收前端传来的 SOOP 登录 Cookie，用于 19+ 直播间的弹幕连接认证。
-    # 未配置时为空字符串，不影响普通房间；19+ 房间没带 Cookie 会被 SOOP 弹幕服务器拒绝。
+    # 【安全】WebSocket Origin 校验（未配置 ALLOWED_WS_ORIGINS 时不校验）
     if not _ws_origin_allowed(ws_conn):
         logging.warning(f"[SOOP WS] 拒绝非法 Origin: {ws_conn.headers.get('origin')!r}")
         await ws_conn.close(code=1008)
@@ -1703,17 +1835,17 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str, cookie: str =
 
     await ws_conn.accept()
     try:
+        # 第一步：拿 CHANNEL 元数据（跟 parse_soop 用的是同一个接口），
+        # 提取弹幕连接需要的 CHATNO / CHDOMAIN(或CHIP) / CHPT
         headers_pc = {
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
             'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
             'origin': 'https://play.sooplive.com',
             'referer': 'https://play.sooplive.com',
         }
-        # 【SOOP-18+修复】元数据请求带 Cookie：19+ 房间的 CHANNEL 响应里
-        # CHATNO / CHDOMAIN / CHPT 只有在已登录状态下才完整返回
+        # 【19+认证】带上用户 Cookie 请求元数据：19+ 直播间只有登录态才会返回 CHATNO/FTK
         if cookie:
             headers_pc['cookie'] = cookie
-
         live_api = f'https://live.sooplive.com/afreeca/player_live_api.php?bjid={room_id}'
         live_data_form = {
             'bid': room_id, 'bno': '', 'type': '', 'pwd': '',
@@ -1726,11 +1858,35 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str, cookie: str =
                                                      log_tag="SOOP-danmaku-meta")
         channel = live_resp.json().get('CHANNEL', {})
         chat_no = str(channel.get('CHATNO', '')).strip()
+        # 【19+认证】提取认证握手所需字段：FTK/AuthTicket/_au + log 元数据（BPS/geo/语言）。
+        # 没有登录 Cookie 时保持匿名路径，包格式与原先完全一致。
+        auth_ticket = _soop_cookie_field(cookie, 'AuthTicket')
+        au = _soop_cookie_field(cookie, '_au')
+        ftk = str(channel.get('FTK', '') or '').strip()
+        view_bps = '0'
+        try:
+            presets = channel.get('VIEWPRESET')
+            if isinstance(presets, list) and presets and isinstance(presets[0], dict):
+                view_bps = str(presets[0].get('bps', '0') or '0')
+        except Exception:
+            pass
+        log_meta = {
+            'set_bps': str(channel.get('BPS', '0') or '0'),
+            'view_bps': view_bps,
+            'geo_cc': str(channel.get('geo_cc', '') or ''),
+            'geo_rc': str(channel.get('geo_rc', '') or ''),
+            'acpt_lang': str(channel.get('acpt_lang', '') or ''),
+            'svc_lang': str(channel.get('svc_lang', '') or ''),
+        }
         if not chat_no:
-            await ws_conn.send_json({"type": "error", "message": "SOOP 聊天室号获取失败"})
+            msg = "SOOP 聊天室号获取失败"
+            if not cookie:
+                msg += "：若为 19+ 直播间，请在设置页填写 SOOP 登录 Cookie 后重试"
+            await ws_conn.send_json({"type": "error", "message": msg})
             await ws_conn.close()
             return
 
+        # 【注意】CHPT 是明文 WS 端口，实际 WSS 连接要 +1，否则握手会卡死超时而不是直接报错
         host = str(channel.get('CHDOMAIN', '') or '').strip()
         if not host:
             raw_ip = str(channel.get('CHIP', '') or '').strip()
@@ -1748,12 +1904,13 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str, cookie: str =
             return
 
         soop_ws_url = f"wss://{host}:{plain_port + 1}/Websocket/{room_id}"
-        logging.info(f"[SOOP WS] room={room_id} chatNo={chat_no} host={host} plainPort={plain_port} → {soop_ws_url} cookieLen={len(cookie)}")
+        logging.info(f"[SOOP WS] room={room_id} chatNo={chat_no} host={host} plainPort={plain_port} "
+                     f"auth={'on' if auth_ticket else 'off'} ftk={'y' if ftk else 'n'} → {soop_ws_url}")
         ws_headers = {
             "Origin": "https://play.sooplive.co.kr",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         }
-        # 【SOOP-18+修复】弹幕连接也带 Cookie：19+ 房间的 chat 服务器要求登录态
+        # 【19+认证】pure_live 同款：WS 握手 HTTP 头也带上 Cookie，19+ 房间可能在此层校验登录态
         if cookie:
             ws_headers["Cookie"] = cookie
 
@@ -1763,6 +1920,7 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str, cookie: str =
                 ping_interval=None, open_timeout=10,
             )
         except TypeError:
+            # 旧版本 websockets 库参数名是 extra_headers，不是 additional_headers
             soop_ws_ctx = websockets.connect(
                 soop_ws_url, subprotocols=["chat"], extra_headers=ws_headers,
                 ping_interval=None, open_timeout=10,
@@ -1770,10 +1928,11 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str, cookie: str =
 
         async with soop_ws_ctx as soop_ws:
             logging.info(f"[SOOP WS] room={room_id} 已连接到 SOOP chat 服务器，开始发送握手包")
-            await soop_ws.send(_soop_connect_packet())
+            await soop_ws.send(_soop_connect_packet(auth_ticket))
             await asyncio.sleep(0.2)
-            await soop_ws.send(_soop_join_packet(chat_no))
-            logging.info(f"[SOOP WS] room={room_id} 握手包+加入包已发送")
+            # 【19+认证】有 AuthTicket 且拿到 FTK 才走认证 JOIN；匿名路径保持原格式
+            await soop_ws.send(_soop_join_packet(chat_no, ftk=ftk if auth_ticket else "", _au=au, log_meta=log_meta))
+            logging.info(f"[SOOP WS] room={room_id} 握手包+加入包已发送（{'认证' if auth_ticket else '匿名'}模式）")
 
             async def heartbeat():
                 try:
@@ -1792,9 +1951,19 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str, cookie: str =
                     async for msg in soop_ws:
                         if isinstance(msg, str):
                             logging.info(f"[SOOP WS] room={room_id} 收到文本帧(忽略): {msg[:200]!r}")
-                            continue
+                            continue  # SOOP 弹幕走二进制帧，文本消息忽略
                         _frame_count += 1
                         for service, body in _soop_parse_frames(msg):
+                            # 【19+认证】登录态收到 service=2（进入聊天室回执）后回发 ENTER_INFO 完成三步握手
+                            if service == 2 and auth_ticket:
+                                parts2 = body.split(_SOOP_F)
+                                syn_ack = parts2[7].decode('utf-8', errors='ignore').strip() if len(parts2) > 7 else ''
+                                if syn_ack:
+                                    try:
+                                        await soop_ws.send(_soop_enter_info_packet(syn_ack))
+                                    except Exception:
+                                        pass
+                                continue
                             if service != 5:
                                 continue
                             decoded = _soop_decode_chat(body)
@@ -1806,6 +1975,8 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str, cookie: str =
                                 await ws_conn.send_json({"type": "chat", "nick": nick, "content": comment})
                             except Exception:
                                 return
+                    # 【诊断】循环正常结束意味着 SOOP 关闭了连接，且没有抛异常——
+                    # 之前这种情况完全没有日志，是"看不到报错但一直重连"的根因之一
                     close_code = getattr(soop_ws, "close_code", None)
                     close_reason = getattr(soop_ws, "close_reason", None)
                     logging.warning(
