@@ -1814,6 +1814,7 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str):
             return
 
         soop_ws_url = f"wss://{host}:{plain_port + 1}/Websocket/{room_id}"
+        logging.info(f"[SOOP WS] room={room_id} chatNo={chat_no} host={host} plainPort={plain_port} → {soop_ws_url}")
         ws_headers = {
             "Origin": "https://play.sooplive.co.kr",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -1832,36 +1833,54 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str):
             )
 
         async with soop_ws_ctx as soop_ws:
+            logging.info(f"[SOOP WS] room={room_id} 已连接到 SOOP chat 服务器，开始发送握手包")
             await soop_ws.send(_soop_connect_packet())
             await asyncio.sleep(0.2)
             await soop_ws.send(_soop_join_packet(chat_no))
+            logging.info(f"[SOOP WS] room={room_id} 握手包+加入包已发送")
 
             async def heartbeat():
                 try:
                     while True:
                         await asyncio.sleep(20)
                         await soop_ws.send(_soop_heartbeat_packet())
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.warning(f"[SOOP WS] room={room_id} heartbeat 异常 [{type(e).__name__}]: {e}")
+
+            _frame_count = 0
+            _chat_count = 0
 
             async def forward_to_frontend():
+                nonlocal _frame_count, _chat_count
                 try:
                     async for msg in soop_ws:
                         if isinstance(msg, str):
+                            logging.info(f"[SOOP WS] room={room_id} 收到文本帧(忽略): {msg[:200]!r}")
                             continue  # SOOP 弹幕走二进制帧，文本消息忽略
+                        _frame_count += 1
                         for service, body in _soop_parse_frames(msg):
                             if service != 5:
                                 continue
                             decoded = _soop_decode_chat(body)
                             if not decoded:
                                 continue
+                            _chat_count += 1
                             nick, comment = decoded
                             try:
                                 await ws_conn.send_json({"type": "chat", "nick": nick, "content": comment})
                             except Exception:
                                 return
+                    # 【诊断】循环正常结束意味着 SOOP 关闭了连接，且没有抛异常——
+                    # 之前这种情况完全没有日志，是"看不到报错但一直重连"的根因之一
+                    close_code = getattr(soop_ws, "close_code", None)
+                    close_reason = getattr(soop_ws, "close_reason", None)
+                    logging.warning(
+                        f"[SOOP WS] room={room_id} 连接被对端关闭（正常结束，无异常）。"
+                        f"close_code={close_code} close_reason={close_reason!r} "
+                        f"共收到二进制帧={_frame_count} 解析出弹幕={_chat_count}"
+                    )
                 except Exception as e:
-                    logging.debug(f"[SOOP WS] forward_to_frontend 异常: {e}")
+                    logging.warning(f"[SOOP WS] room={room_id} forward_to_frontend 异常 [{type(e).__name__}]: {e}")
 
             async def listen_to_frontend():
                 try:
@@ -1890,7 +1909,7 @@ async def websocket_soop_danmaku(ws_conn: WebSocket, room_id: str):
                 await asyncio.gather(*pending, return_exceptions=True)
 
     except Exception as e:
-        logging.warning(f"[SOOP WS] 连接异常: {e}")
+        logging.warning(f"[SOOP WS] room={room_id} 连接异常 [{type(e).__name__}]: {e}")
     finally:
         try:
             await ws_conn.close()
