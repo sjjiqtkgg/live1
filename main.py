@@ -1172,6 +1172,13 @@ async def parse_twitch(url, cookie: str = ""):
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
         channel = match.group(1)
         eff_cookie = cookie or TWITCH_COOKIE
+        # 【2K修复】Twitch 的 1440p/4K 源有门禁：仅"已登录 + 地区开放"的会话可见，匿名令牌 usher 只下发
+        # H.264 梯度（最高 1080p60）。GQL 不认 Cookie 头，必须用 Cookie 里的 auth-token 组成
+        # Authorization: OAuth 头，拿到带用户身份的播放令牌后 usher 才会下发 1440p chunked 源。
+        auth_token = ""
+        m_at = re.search(r"(?:^|;\s*)auth-token=([^;\s]+)", eff_cookie)
+        if m_at:
+            auth_token = m_at.group(1)
 
         proxylist = await get_fixed_proxy_list(EXTERNAL_PROXY_URLS)
 
@@ -1185,6 +1192,8 @@ async def parse_twitch(url, cookie: str = ""):
                     "query": "query UserAvatar($login: String!) { user(login: $login) { profileImageURL(width: 300) displayName } }"
                 }]
                 gql_headers = {"Client-ID": client_id, "Content-Type": "application/json", "User-Agent": UA}
+                if auth_token:
+                    gql_headers["Authorization"] = f"OAuth {auth_token}"
                 if eff_cookie:
                     gql_headers["Cookie"] = eff_cookie
                 avatar_resp = await request_with_proxy_group("POST", "https://gql.twitch.tv/gql",
@@ -1203,51 +1212,71 @@ async def parse_twitch(url, cookie: str = ""):
                 continue
 
         token, sig = None, None
+        gql_url = "https://gql.twitch.tv/gql"
+        payload = [{"operationName": "PlaybackAccessToken",
+                     "variables": {"login": channel, "playerType": "embed"},
+                     "query": "query PlaybackAccessToken($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: { platform: \"web\", playerType: $playerType, playerBackend: \"mediaplayer\" }) { value signature } }"}]
         for client_id in TWITCH_CLIENT_IDS:
-            gql_headers = {"Client-ID": client_id, "Content-Type": "application/json", "User-Agent": UA}
+            base_headers = {"Client-ID": client_id, "Content-Type": "application/json", "User-Agent": UA}
             if eff_cookie:
-                gql_headers["Cookie"] = eff_cookie
-            gql_url = "https://gql.twitch.tv/gql"
-            payload = [{"operationName": "PlaybackAccessToken",
-                         "variables": {"login": channel, "playerType": "embed"},
-                         "query": "query PlaybackAccessToken($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: { platform: \"web\", playerType: $playerType, playerBackend: \"mediaplayer\" }) { value signature } }"}]
-            try:
-                resp = await request_with_proxy_group("POST", gql_url, proxy_list=proxylist, json=payload,
-                                                     headers=gql_headers, shuffle_proxy=False,
-                                                     log_tag="Twitch-token")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        t = data[0].get("data", {}).get("streamPlaybackAccessToken")
-                        if t:
-                            token, sig = t.get("value"), t.get("signature")
-                            if token and sig:
+                base_headers["Cookie"] = eff_cookie
+            # 【2K修复】优先带登录身份请求；auth-token 失效时自动降级匿名（至少保住 1080p 梯度）
+            header_variants = ([{**base_headers, "Authorization": f"OAuth {auth_token}"}] if auth_token else []) + [base_headers]
+            for gql_headers in header_variants:
+                try:
+                    resp = await request_with_proxy_group("POST", gql_url, proxy_list=proxylist, json=payload,
+                                                         headers=gql_headers, shuffle_proxy=False,
+                                                         log_tag="Twitch-token")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            t = data[0].get("data", {}).get("streamPlaybackAccessToken")
+                            if t and t.get("value") and t.get("signature"):
+                                token, sig = t["value"], t["signature"]
                                 break
-                logging.warning(f"[Twitch] Client-ID {client_id} 失效")
-            except Exception:
-                logging.warning(f"[Twitch] Client-ID {client_id} 请求异常")
+                    logging.warning(f"[Twitch] Client-ID {client_id} 失效（{'带登录' if 'Authorization' in gql_headers else '匿名'}）")
+                except Exception:
+                    logging.warning(f"[Twitch] Client-ID {client_id} 请求异常")
+            if token and sig:
+                break
         if not token or not sig:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
 
-        m3u8_url = f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}&allow_source=true&allow_audio_only=true&allow_spectre=true&fast_bread=true&allow_ads=false"
+        # 【2K修复】usher 需声明支持 HEVC/AV1 并开启 multigroup_video，登录令牌 + 开放地区 IP 才会下发 1440p chunked 源
+        m3u8_url = (f"https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={quote(token, safe='')}"
+                    f"&allow_source=true&allow_audio_only=true&platform=web&player=twitchweb&type=any"
+                    f"&p={random.randint(100000, 999999)}&playlist_include_framerate=true&multigroup_video=true"
+                    f"&supported_codecs=av1,h265,h264,mp4a&fast_bread=true")
         usher_resp = await request_with_proxy_group("GET", m3u8_url, proxy_list=proxylist,
                                                      headers={"User-Agent": UA, "Referer": "https://player.twitch.tv"},
                                                      shuffle_proxy=False, log_tag="Twitch-m3u8")
         if usher_resp.status_code != 200 or "#EXT-X-STREAM-INF" not in usher_resp.text:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
 
-        streams, lines = [], usher_resp.text.splitlines()
+        # 【2K修复】记录 usher 认定的出口地区：2K 源仅对"登录令牌 + 地区开放"的会话下发，地区不对时最高只有 1080p60
+        country_m = re.search(r'USER-COUNTRY="([^"]*)"', usher_resp.text)
+        if country_m:
+            logging.info(f"[Twitch] usher 出口地区={country_m.group(1)} 登录={'是' if auth_token else '否'}（2K 需两者同时满足）")
+
+        # 【2K修复】原逻辑把无 RESOLUTION 的 audio_only 误标成 "source" 并排在最前（误点会变成纯音频）。
+        # 改为：有 RESOLUTION 的按分辨率命名并降序排序，chunked（源）加"(源)"后缀，audio_only 归到最后。
+        variants, lines = [], usher_resp.text.splitlines()
         for i, line in enumerate(lines):
-            if line.startswith("#EXT-X-STREAM-INF"):
-                name = "source"
-                if "RESOLUTION=" in line:
-                    name = line.split("RESOLUTION=")[1].split(",")[0].replace("x", "p")
-                if i+1 < len(lines):
-                    sub_url = lines[i+1].strip()
-                    if not sub_url.startswith("http"):
-                        sub_url = urljoin(m3u8_url, sub_url)
-                    streams.append({"cdn": f"Twitch-{name}", "url": sub_url, "type": "m3u8"})
-        streams.sort(key=lambda s: (0 if "source" in s["cdn"] else 1, s["cdn"]))
+            if not line.startswith("#EXT-X-STREAM-INF") or i + 1 >= len(lines):
+                continue
+            sub_url = lines[i + 1].strip()
+            if not sub_url.startswith("http"):
+                sub_url = urljoin(m3u8_url, sub_url)
+            res_m = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
+            vid_m = re.search(r'VIDEO="([^"]*)"', line)
+            video = vid_m.group(1) if vid_m else ""
+            if res_m:
+                name = f"{res_m.group(1)}p{res_m.group(2)}" + ("(源)" if video == "chunked" else "")
+                variants.append((int(res_m.group(2)), name, sub_url))
+            else:
+                variants.append((-1, "仅音频", sub_url))
+        variants.sort(key=lambda v: -v[0])
+        streams = [{"cdn": f"Twitch-{name}", "url": sub_url, "type": "m3u8"} for _, name, sub_url in variants]
         if not streams:
             return {"streams": [], "isLive": False, "title": nickname, "avatar": avatar}
         return {"streams": streams, "title": nickname, "avatar": avatar, "channelName": channel, "isLive": True}
