@@ -802,50 +802,70 @@ async def parse_huya(url):
         if live.get("realLiveStatus") != "ON":
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
 
-        bitrate_list = live.get("liveBitRateInfo", [])
-        quality_map = {}
-        if bitrate_list:
-            for item in bitrate_list:
-                bitrate = item.get("bitrate", "")
-                name = item.get("name", "") or f"{bitrate}K"
-                quality_map[str(bitrate)] = name
-        default_qualities = {
-            "0": "原画",
-            "4000": "蓝光",
-            "2000": "超清",
-            "1000": "高清",
-            "500": "标清"
-        }
-        for k, v in default_qualities.items():
-            if k not in quality_map:
-                quality_map[k] = v
+        # 【画质名修复·对齐原站】原代码读 live.liveBitRateInfo，但 profileRoom 响应里
+        # 该字段不存在（真实字段是 liveData.bitRateInfo，且它是 JSON 字符串需二次解析），
+        # 导致画质名永远落回硬编码兜底（原画/蓝光/超清/高清/标清），
+        # 丢失原站的"蓝光20M/蓝光8M/蓝光4M/超清/流畅"真实档位名。
+        bitrate_list = live_data.get("bitRateInfo") or live.get("bitRateInfo") or live.get("liveBitRateInfo") or []
+        if isinstance(bitrate_list, str):
+            try:
+                bitrate_list = json.loads(bitrate_list)
+            except Exception:
+                bitrate_list = []
+        qualities = []   # [(bitrate:int, name:str)]，bitrate 0 = 原画（流名无后缀）
+        seen_bitrate = set()
+        for item in bitrate_list or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                b = int(item.get("iBitRate") or 0)
+            except (TypeError, ValueError):
+                b = 0
+            name = (item.get("sDisplayName") or "").strip()
+            if not name or b in seen_bitrate:
+                continue
+            seen_bitrate.add(b)
+            qualities.append((b, name))
+        # 原站顺序：原画(0)最前，其余按码率降序（蓝光20M → 蓝光8M → … → 流畅）
+        qualities.sort(key=lambda x: (0 if x[0] == 0 else 1, -x[0]))
+        if not qualities:
+            qualities = [(0, "原画"), (4000, "蓝光"), (2000, "超清"), (1000, "高清"), (500, "标清")]
 
         cdn_list = live.get("stream", {}).get("baseSteamInfoList", [])
         if not cdn_list:
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
         cdn_list.sort(key=lambda s: CDN_ORDER.get(s.get("sCdnType", "ZZ"), 9))
 
+        # 【线路×画质矩阵·对齐原站】原代码用 seen_qualities 做全局去重，导致只有
+        # 排序第一的 CDN（腾讯云）能产出流，其余线路（线路3/线路13…）全被丢弃。
+        # 原站的线路与画质是正交维度：每条线路都支持全部画质档位。
+        # 输出结构改为带 line/quality 两个字段，cdn 保留 "线路N-档位名" 兼容旧前端。
         streams = []
         seen_urls = set()
-        seen_qualities = set()
 
         for cdn in cdn_list:
             flv_url = cdn.get("sFlvUrl", "")
             base_stream_name = cdn.get("sStreamName", "")
             anti_code = cdn.get("sFlvAntiCode", "")
             suffix = cdn.get("sFlvUrlSuffix", "flv")
+            # 线路名对齐原站显示（线路3/线路5/线路13…，取 iLineIndex）
+            line_index = cdn.get("iLineIndex", "")
             cdn_type = cdn.get("sCdnType", "")
-            cdn_label = CDN_NAMES.get(cdn_type, cdn_type or "CDN")
+            if line_index not in ("", None):
+                line_label = f"线路{line_index}"
+            else:
+                line_label = CDN_NAMES.get(cdn_type, cdn_type or "线路")
 
             if not (flv_url and base_stream_name and anti_code):
                 continue
 
-            for bitrate, quality_name in quality_map.items():
-                if bitrate == "0":
-                    stream_name = base_stream_name
-                else:
-                    stream_name = f"{base_stream_name}_{bitrate}"
+            line_bitrates = set()   # 线路内按码率去重（跨线路不去重，保留完整矩阵）
+            for bitrate, quality_name in qualities:
+                if bitrate in line_bitrates:
+                    continue
+                line_bitrates.add(bitrate)
 
+                stream_name = base_stream_name if bitrate == 0 else f"{base_stream_name}_{bitrate}"
                 built = huya_build_anticode(anti_code, stream_name)
                 full_url = f"{flv_url}/{stream_name}.{suffix}?{built}"
                 full_url = full_url.replace("http://", "https://")
@@ -854,12 +874,10 @@ async def parse_huya(url):
                     continue
                 seen_urls.add(full_url)
 
-                if quality_name in seen_qualities:
-                    continue
-                seen_qualities.add(quality_name)
-
                 streams.append({
-                    "cdn": f"{cdn_label}-{quality_name}",
+                    "cdn": f"{line_label}-{quality_name}",
+                    "line": line_label,
+                    "quality": quality_name,
                     "url": full_url,
                     "type": "flv"
                 })
@@ -867,11 +885,8 @@ async def parse_huya(url):
         if not streams:
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
 
-        quality_order = {"原画": 0, "蓝光": 1, "超清": 2, "高清": 3, "标清": 4}
-        def sort_key(s):
-            q_name = s["cdn"].rsplit("-", 1)[-1]
-            return quality_order.get(q_name, 99)
-        streams.sort(key=sort_key)
+        # cdn_list 已按 CDN_ORDER 排序、qualities 已按码率降序，嵌套生成的顺序即目标顺序：
+        # 线路优先（腾讯云线路在前），线路内 原画→蓝光→…→流畅，无需再排序
 
         danmaku = _extract_huya_danmaku_params(live)
         return {"streams": streams, "title": anchor_name, "avatar": avatar, "danmaku": danmaku, "isLive": True}
@@ -948,11 +963,56 @@ async def parse_douyu(url):
             'auth': auth,
         }
 
-        rate_map = {0: "原画", 2: "高清", 4: "标清"}
+        # 【线路×画质矩阵·对齐原站】首次 getH5PlayV1 请求（不带 cdn/rate）即可拿到：
+        #   cdnsWithName —— 线路表（name=原站显示名"线路1/线路7/…"，cdn=组合参数），已按原站权重排序
+        #   multirates   —— 画质表（name=原站菜单名"原画2K60/蓝光8M/蓝光4M/超清/高清"，rate=组合参数），已按码率降序
+        # 线路与画质正交：POST 参数 cdn+rate 可取任意组合。旧代码的 rate_map={0:原画,2:高清,4:标清}
+        # 是错的（斗鱼 rate 4 实为蓝光4M、3 为超清），且未登录时高码率会被服务端静默降级
+        # （如 rate 0/8 都下发 4000），导致 URL 互相撞车、档位缺失——故按实际码率后缀命名并去重。
+        probe_params = dict(base_params, rate="0")
+        try:
+            await asyncio.sleep(random.uniform(0, 0.15))
+            probe = await request_with_retry("POST",
+                f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
+                headers=hdrs, data=probe_params, timeout=10)
+            probe = probe.json()
+        except Exception as e:
+            logging.warning(f"[斗鱼] 线路/画质表探测失败: {e}")
+            probe = {}
+        if probe.get("error") != 0 or not isinstance(probe.get("data"), dict):
+            return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
+        pdata = probe["data"]
 
-        async def fetch_rate(rate_val):
+        lines, seen_cdn = [], set()
+        for entry in pdata.get("cdnsWithName") or []:
+            cdn_code = str(entry.get("cdn") or "").strip()
+            if not cdn_code or cdn_code in seen_cdn:
+                continue
+            seen_cdn.add(cdn_code)
+            lines.append({"name": (entry.get("name") or "").strip() or cdn_code, "cdn": cdn_code})
+        if not lines:
+            lines = [{"name": "主线路", "cdn": None}]
+
+        rates, seen_rate = [], set()
+        for entry in pdata.get("multirates") or []:
+            try:
+                rv = int(entry.get("rate"))
+            except (TypeError, ValueError):
+                continue
+            if rv in seen_rate:
+                continue
+            seen_rate.add(rv)
+            rates.append({"name": (entry.get("name") or "").strip() or f"画质{rv}",
+                          "rate": rv, "bit": int(entry.get("bit") or 0)})
+        if not rates:
+            rates = [{"name": "原画", "rate": 0, "bit": 0}]
+        name_by_bit = {r_["bit"]: r_["name"] for r_ in rates if r_["bit"]}
+
+        async def fetch_combo(line_name, cdn_code, rate_info):
             params = base_params.copy()
-            params['rate'] = str(rate_val)
+            params["rate"] = str(rate_info["rate"])
+            if cdn_code:
+                params["cdn"] = cdn_code
             try:
                 await asyncio.sleep(random.uniform(0, 0.15))
                 r = await request_with_retry("POST",
@@ -962,32 +1022,47 @@ async def parse_douyu(url):
                     d = r.json()
                     if d.get("error") == 0:
                         info = d["data"]
-                        flv_url = f"{info['rtmp_url']}/{info['rtmp_live']}"
-                        return rate_val, flv_url
-                    else:
-                        logging.warning(f"[斗鱼] 画质 rate={rate_val} 接口返回错误: {d.get('error')} {d.get('msg','')}")
+                        return line_name, rate_info, f"{info['rtmp_url']}/{info['rtmp_live']}"
+                    logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 接口返回错误: {d.get('error')} {d.get('msg','')}")
                 else:
-                    logging.warning(f"[斗鱼] 画质 rate={rate_val} HTTP {r.status_code}")
+                    logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} HTTP {r.status_code}")
             except Exception as e:
-                logging.warning(f"[斗鱼] 画质 rate={rate_val} 请求异常: {e}")
-            return rate_val, None
+                logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 请求异常: {e}")
+            return line_name, rate_info, None
 
-        tasks = [fetch_rate(r) for r in rate_map.keys()]
-        results = await asyncio.gather(*tasks)
+        combos = [(l_["name"], l_["cdn"], r_) for l_ in lines for r_ in rates]
+        results = []
+        for chunk in [combos[i:i + 4] for i in range(0, len(combos), 4)]:
+            results += await asyncio.gather(*(fetch_combo(*cb) for cb in chunk))
 
         streams = []
         seen_urls = set()
-        for rate_val, flv_url in results:
-            if flv_url and flv_url not in seen_urls:
-                seen_urls.add(flv_url)
-                label = rate_map.get(rate_val, f"画质{rate_val}")
-                streams.append({"cdn": label, "url": flv_url, "type": "flv"})
+        seen_pair = set()   # (线路, 实际码率)：未登录降级时多条目会落到同一条流，去重防误标
+        for line_name, rate_info, flv_url in results:
+            if not flv_url or flv_url in seen_urls:
+                continue
+            seen_urls.add(flv_url)
+            m = re.search(r"_([0-9]{3,6})\.flv", flv_url)
+            actual_bit = int(m.group(1)) if m else rate_info["bit"]
+            key = (line_name, actual_bit)
+            if key in seen_pair:
+                continue
+            seen_pair.add(key)
+            # 显示名以实际下发码率对回画质表：登录态真 2K60 就显示"原画2K60"，
+            # 未登录降级 4000 就显示"蓝光4M"，与原站未登录菜单一致，不误标
+            q_name = name_by_bit.get(actual_bit) or rate_info["name"]
+            streams.append({
+                "cdn": f"{line_name}-{q_name}",
+                "line": line_name,
+                "quality": q_name,
+                "url": flv_url,
+                "type": "flv"
+            })
 
         if not streams:
             return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
 
-        quality_order = {"原画": 0, "高清": 1, "标清": 2}
-        streams.sort(key=lambda s: quality_order.get(s["cdn"], 99))
+        # 生成顺序即目标顺序：线路按原站权重（主线路在前），线路内按 multirates 码率降序，无需再排序
 
         return {"streams": streams, "title": name, "avatar": avatar, "isLive": True}
     except Exception as e:
