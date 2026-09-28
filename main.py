@@ -26,7 +26,6 @@ try:
 except ImportError:
     SLOWAPI_AVAILABLE = False
 
-# -------------------- 日志配置 --------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -64,7 +63,6 @@ _GO_SERVICE_CHECK_INTERVAL = 30.0
 _GO_SERVICE_CHECK_LOCK = asyncio.Lock()
 
 async def _check_go_service() -> bool:
-    """TCP 探测 Go 弹幕服务是否在线，结果写入全局标志。"""
     global _GO_SERVICE_AVAILABLE, _GO_SERVICE_LAST_CHECK
     now = time.time()
     if now - _GO_SERVICE_LAST_CHECK < _GO_SERVICE_CHECK_INTERVAL:
@@ -749,7 +747,6 @@ async def parse_huya(url):
         if live.get("realLiveStatus") != "ON":
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
 
-        # 【虎牙画质字段名修复】兼容两套命名：虎牙 bitRate/name，斗鱼 iBitRate/sDisplayName
         bitrate_list = live_data.get("bitRateInfo") or live.get("bitRateInfo") or live.get("liveBitRateInfo") or []
         if isinstance(bitrate_list, str):
             try:
@@ -837,11 +834,6 @@ async def parse_douyu(url):
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
 
-        # 【斗鱼画质修复】构造设备 ID，用作 Cookie 中的 dy_did / acf_did。
-        # 斗鱼服务端通过这两个 cookie 判断请求是否来自"真实浏览器会话"。
-        # 之前后端裸请求（无 Cookie）会被静默降级：rate=0 请求"原画2K60"，
-        # 服务端下发的播放地址实际只有 _4000.flv（蓝光4M），导致最高档丢失。
-        # 补上设备 cookie + Origin 头后，未登录状态也能拿到最高档。
         did = hashlib.md5(f"douyu_{room_id}_{int(time.time() // 3600)}_{random.randint(0, 9999)}".encode()).hexdigest()[:32].ljust(32, "0")
         device_cookie = f"dy_did={did}; acf_did={did}"
         hdrs = {
@@ -888,8 +880,6 @@ async def parse_douyu(url):
             return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
 
         real_id = str(room["room_id"])
-        # 【斗鱼画质修复】did 已在函数开头构造，此处不再重复生成，保证 getEncryption 和
-        # 后续 play 请求使用同一个设备标识（服务端可能校验 did 一致性）。
         enc_resp = await request_with_retry("GET", f"https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did={did}",
                                             headers=hdrs)
         enc_data = enc_resp.json()
@@ -902,6 +892,13 @@ async def parse_douyu(url):
             secret = hashlib.md5((secret + white['key']).encode()).hexdigest()
         suffix = f"{real_id}{ts}" if not white.get('is_special', False) else ""
         auth = hashlib.md5((secret + white['key'] + suffix).encode()).hexdigest()
+
+        # 【斗鱼HEVC修复】hevc 由 '0' 改为 '1'：
+        # 斗鱼的"原画2K60"档位通常只以 H265 编码提供，H264 通道跑不到这个码率。
+        # 之前声明 hevc=0，服务端把请求当成"不支持 H265 的客户端"，直接跳过 2K60，
+        # 降到 H264 能给的最高档（4M），导致探测阶段能看到"原画2K60"（那是画质表，
+        # 不区分编码），但实际取流永远拿不到。改成 hevc=1 后，服务端会按 H265 通道
+        # 下发，rate=0 才能真正对应到 13156 码率的原画流。
         base_params = {
             'ver': '219032101',
             'iar': '0',
@@ -957,32 +954,33 @@ async def parse_douyu(url):
             rates = [{"name": "原画", "rate": 0, "bit": 0}]
         name_by_bit = {r_["bit"]: r_["name"] for r_ in rates if r_["bit"]}
 
-   async def fetch_combo(line_name, cdn_code, rate_info):
-    params = base_params.copy()
-    params["rate"] = str(rate_info["rate"])
-    if cdn_code:
-        params["cdn"] = cdn_code
-    try:
-        await asyncio.sleep(random.uniform(0, 0.15))
-        r = await request_with_retry("POST",
-            f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
-            headers=hdrs, data=params, timeout=10)
-        if r.status_code == 200:
-            d = r.json()
-            if d.get("error") == 0:
-                info = d["data"]
-                url = f"{info['rtmp_url']}/{info['rtmp_live']}"
-                # 【诊断】打印请求的 rate 和实际下发的 URL 后缀，可以直接看到是否被降级
-                m_suffix = re.search(r"_([0-9]{3,6})\.flv", url)
-                actual_suffix = m_suffix.group(1) if m_suffix else "无后缀(原画)"
-                logging.info(f"[斗鱼] {line_name} 请求 rate={rate_info['rate']}({rate_info['name']}) → 实际后缀={actual_suffix}")
-                return line_name, rate_info, url
-            logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 接口返回错误: {d.get('error')} {d.get('msg','')}")
-        else:
-            logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} HTTP {r.status_code}")
-    except Exception as e:
-        logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 请求异常: {e}")
-    return line_name, rate_info, None
+        async def fetch_combo(line_name, cdn_code, rate_info):
+            params = base_params.copy()
+            params["rate"] = str(rate_info["rate"])
+            if cdn_code:
+                params["cdn"] = cdn_code
+            try:
+                await asyncio.sleep(random.uniform(0, 0.15))
+                r = await request_with_retry("POST",
+                    f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
+                    headers=hdrs, data=params, timeout=10)
+                if r.status_code == 200:
+                    d = r.json()
+                    if d.get("error") == 0:
+                        info = d["data"]
+                        url = f"{info['rtmp_url']}/{info['rtmp_live']}"
+                        # 【斗鱼诊断日志】打印请求的 rate 与实际下发的 URL 后缀，
+                        # 可以直接看出是否被服务端降级（如请求 rate=0 但下发 _4000.flv）
+                        m_suffix = re.search(r"_([0-9]{3,6})\.flv", url)
+                        actual_suffix = m_suffix.group(1) if m_suffix else "无后缀(原画)"
+                        logging.info(f"[斗鱼] {line_name} 请求 rate={rate_info['rate']}({rate_info['name']}) → 实际后缀={actual_suffix}")
+                        return line_name, rate_info, url
+                    logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 接口返回错误: {d.get('error')} {d.get('msg','')}")
+                else:
+                    logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} HTTP {r.status_code}")
+            except Exception as e:
+                logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 请求异常: {e}")
+            return line_name, rate_info, None
 
         combos = [(l_["name"], l_["cdn"], r_) for l_ in lines for r_ in rates]
         results = []
