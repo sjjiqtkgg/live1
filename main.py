@@ -907,7 +907,7 @@ async def parse_douyu(url):
             'iar': '0',
             'ive': '0',
             'rid': real_id,
-            'hevc': '0',
+            'hevc': '1',
             'fa': '0',
             'sov': '0',
             'enc_data': white['enc_data'],
@@ -957,27 +957,32 @@ async def parse_douyu(url):
             rates = [{"name": "原画", "rate": 0, "bit": 0}]
         name_by_bit = {r_["bit"]: r_["name"] for r_ in rates if r_["bit"]}
 
-        async def fetch_combo(line_name, cdn_code, rate_info):
-            params = base_params.copy()
-            params["rate"] = str(rate_info["rate"])
-            if cdn_code:
-                params["cdn"] = cdn_code
-            try:
-                await asyncio.sleep(random.uniform(0, 0.15))
-                r = await request_with_retry("POST",
-                    f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
-                    headers=hdrs, data=params, timeout=10)
-                if r.status_code == 200:
-                    d = r.json()
-                    if d.get("error") == 0:
-                        info = d["data"]
-                        return line_name, rate_info, f"{info['rtmp_url']}/{info['rtmp_live']}"
-                    logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 接口返回错误: {d.get('error')} {d.get('msg','')}")
-                else:
-                    logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} HTTP {r.status_code}")
-            except Exception as e:
-                logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 请求异常: {e}")
-            return line_name, rate_info, None
+   async def fetch_combo(line_name, cdn_code, rate_info):
+    params = base_params.copy()
+    params["rate"] = str(rate_info["rate"])
+    if cdn_code:
+        params["cdn"] = cdn_code
+    try:
+        await asyncio.sleep(random.uniform(0, 0.15))
+        r = await request_with_retry("POST",
+            f"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{real_id}",
+            headers=hdrs, data=params, timeout=10)
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("error") == 0:
+                info = d["data"]
+                url = f"{info['rtmp_url']}/{info['rtmp_live']}"
+                # 【诊断】打印请求的 rate 和实际下发的 URL 后缀，可以直接看到是否被降级
+                m_suffix = re.search(r"_([0-9]{3,6})\.flv", url)
+                actual_suffix = m_suffix.group(1) if m_suffix else "无后缀(原画)"
+                logging.info(f"[斗鱼] {line_name} 请求 rate={rate_info['rate']}({rate_info['name']}) → 实际后缀={actual_suffix}")
+                return line_name, rate_info, url
+            logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 接口返回错误: {d.get('error')} {d.get('msg','')}")
+        else:
+            logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} HTTP {r.status_code}")
+    except Exception as e:
+        logging.warning(f"[斗鱼] {line_name} 画质 rate={rate_info['rate']} 请求异常: {e}")
+    return line_name, rate_info, None
 
         combos = [(l_["name"], l_["cdn"], r_) for l_ in lines for r_ in rates]
         results = []
