@@ -801,20 +801,21 @@ async def parse_huya(url):
             suffix = cdn.get("sFlvUrlSuffix", "flv")
             line_index = cdn.get("iLineIndex", "")
             cdn_type = cdn.get("sCdnType", "")
+            # 【修复】保留 CDN 名 + 线路号。原先直接用"线路N"当标签：当多个 sCdnType
+            # （TX/AL/HW）共享同一 iLineIndex 时会被前端合并成同一条线路，画质菜单里
+            # 也会出现两个同名"原画"，用户无法区分是哪个 CDN。
+            cdn_name = CDN_NAMES.get(cdn_type, cdn_type or "线路")
             if line_index not in ("", None):
-                line_label = f"线路{line_index}"
+                line_label = f"{cdn_name}线路{line_index}"
             else:
-                line_label = CDN_NAMES.get(cdn_type, cdn_type or "线路")
+                line_label = cdn_name
 
             if not (flv_url and base_stream_name and anti_code):
                 continue
 
-            line_bitrates = set()
+            # 【清理】原代码此处有一层 line_bitrates 去重，但 qualities 在构建时已按
+            # bitrate 去过重，这层不会改变结果，纯属冗余。
             for bitrate, quality_name in qualities:
-                if bitrate in line_bitrates:
-                    continue
-                line_bitrates.add(bitrate)
-
                 stream_name = base_stream_name if bitrate == 0 else f"{base_stream_name}_{bitrate}"
                 built = huya_build_anticode(anti_code, stream_name)
                 full_url = f"{flv_url}/{stream_name}.{suffix}?{built}"
@@ -1003,7 +1004,9 @@ async def parse_douyu(url):
 
         combos = [(l_["name"], l_["cdn"], r_) for l_ in lines for r_ in rates]
         results = []
-        for chunk in [combos[i:i + 4] for i in range(0, len(combos), 4)]:
+        # 【调优】原先每批 4 个、串行等待，5 线路 × 5 画质的常见场景要 7 批；
+        # 每批内已有 0~0.15s 随机延迟做节流，提到 8 个/批可缩短解析耗时又不至于过于激进。
+        for chunk in [combos[i:i + 8] for i in range(0, len(combos), 8)]:
             results += await asyncio.gather(*(fetch_combo(*cb) for cb in chunk))
 
         streams = []
@@ -1019,8 +1022,12 @@ async def parse_douyu(url):
             if key in seen_pair:
                 continue
             seen_pair.add(key)
-            # 显示名以实际下发码率对回画质表，避免误标
-            q_name = name_by_bit.get(actual_bit) or rate_info["name"]
+            # 【修复】显示名以实际下发码率对回画质表；若对不上（服务端降级到表里没记录的码率），
+            # 显式标注真实码率而不是沿用请求档位名，避免把降级后的流标成"原画"。
+            if actual_bit and rate_info["bit"] and actual_bit != rate_info["bit"]:
+                q_name = f"{rate_info['name']}→{actual_bit//1000}k"
+            else:
+                q_name = name_by_bit.get(actual_bit) or rate_info["name"]
             streams.append({
                 "cdn": f"{line_name}-{q_name}",
                 "line": line_name,
