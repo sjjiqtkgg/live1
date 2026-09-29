@@ -106,14 +106,12 @@ async def lifespan(app):
             await asyncio.sleep(60)
             now = time.time()
 
-            # 清理 M3U8 缓存
             expired = [k for k, v in list(M3U8_CACHE.items()) if v.get('expire', 0) < now]
             for k in expired:
                 M3U8_CACHE.pop(k, None)
             if expired:
                 logging.info(f"[缓存] 清理 {len(expired)} 条过期条目，剩余 {len(M3U8_CACHE)} 条")
 
-            # 清理 STREAM_PROXY_MAP（只删超过 60 秒未访问的）
             if len(STREAM_PROXY_MAP) > 500:
                 now_ts = time.time()
                 safe_to_remove = [
@@ -125,19 +123,16 @@ async def lifespan(app):
                     STREAM_PROXY_MAP_TS.pop(k, None)
                 logging.info(f"[缓存] STREAM_PROXY_MAP 超限，已安全清理 {len(safe_to_remove[:250])} 条，剩余 {len(STREAM_PROXY_MAP)} 条")
 
-            # 清理 SOOP 离线退避计数器
             if len(_SOOP_OFFLINE_COUNT) > 1000:
                 keys = list(_SOOP_OFFLINE_COUNT.keys())
                 for k in keys[:500]:
                     _SOOP_OFFLINE_COUNT.pop(k, None)
 
-            # 清理抖音"无画质流"日志去重记录
             if len(_DOUYIN_NO_STREAM_LOGGED) > 1000:
                 keys = list(_DOUYIN_NO_STREAM_LOGGED.keys())
                 for k in keys[:500]:
                     _DOUYIN_NO_STREAM_LOGGED.pop(k, None)
 
-            # 连接池惰性清理
             if now - last_pool_rebuild >= 3600:
                 last_pool_rebuild = now
                 async with CLIENT_LOCK:
@@ -156,7 +151,6 @@ async def lifespan(app):
                 if idle_keys:
                     logging.info(f"[连接池] 惰性清理 {len(idle_keys)} 个空闲连接，剩余 {len(CLIENT_POOL)} 个")
 
-            # 每 6 小时重置代理健康统计
             if now - last_health_reset >= 6 * 3600:
                 last_health_reset = now
                 if _PROXY_HEALTH:
@@ -173,7 +167,6 @@ async def lifespan(app):
         await task
     except asyncio.CancelledError:
         pass
-    # 关闭所有连接池中的客户端
     async with CLIENT_LOCK:
         for k, (client, _) in list(CLIENT_POOL.items()):
             try:
@@ -186,7 +179,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
-# ==================== 安全配置（环境变量，均向后兼容） ====================
+# ==================== 安全配置 ====================
 ALLOWED_HOSTS = [h.strip().lower() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()]
 ALLOWED_WS_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_WS_ORIGINS", "").split(",") if o.strip()]
 MAX_TS_SIZE = int(os.getenv("MAX_TS_SIZE", str(20 * 1024 * 1024)))
@@ -239,9 +232,14 @@ EXTERNAL_PROXY_URLS = [p.strip() for p in EXTERNAL_PROXY_LIST_STR.split(",") if 
 logging.info(f"[代理] 外网代理 {len(EXTERNAL_PROXY_URLS)} 个: {EXTERNAL_PROXY_URLS}")
 
 CF_WORKER = os.getenv("CF_WORKER_URL", "").strip()
+# 【统一 Cookie】各平台登录 Cookie：前端可通过 /api/parse?cookie=xxx 动态传入，
+# 环境变量作为兜底（未传时使用）。两个都没配置时走匿名路径。
 SOOP_COOKIE = os.getenv("SOOP_COOKIE", "").strip()
 TWITCH_COOKIE = os.getenv("TWITCH_COOKIE", "").strip()
 BILI_COOKIE = os.getenv("BILI_COOKIE", "").strip()
+HUYA_COOKIE = os.getenv("HUYA_COOKIE", "").strip()
+DOUYU_COOKIE = os.getenv("DOUYU_COOKIE", "").strip()
+DOUYIN_COOKIE = os.getenv("DOUYIN_COOKIE", "").strip()
 
 if CF_WORKER:
     logging.info(f"[CF Worker] 已配置: {CF_WORKER}")
@@ -336,7 +334,6 @@ async def get_fixed_proxy_list(proxy_pool):
     return [proxy_pool[(start + i) % n] for i in range(n)]
 
 async def _sequential_request(method, url, proxy_list, fail_log_prefix, timeout, log_tag, **kwargs):
-    """按顺序依次尝试 proxy_list 中的代理，成功即返回，全部失败则抛出最后一次异常。"""
     last_error = None
     last_index = len(proxy_list) - 1
     for i, proxy in enumerate(proxy_list):
@@ -364,11 +361,9 @@ async def request_with_proxy_group(method, url, proxy_list, **kwargs):
     timeout = kwargs.pop("timeout", 15)
     shuffle_proxy = kwargs.pop("shuffle_proxy", False)
     log_tag = kwargs.pop("log_tag", None)
-
     targets = proxy_list[:]
     if shuffle_proxy and targets:
         random.shuffle(targets)
-
     return await _sequential_request(method, url, targets, "[分组请求]", timeout, log_tag, **kwargs)
 
 
@@ -377,7 +372,6 @@ async def stream_request_with_proxy_group(method, url, proxy_list, headers=None,
     proxies = proxy_list[:] if proxy_list else [None]
     if shuffle_proxy and proxies:
         random.shuffle(proxies)
-
     last_error = None
     last_index = len(proxies) - 1
     for i, proxy in enumerate(proxies):
@@ -402,10 +396,8 @@ async def request_race(method, url, proxy_list, **kwargs):
     timeout = kwargs.pop("timeout", 15)
     log_tag = kwargs.pop("log_tag", None)
     kwargs.pop("shuffle_proxy", None)
-
     if not proxy_list:
         proxy_list = [None]
-
     if len(proxy_list) == 1:
         client = await get_client(proxy_list[0], timeout)
         resp = await client.request(method, url, **kwargs)
@@ -422,7 +414,6 @@ async def request_race(method, url, proxy_list, **kwargs):
     pending: set = set(task_proxy)
     errors = []
     winner = None
-
     while pending and winner is None:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -436,18 +427,15 @@ async def request_race(method, url, proxy_list, **kwargs):
                 _record_proxy_health(proxy, False, tag=log_tag, error=f"{type(e).__name__}: {e}")
                 errors.append(e)
                 logging.warning(f"[竞速]{f'[{log_tag}]' if log_tag else ''} {proxy or '直连'} 失败 [{type(e).__name__}]: {e}")
-
     for t in pending:
         t.cancel()
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
-
     if winner:
         proxy, resp = winner
         if log_tag:
             logging.info(f"[{log_tag}] {proxy or '直连'} 竞速胜出 → HTTP {resp.status_code} {_short_url(url)}")
         return resp
-
     raise errors[-1] if errors else Exception("所有代理均失败")
 
 # ------------------ 代理接口 -----------------
@@ -458,9 +446,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
         ".douyu.com", ".huya.com", ".bilibili.com", ".bilivideo.com", ".douyucdn.cn",
         ".douyin.com", ".live.bilibili.com", ".twitch.tv", ".ttvnw.net",
         ".sooplive.com", ".sooplive.net", ".sooplivecdn.com",
-        ".pandalive.co.kr",
-        ".live-video.net",
-        ".pandalivecdn.com",
+        ".pandalive.co.kr", ".live-video.net", ".pandalivecdn.com",
     ]
 
     def is_allowed_domain(url: str) -> bool:
@@ -611,6 +597,7 @@ async def api_proxy(request: Request, url: str = Query(...), referer: str = Quer
                 "Content-Type": content_type or "video/mp2t"
             }
         )
+
     async def _stream_and_close_fallback():
         total = 0
         truncated = False
@@ -680,13 +667,11 @@ def _extract_huya_danmaku_params(live):
     try:
         profile_info = live.get("profileInfo", {})
         live_data = live.get("liveData", {})
-
         uid = int(
             profile_info.get("lUid") or profile_info.get("uid") or
             live_data.get("lUid") or live_data.get("uid") or
             live_data.get("lYyid") or profile_info.get("lYyid") or 0
         )
-
         return {"platform": "huya", "uid": uid, "ayyuid": uid}
     except Exception:
         return {}
@@ -714,13 +699,23 @@ def huya_build_anticode(raw_anti, stream_name):
     params["u"] = "0"
     return "&".join(f"{k}={v}" for k, v in params.items())
 
-async def parse_huya(url):
+async def parse_huya(url, cookie: str = ""):
+    """
+    【统一 Cookie】cookie 为空时行为与原先完全一致（匿名路径）；
+    有 cookie 时优先使用用户 Cookie（可能包含登录身份），可拿到部分房间的高码率画质。
+    """
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
         CDN_NAMES = {"AL": "阿里云", "TX": "腾讯云", "HW": "华为云", "WS": "网宿", "BD": "百度云"}
         CDN_ORDER = {"TX": 0, "AL": 1, "HW": 2, "WS": 3, "BD": 4}
+
+        eff_cookie = cookie or HUYA_COOKIE
+        base_headers = {"User-Agent": UA, "Referer": "https://www.huya.com/"}
+        if eff_cookie:
+            base_headers["Cookie"] = eff_cookie
+
         resp = await request_with_retry("GET", f"https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={room_id}",
-            headers={"User-Agent": UA, "Referer": "https://www.huya.com/"})
+            headers=base_headers)
         data = resp.json()
         if data.get("status") != 200:
             return {"streams": [], "isLive": False, "title": "", "avatar": ""}
@@ -735,8 +730,10 @@ async def parse_huya(url):
         )
         if not anchor_name:
             try:
-                mob_resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}",
-                    headers={"User-Agent": MOBILE_UA, "Referer": "https://www.huya.com/"})
+                mob_headers = {"User-Agent": MOBILE_UA, "Referer": "https://www.huya.com/"}
+                if eff_cookie:
+                    mob_headers["Cookie"] = eff_cookie
+                mob_resp = await request_with_retry("GET", f"https://m.huya.com/{room_id}", headers=mob_headers)
                 mob_html = mob_resp.text
                 m = re.search(r'"nick":"([^"]+)"', mob_html) or re.search(r'<title>([^_<]+)', mob_html)
                 if m:
@@ -757,8 +754,6 @@ async def parse_huya(url):
         if live.get("realLiveStatus") != "ON":
             return {"streams": [], "isLive": False, "title": anchor_name, "avatar": avatar}
 
-        # 【画质名修复·对齐原站】原代码读 live.liveBitRateInfo，但 profileRoom 响应里
-        # 该字段不存在（真实字段是 liveData.bitRateInfo，且它是 JSON 字符串需二次解析）
         bitrate_list = live_data.get("bitRateInfo") or live.get("bitRateInfo") or live.get("liveBitRateInfo") or []
         if isinstance(bitrate_list, str):
             try:
@@ -801,9 +796,6 @@ async def parse_huya(url):
             suffix = cdn.get("sFlvUrlSuffix", "flv")
             line_index = cdn.get("iLineIndex", "")
             cdn_type = cdn.get("sCdnType", "")
-            # 【修复】保留 CDN 名 + 线路号。原先直接用"线路N"当标签：当多个 sCdnType
-            # （TX/AL/HW）共享同一 iLineIndex 时会被前端合并成同一条线路，画质菜单里
-            # 也会出现两个同名"原画"，用户无法区分是哪个 CDN。
             cdn_name = CDN_NAMES.get(cdn_type, cdn_type or "线路")
             if line_index not in ("", None):
                 line_label = f"{cdn_name}线路{line_index}"
@@ -813,8 +805,6 @@ async def parse_huya(url):
             if not (flv_url and base_stream_name and anti_code):
                 continue
 
-            # 【清理】原代码此处有一层 line_bitrates 去重，但 qualities 在构建时已按
-            # bitrate 去过重，这层不会改变结果，纯属冗余。
             for bitrate, quality_name in qualities:
                 stream_name = base_stream_name if bitrate == 0 else f"{base_stream_name}_{bitrate}"
                 built = huya_build_anticode(anti_code, stream_name)
@@ -843,19 +833,22 @@ async def parse_huya(url):
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
 # ==================== 斗鱼 ====================
-# 【斗鱼对齐 dart_simple_live】固定 did：dart_simple_live 用这个常量作为"官方客户端"标识，
-# 服务端对陌生 did（如每次随机生成）会做未登录降级——探测阶段能看到"原画2K60"，
-# 但 rate=0 取流实际只下发 4000（蓝光4M）。改用这个固定值后，服务端把请求当作
-# 官方客户端会话处理，rate=0 才真正对应到 13156 码率的原画流。
 DOUYU_FIXED_DID = "10000000000000000000000000001501"
 
-async def parse_douyu(url):
+async def parse_douyu(url, cookie: str = ""):
+    """
+    【统一 Cookie】cookie 为空时行为与原先完全一致（用固定 did 走匿名路径）；
+    有 cookie 时优先使用用户 Cookie（携带登录身份），可解锁 2K/4K 60帧等高画质。
+    """
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
 
-        # 【斗鱼对齐 dart_simple_live】did 固定 + 完整浏览器请求头（Origin/Referer/UA/Cookie）
         did = DOUYU_FIXED_DID
-        device_cookie = f"dy_did={did}; acf_did={did}"
+        # 【统一 Cookie】用户 Cookie 优先；未提供则回退到设备 Cookie（匿名）
+        if cookie:
+            effective_cookie = cookie
+        else:
+            effective_cookie = f"dy_did={did}; acf_did={did}"
         hdrs = {
             "accept": "*/*",
             "accept-encoding": "gzip, deflate, br, zstd",
@@ -864,7 +857,7 @@ async def parse_douyu(url):
             "referer": f"https://www.douyu.com/{room_id}",
             "content-type": "application/x-www-form-urlencoded",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 Edg/114.0.1823.43",
-            "cookie": device_cookie,
+            "cookie": effective_cookie,
         }
 
         info_resp = await request_with_retry("GET", f"https://www.douyu.com/betard/{room_id}", headers=hdrs)
@@ -914,14 +907,9 @@ async def parse_douyu(url):
         secret = white['rand_str']
         for _ in range(white['enc_time']):
             secret = hashlib.md5((secret + white['key']).encode()).hexdigest()
-        # 【斗鱼对齐 dart_simple_live】salt 计算与 dart 一致：is_special==1 → salt=""，否则 "{rid}{ts}"
         salt = "" if white.get('is_special', 0) == 1 else f"{real_id}{ts}"
         auth = hashlib.md5((secret + white['key'] + salt).encode()).hexdigest()
 
-        # 【斗鱼对齐 dart_simple_live】字段对齐：
-        # - ver='Douyu_new'（不是 '219032101'）
-        # - 没有 iar / sov 两个字段
-        # - hevc='1'（2K60 只走 H265 通道，声明 hevc=0 会被当成"不支持 H265"直接跳过 2K60）
         base_params = {
             'enc_data': white['enc_data'],
             'tt': str(ts),
@@ -933,8 +921,6 @@ async def parse_douyu(url):
             'ive': '0',
         }
 
-        # 【探测】rate=-1、cdn='hw-h5' 与 dart_simple_live 的默认值一致，
-        # 服务端返回完整 cdnsWithName 与 multirates 列表
         probe_params = dict(base_params, rate="-1", cdn="hw-h5")
         try:
             await asyncio.sleep(random.uniform(0, 0.15))
@@ -948,7 +934,7 @@ async def parse_douyu(url):
         if probe.get("error") != 0 or not isinstance(probe.get("data"), dict):
             return {"streams": [], "isLive": False, "title": name, "avatar": avatar}
         pdata = probe["data"]
-        logging.info(f"[斗鱼] room={room_id} cdnsWithName={pdata.get('cdnsWithName')!r}")
+        logging.info(f"[斗鱼] room={room_id} 登录={'是' if cookie else '否'} cdnsWithName={pdata.get('cdnsWithName')!r}")
         logging.info(f"[斗鱼] room={room_id} multirates={pdata.get('multirates')!r}")
 
         lines, seen_cdn = [], set()
@@ -990,7 +976,6 @@ async def parse_douyu(url):
                     if d.get("error") == 0:
                         info = d["data"]
                         u = f"{info['rtmp_url']}/{info['rtmp_live']}"
-                        # 【诊断日志】打印请求 rate 与实际下发 URL 后缀，可直接看出是否被服务端降级
                         m_suffix = re.search(r"_([0-9]{3,6})\.flv", u)
                         actual_suffix = m_suffix.group(1) if m_suffix else "无后缀(原画)"
                         logging.info(f"[斗鱼] {line_name} 请求 rate={rate_info['rate']}({rate_info['name']}) → 实际后缀={actual_suffix}")
@@ -1004,8 +989,6 @@ async def parse_douyu(url):
 
         combos = [(l_["name"], l_["cdn"], r_) for l_ in lines for r_ in rates]
         results = []
-        # 【调优】原先每批 4 个、串行等待，5 线路 × 5 画质的常见场景要 7 批；
-        # 每批内已有 0~0.15s 随机延迟做节流，提到 8 个/批可缩短解析耗时又不至于过于激进。
         for chunk in [combos[i:i + 8] for i in range(0, len(combos), 8)]:
             results += await asyncio.gather(*(fetch_combo(*cb) for cb in chunk))
 
@@ -1022,8 +1005,6 @@ async def parse_douyu(url):
             if key in seen_pair:
                 continue
             seen_pair.add(key)
-            # 【修复】显示名以实际下发码率对回画质表；若对不上（服务端降级到表里没记录的码率），
-            # 显式标注真实码率而不是沿用请求档位名，避免把降级后的流标成"原画"。
             if actual_bit and rate_info["bit"] and actual_bit != rate_info["bit"]:
                 q_name = f"{rate_info['name']}→{actual_bit//1000}k"
             else:
@@ -1045,10 +1026,18 @@ async def parse_douyu(url):
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
 # ==================== B站 ====================
-async def parse_bilibili(url):
+async def parse_bilibili(url, cookie: str = ""):
+    """
+    【统一 Cookie】cookie 为空时行为与原先完全一致（匿名路径）；
+    有 cookie 时携带登录身份，可获取更高画质（如原画/4K）及部分限制内容。
+    """
     try:
         rid = url.rstrip("/").split("/")[-1].split("?")[0]
+        eff_cookie = cookie or BILI_COOKIE
         hdrs = {"User-Agent": UA, "Referer": "https://live.bilibili.com/"}
+        if eff_cookie:
+            hdrs["Cookie"] = eff_cookie
+
         room_resp = await request_with_retry("GET", f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={rid}", headers=hdrs)
         room_data = room_resp.json()
         if room_data.get("code") != 0:
@@ -1100,9 +1089,29 @@ async def parse_bilibili(url):
         return {"streams": [], "isLive": False, "title": "", "avatar": ""}
 
 # ==================== 抖音 ====================
-async def parse_douyin(url):
+async def parse_douyin(url, cookie: str = ""):
+    """
+    【统一 Cookie】cookie 为空时行为与原先完全一致（匿名路径）；
+    有 cookie 时尝试注入到底层 streamget 库（不同版本支持情况可能不同，
+    若不支持则自动忽略，不影响主流程）。
+    """
     try:
-        live = DouyinLiveStream()
+        eff_cookie = cookie or DOUYIN_COOKIE
+        # 【兼容性处理】不同版本的 streamget 对 Cookie 的注入方式可能不同，
+        # 优先尝试构造函数参数，其次尝试属性注入，两者都失败则忽略。
+        try:
+            live = DouyinLiveStream(cookie=eff_cookie) if eff_cookie else DouyinLiveStream()
+        except TypeError:
+            live = DouyinLiveStream()
+            if eff_cookie:
+                try:
+                    live.headers["Cookie"] = eff_cookie
+                except Exception:
+                    try:
+                        live.cookie = eff_cookie
+                    except Exception:
+                        pass
+
         data = await live.fetch_web_stream_data(url, process_data=True)
 
         qualities = ["OD", "UHD", "HD", "SD", "LD"]
@@ -1179,7 +1188,10 @@ async def parse_douyin(url):
         need_avatar_fallback = not avatar
         if need_room_id or need_avatar_fallback:
             try:
-                resp = await request_with_retry("GET", url, headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"})
+                page_headers = {"User-Agent": UA, "Referer": "https://www.douyin.com/"}
+                if eff_cookie:
+                    page_headers["Cookie"] = eff_cookie
+                resp = await request_with_retry("GET", url, headers=page_headers)
                 page_text = resp.text
                 if need_room_id:
                     match = re.search(r'"room_id":"(\d+)"', page_text)
@@ -1580,11 +1592,15 @@ async def api_parse(request: Request, url: str = Query(...), cookie: str = Query
         raise HTTPException(500, str(e))
 
 async def _parse_dispatch(url: str, cookie: str = ""):
+    """
+    【统一 Cookie】所有平台的解析函数都接受 cookie 参数；
+    具体哪个平台用得上、用不用，由各 parse_xxx 内部决定，入口这里统一透传。
+    """
     try:
-        if "huya.com" in url: return await parse_huya(url)
-        if "douyu.com" in url: return await parse_douyu(url)
-        if "bilibili.com" in url: return await parse_bilibili(url)
-        if "douyin.com" in url: return await parse_douyin(url)
+        if "huya.com" in url: return await parse_huya(url, cookie=cookie)
+        if "douyu.com" in url: return await parse_douyu(url, cookie=cookie)
+        if "bilibili.com" in url: return await parse_bilibili(url, cookie=cookie)
+        if "douyin.com" in url: return await parse_douyin(url, cookie=cookie)
         if "twitch.tv" in url: return await parse_twitch(url, cookie=cookie)
         if "sooplive.com" in url: return await parse_soop(url, cookie=cookie)
         if "pandalive.co.kr" in url: return await parse_panda_manual(url)
