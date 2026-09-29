@@ -836,19 +836,24 @@ async def parse_huya(url, cookie: str = ""):
 DOUYU_FIXED_DID = "10000000000000000000000000001501"
 
 async def parse_douyu(url, cookie: str = ""):
-    """
-    【统一 Cookie】cookie 为空时行为与原先完全一致（用固定 did 走匿名路径）；
-    有 cookie 时优先使用用户 Cookie（携带登录身份），可解锁 2K/4K 60帧等高画质。
-    """
     try:
         room_id = url.rstrip("/").split("/")[-1].split("?")[0]
 
-        did = DOUYU_FIXED_DID
-        # 【统一 Cookie】用户 Cookie 优先；未提供则回退到设备 Cookie（匿名）
+        # 【关键修复】用户 Cookie 优先；从 Cookie 里提取用户自己的 did
+        # 否则服务端会认为"账号身份 + 不匹配的设备 ID"非法，拒绝返回高画质流
         if cookie:
             effective_cookie = cookie
+            m_did = re.search(r'(?:^|;\s*)(?:dy_did|acf_did)=([^;\s]+)', cookie)
+            if m_did:
+                did = m_did.group(1)
+                logging.info(f"[斗鱼] room={room_id} 使用用户 Cookie 中的 did={did[:16]}…")
+            else:
+                did = DOUYU_FIXED_DID
+                logging.warning(f"[斗鱼] room={room_id} 用户 Cookie 中未找到 dy_did/acf_did，回退到固定 did")
         else:
+            did = DOUYU_FIXED_DID
             effective_cookie = f"dy_did={did}; acf_did={did}"
+
         hdrs = {
             "accept": "*/*",
             "accept-encoding": "gzip, deflate, br, zstd",
